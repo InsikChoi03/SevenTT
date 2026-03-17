@@ -1,21 +1,50 @@
-# Python 캐시 파일 (팀원간 코드 충돌 방지)
+# ─── Python ───────────────────────────────────────────
 __pycache__/
 *.py[cod]
 *$py.class
+*.so
+.pytest_cache/
 
-# 젯슨 로그 및 설정
-*.log
-.vscode/
-.DS_Store
-
-# AI 모델 및 대용량 데이터 (깃허브 용량 관리 필수)
-*.pt
-*.onnx
-*.weights
-*.mp4
-*.jpg
-*.png
-
-# 가상환경
+# ─── 가상환경 ──────────────────────────────────────────
 venv/
 .venv/
+env/
+
+# ─── AI 모델 / 대용량 바이너리 ────────────────────────
+# TensorRT 엔진 (젯슨 아키텍처 종속 → 다른 기기에서 사용 불가)
+*.engine
+*.trt
+*.plan
+# 모델 가중치
+*.pt
+*.pth
+*.onnx
+*.weights
+*.bin
+# 체크포인트 디렉토리
+checkpoints/
+
+# ─── 데이터셋 / 미디어 ────────────────────────────────
+data/raw/
+data/processed/
+*.mp4
+*.avi
+*.mov
+
+# ─── 로그 / 결과물 ────────────────────────────────────
+*.log
+logs/
+*.csv
+results/
+
+# ─── 민감 정보 (절대 커밋 금지) ───────────────────────
+.env
+*.key
+secrets/
+
+# ─── IDE / OS ─────────────────────────────────────────
+.vscode/*
+!.vscode/launch.json
+.idea/
+.DS_Store
+Thumbs.db

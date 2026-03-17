@@ -1,0 +1,19 @@
+# 하드웨어 설정
+camera:
+  source: "csi"           # "csi" 또는 "usb"
+  device_id: 0
+  capture_width: 1920
+  capture_height: 1080
+  display_width: 640
+  display_height: 640
+  framerate: 30
+  flip_method: 0
+
+motor:
+  port: "/dev/ttyUSB0"
+  baudrate: 9600
+  default_speed: 50       # 0~100
+
+system:
+  target_fps: 30
+  display: false          # 젯슨에서 디스플레이 없이 실행 시 false

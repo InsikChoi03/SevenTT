@@ -1,0 +1,28 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Run Inference (Jetson)",
+            "type": "python",
+            "request": "launch",
+            "program": "${workspaceFolder}/scripts/run_inference.py",
+            "console": "integratedTerminal",
+            "justMyCode": false
+        },
+        {
+            "name": "Build TRT Engine",
+            "type": "python",
+            "request": "launch",
+            "program": "${workspaceFolder}/scripts/build_engine.py",
+            "console": "integratedTerminal"
+        },
+        {
+            "name": "Run Tests",
+            "type": "python",
+            "request": "launch",
+            "module": "pytest",
+            "args": ["tests/", "-v"],
+            "console": "integratedTerminal"
+        }
+    ]
+}
