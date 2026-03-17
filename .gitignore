@@ -1,0 +1,21 @@
+# Python 캐시 파일 (팀원간 코드 충돌 방지)
+__pycache__/
+*.py[cod]
+*$py.class
+
+# 젯슨 로그 및 설정
+*.log
+.vscode/
+.DS_Store
+
+# AI 모델 및 대용량 데이터 (깃허브 용량 관리 필수)
+*.pt
+*.onnx
+*.weights
+*.mp4
+*.jpg
+*.png
+
+# 가상환경
+venv/
+.venv/
