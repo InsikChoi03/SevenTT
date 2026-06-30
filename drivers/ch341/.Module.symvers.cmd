@@ -1,0 +1,1 @@
+cmd_/home/seventt/seventt/workspace/drivers/ch341/Module.symvers := sed 's/\.ko$$/\.o/' /home/seventt/seventt/workspace/drivers/ch341/modules.order | scripts/mod/modpost -m   -o /home/seventt/seventt/workspace/drivers/ch341/Module.symvers -e -i Module.symvers   -T -

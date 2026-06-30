@@ -1,0 +1,1 @@
+cmd_/home/seventt/seventt/workspace/drivers/ch341/modules.order := {   echo /home/seventt/seventt/workspace/drivers/ch341/ch341.ko; :; } | awk '!x[$$0]++' - > /home/seventt/seventt/workspace/drivers/ch341/modules.order

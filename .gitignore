@@ -1,0 +1,51 @@
+# Build artifacts
+ros2_ws/build/
+ros2_ws/install/
+ros2_ws/log/
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+
+# Training runs, vendored tools, root pretrained weights (reproducible/large)
+runs/
+tools/
+/*.pt
+
+# Models (download separately, large files)
+models/*.engine
+models/*.onnx
+models/*.pt
+models/*.safetensors
+models/*.bin
+!models/.gitkeep
+!models/README.md
+# keep trained models (small, valuable, not trivially reproducible)
+!models/cube.pt
+!models/cube_v1_backup.pt
+!models/cube_v2.pt
+!models/cube_v3.pt
+!models/wide.pt
+
+# Data (raw recordings, bag files)
+data/**
+!data/.gitkeep
+!data/README.md
+
+# Logs
+logs/**
+!logs/.gitkeep
+
+# IDE/editor
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Python venvs
+.venv/
+venv/
+
+# Secrets / local config
+.env
+*.local.yaml

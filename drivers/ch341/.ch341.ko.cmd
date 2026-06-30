@@ -1,0 +1,1 @@
+cmd_/home/seventt/seventt/workspace/drivers/ch341/ch341.ko := ld -r -EL  -maarch64elf -z noexecstack --build-id=sha1  -T scripts/module.lds -o /home/seventt/seventt/workspace/drivers/ch341/ch341.ko /home/seventt/seventt/workspace/drivers/ch341/ch341.o /home/seventt/seventt/workspace/drivers/ch341/ch341.mod.o;  true

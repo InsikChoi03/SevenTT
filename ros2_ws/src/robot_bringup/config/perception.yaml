@@ -1,0 +1,105 @@
+# Parameters for localization / perception / judgment nodes.
+# Keys are node names (must match the launched node name). Undeclared params are ignored,
+# so this file is safe to share across nodes.
+#
+# !!! CALIBRATION !!!
+# The wide (top) cam is a FISHEYE ~116 H / 85 V / 151 diag deg (~160 spec).
+# !!! The top cam is published 180-DEGREE ROTATED (cameras.launch.py camera_top flip_method=2,
+# mounted inverted). So top_fx/fy/cx/cy below are the ROTATED-FRAME fisheye solve (126 imgs
+# rotated 180 then cv2.fisheye.calibrate, RMS 1.41px, 2026-06-30) — cx/cy are W-1-cx / H-1-cy of
+# the raw solve; fx/fy/dist unchanged. ALL top consumers (localizer + yolo_detector) see the
+# rotated frame, so pixels match these intrinsics. Re-solve: scripts/calib_fisheye.py on rotated
+# imgs (or data/calib/top_fisheye_rot180_calib.npz). fisheye_model: true -> world_model_node uses
+# cv2.fisheye.undistortPoints; localizer_node rectifies with cv2.fisheye maps.
+# Any top_fx=0 -> projection/undistort skipped (nodes still run).
+# set1_label / set2_label are announced on match morning -> fill them in then.
+
+localizer_node:
+  ros__parameters:
+    lx: 0.10
+    ly: 0.10
+    initial_x: 3.8
+    initial_y: 0.2
+    initial_theta: 3.14159        # facing -x, into the field, from the bottom-right start zone
+    publish_rate_hz: 20.0
+    use_visual_odometry: true
+    broadcast_tf: true
+    fisheye_model: true
+    # rotated-frame (180-deg) fisheye intrinsics — see header
+    top_fx: 857.316
+    top_fy: 860.071
+    top_cx: 789.858
+    top_cy: 541.748
+    dist_coeffs: [-0.085721, 0.053910, -0.034649, 0.007943]
+
+yolo_detector_node:
+  ros__parameters:
+    # Custom YOLOv8n trained on the 4 white polyhedra
+    # (cube / octahedron / dodecahedron / icosahedron). Absolute path so it resolves
+    # regardless of launch CWD.
+    model_path: "/home/seventt/seventt/workspace/models/cube.pt"
+    conf_threshold: 0.5
+    imgsz: 640
+    device: "auto"
+    top_min_interval_sec: 0.12          # ~8 Hz  (wide cam, world-model positions)
+    body_min_interval_sec: 0.06         # ~16 Hz (eye-in-hand, visual servo)
+    publish_shape_classification: true  # best body detection -> /classification/shape
+    shape_topic: "/classification/shape"
+
+siglip_gate_node:
+  ros__parameters:
+    model_id: "google/siglip-base-patch16-224"
+    set2_label: ""                # e.g. "apple" — announced match morning
+    fruit_labels: ["apple", "orange", "banana", "pineapple"]
+    confidence_threshold: 0.7
+    device: "auto"
+    min_box_area: 400
+
+# shape_heuristic_node DEPRECATED -> the Set1 shape class now comes from yolo_detector_node
+# (best body detection republished on /classification/shape, source='yolo'). No params needed.
+
+world_model_node:
+  ros__parameters:
+    publish_rate_hz: 10.0
+    fisheye_model: true
+    image_rotated_180: true   # top published 180-deg rotated -> negate fisheye ray x,y
+    # rotated-frame (180-deg) fisheye intrinsics — see header
+    top_fx: 857.316
+    top_fy: 860.071
+    top_cx: 789.858
+    top_cy: 541.748
+    dist_coeffs: [-0.085721, 0.053910, -0.034649, 0.007943]
+    # wide-cam extrinsics measured after install (2026-06-30): height 88.5cm, near-nadir
+    # (pitch=90 is straight down) tilted 2 deg forward -> 88, +9cm forward (offset_x, tentative).
+    cam_height_m: 0.885
+    cam_pitch_deg: 88.0
+    cam_offset_x: 0.204      # solved from 0.5m-front GT object (was 0.09 measured; +0.11 refine)
+    cam_offset_y: 0.052      # camera ~5cm left of base center (solved from same GT)
+    cam_yaw_deg: 180.0        # rig mounted reversed — verified by 0.5m-front icosa landing at image top
+
+    object_center_height_m: 0.04
+    assoc_radius_m: 0.18
+    conf_ema: 0.5
+    forget_after_sec: 6.0
+
+target_selector_node:
+  ros__parameters:
+    set1_label: ""
+    set2_label: ""
+    rate_hz: 2.0
+    explore_base: 5.0
+
+mission_fsm_node:
+  ros__parameters:
+    set1_label: ""
+    set2_label: ""
+    conf_threshold: 0.7
+    approach_dist_m: 0.25
+    align_settle_sec: 1.0
+    classify_timeout_sec: 2.0
+    pick_duration_sec: 3.0
+    storage_x: 0.2
+    storage_y: 0.2
+    shape_target_total: 4
+    fruit_target_total: 3
+    publish_rate_hz: 5.0

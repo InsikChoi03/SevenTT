@@ -1,0 +1,1 @@
+cmd_/home/seventt/seventt/workspace/drivers/ch341/ch341.mod := printf '%s\n'   ch341.o | awk '!x[$$0]++ { print("/home/seventt/seventt/workspace/drivers/ch341/"$$0) }' > /home/seventt/seventt/workspace/drivers/ch341/ch341.mod
