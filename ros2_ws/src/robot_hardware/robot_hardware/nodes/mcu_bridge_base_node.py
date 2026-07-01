@@ -7,7 +7,13 @@ Outbound protocol (one line per command, '\n' terminated):
 where each value is wheel linear speed in m/s, signed, 3 decimals.
 
 Inbound (Arduino → host, line per packet):
-    <ODOM,fl,fr,rl,rr,t_ms>   wheel speeds and timestamp ms
+    <ODOM,fl,fr,rl,rr,t_ms>   encoder wheel speeds + timestamp ms (when encoders exist)
+    <HB,fl,fr,rl,rr>          heartbeat = the COMMANDED wheel speeds echoed at 5 Hz. The current
+                              base (PCA9685+MX1508) has NO encoders, so this is all we get.
+Both are republished on /base/wheel_odom (m/s). With only <HB>, the localizer dead-reckons
+OPEN-LOOP from commands (directions correct; magnitude approximate until an encoder or the
+object-landmark correction tightens it). Without this the localizer never moves -> the robot
+cannot track its own heading/position and drives the wrong way ("상하좌우 모름").
 """
 from __future__ import annotations
 
@@ -95,10 +101,16 @@ class McuBridgeBaseNode(Node):
                 self._handle_line(line.strip().decode("ascii", errors="ignore"))
 
     def _handle_line(self, line: str) -> None:
-        if not line.startswith("<ODOM,") or not line.endswith(">"):
+        if not line.endswith(">"):
+            return
+        # <ODOM,fl,fr,rl,rr,t_ms> (encoders) OR <HB,fl,fr,rl,rr> (commanded-speed echo, no encoders).
+        if line.startswith("<ODOM,"):
+            payload = line[6:-1]
+        elif line.startswith("<HB,"):
+            payload = line[4:-1]
+        else:
             return
         try:
-            payload = line[6:-1]
             parts = payload.split(",")
             fl, fr, rl, rr = (float(p) for p in parts[:4])
         except (ValueError, IndexError):

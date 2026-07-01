@@ -31,7 +31,7 @@ import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import PoseStamped
 from robot_interfaces.msg import Classification, MissionState, Object, WorldModel
-from std_msgs.msg import Bool, Empty, UInt64
+from std_msgs.msg import Bool, Empty, Int8, String, UInt64
 
 
 STATES = [
@@ -57,6 +57,14 @@ class MissionFsmNode(Node):
         self.declare_parameter("shape_target_total", 4)   # set1 shape * 4
         self.declare_parameter("fruit_target_total", 3)   # set2 fruit * 3
         self.declare_parameter("publish_rate_hz", 5.0)
+        # --- mock-field-test knobs (all default to competition behaviour) ---
+        # dry_pick: log the pick instead of firing /arm/pick_trigger (arm not driven in the test).
+        # end_after_quota: END once both quotas are met (skip STORE/DRIVE/DUMP storage phase).
+        # select_timeout_sec>0: if SELECT_TARGET finds nothing for this long, advance phase (1->2)
+        #   or END (phase 2) — graceful termination when fewer objects are present than the quota.
+        self.declare_parameter("dry_pick", False)
+        self.declare_parameter("end_after_quota", False)
+        self.declare_parameter("select_timeout_sec", 0.0)
 
         self.set1_label = str(self.get_parameter("set1_label").value)
         self.set2_label = str(self.get_parameter("set2_label").value)
@@ -69,10 +77,14 @@ class MissionFsmNode(Node):
         self.storage_y = float(self.get_parameter("storage_y").value)
         self.shape_target_total = int(self.get_parameter("shape_target_total").value)
         self.fruit_target_total = int(self.get_parameter("fruit_target_total").value)
+        self.dry_pick = bool(self.get_parameter("dry_pick").value)
+        self.end_after_quota = bool(self.get_parameter("end_after_quota").value)
+        self.select_timeout_sec = float(self.get_parameter("select_timeout_sec").value)
         rate = float(self.get_parameter("publish_rate_hz").value)
 
         # --- runtime state ---
         self.state = "SCAN"
+        self.phase = 1          # 1 = pursue Set1, 2 = pursue Set2 (pick ordering; mapping is continuous)
         self.tray_shape = 0
         self.tray_fruit = 0
         self.current_target: Object | None = None    # latched selected target (id, set_type, ...)
@@ -99,12 +111,18 @@ class MissionFsmNode(Node):
         self.pub_blacklist = self.create_publisher(UInt64, "/world_model/blacklist_add", 10)
         self.pub_goal = self.create_publisher(PoseStamped, "/base/goal_pose", 10)
         self.pub_pick = self.create_publisher(Bool, "/arm/pick_trigger", 10)
+        # Current pick phase (1=Set1, 2=Set2) for the target selector's phase filter.
+        self.pub_phase = self.create_publisher(Int8, "/planning/phase", 10)
+        # Human-readable decision feed (PICK / PASS / SKIP / PHASE / END) for the visualiser.
+        self.pub_decision = self.create_publisher(String, "/planning/decision", 10)
 
         self.timer = self.create_timer(1.0 / rate, self.tick)
 
         self.get_logger().info(
             f"FSM started at {self.state}  set1='{self.set1_label}' set2='{self.set2_label}' "
-            f"conf>={self.conf_threshold} approach<{self.approach_dist_m}m rate={rate}Hz"
+            f"conf>={self.conf_threshold} approach<{self.approach_dist_m}m rate={rate}Hz "
+            f"dry_pick={self.dry_pick} end_after_quota={self.end_after_quota} "
+            f"select_timeout={self.select_timeout_sec}s"
         )
 
     # ------------------------------------------------------------------ utils
@@ -165,6 +183,10 @@ class MissionFsmNode(Node):
         if obj_id != 0:
             self.pub_blacklist.publish(UInt64(data=int(obj_id)))
 
+    def _decide(self, text: str) -> None:
+        """Publish a human-readable decision for the visualiser's decision feed."""
+        self.pub_decision.publish(String(data=text))
+
     def _count_non_blacklisted(self) -> int:
         if self.world is None:
             return 0
@@ -193,7 +215,8 @@ class MissionFsmNode(Node):
         elif self.state == "CLASSIFY":
             # force a PICK so the downstream chain can be exercised
             self.set_type = self.current_target.set_type if self.current_target else 0
-            self._publish_pick(True)
+            if not self.dry_pick:
+                self._publish_pick(True)
             self._enter("PICK")
         elif self.state == "DUMP_ALL":
             self._enter("END")
@@ -202,7 +225,7 @@ class MissionFsmNode(Node):
 
     # ------------------------------------------------------------ state helper
     def _do_store_in_tray(self) -> None:
-        """Tray bookkeeping + blacklist picked object, then branch."""
+        """Tray bookkeeping + blacklist picked object, then branch (phase-aware)."""
         if self.set_type == 1:
             self.tray_shape += 1
         elif self.set_type == 2:
@@ -211,7 +234,22 @@ class MissionFsmNode(Node):
             self._blacklist(self.current_target.id)   # picked -> never reselect
         self.current_target = None
         self.set_type = 0
-        if self.tray_shape >= self.shape_target_total and self.tray_fruit >= self.fruit_target_total:
+
+        # Advance to Set2 phase once the Set1 quota is met.
+        if self.phase == 1 and self.tray_shape >= self.shape_target_total:
+            self.phase = 2
+            self.get_logger().info("Set1 quota met -> phase 2 (Set2)")
+            self._decide("PHASE 1->2 (Set1 quota met)")
+
+        both_met = (
+            self.tray_shape >= self.shape_target_total
+            and self.tray_fruit >= self.fruit_target_total
+        )
+        if both_met and self.end_after_quota:
+            self.get_logger().info("both quotas met (test mode) -> END")
+            self._decide("END (quotas met)")
+            self._enter("END")
+        elif both_met:
             self._enter("DRIVE_TO_STORAGE")
         else:
             self._enter("SELECT_TARGET")
@@ -229,7 +267,10 @@ class MissionFsmNode(Node):
                 self.current_target = sel
                 self._publish_goal(sel.x, sel.y)
                 self._enter("APPROACH")
-            # else: keep scanning (stay in SELECT_TARGET)
+            elif self.select_timeout_sec > 0.0 and self._time_in_state() > self.select_timeout_sec:
+                # No phase-appropriate target for a while: advance Set1->Set2, or END on Set2.
+                self._advance_phase_or_end()
+            # else: keep waiting (selector may still surface a target as the map fills)
 
         elif self.state == "APPROACH":
             tgt = self._lookup_object(self.current_target.id) if self.current_target else None
@@ -270,62 +311,99 @@ class MissionFsmNode(Node):
                 self._enter("DUMP_ALL")
 
         elif self.state == "DUMP_ALL":
-            self._publish_pick(False)   # release / dump tray
+            if not self.dry_pick:
+                self._publish_pick(False)   # release / dump tray
             if self._time_in_state() >= self.pick_duration_sec:
                 self.get_logger().info("DUMP_ALL complete -> END")
                 self._enter("END")
 
         # END: terminal, no transition
 
+    def _commit_pick(self, set_type: int, label: str, detail: str) -> None:
+        """Enter PICK for a confirmed target. In dry_pick mode, log instead of firing the arm."""
+        self.set_type = set_type
+        obj_id = self.current_target.id if self.current_target else 0
+        if self.dry_pick:
+            self.get_logger().info(
+                f"[DRY PICK] picked id={obj_id} class='{label}' set={set_type} ({detail})"
+            )
+        else:
+            self._publish_pick(True)
+            self.get_logger().info(f"GATE PICK set{set_type} '{label}' ({detail})")
+        self._decide(f"{'DRY-' if self.dry_pick else ''}PICK set{set_type} {label} #{obj_id} ({detail})")
+        self._enter("PICK")
+
+    def _advance_phase_or_end(self) -> None:
+        """No phase-appropriate target left: Set1 phase -> Set2 phase, or Set2 phase -> END."""
+        if self.phase == 1:
+            self.phase = 2
+            self.get_logger().info("phase 1 (Set1) exhausted -> phase 2 (Set2)")
+            self._decide("PHASE 1->2 (Set1 exhausted)")
+            self._enter("SELECT_TARGET")   # reset the timer and re-select for Set2
+        else:
+            self.get_logger().info("phase 2 (Set2) exhausted -> END")
+            self._decide("END (Set2 exhausted)")
+            self._enter("END")
+
+    def _skip_target(self, reason: str) -> None:
+        """Abandon the current target WITHOUT blacklisting (wrong phase; keep for later)."""
+        obj_id = self.current_target.id if self.current_target else 0
+        self.get_logger().info(f"skip id={obj_id} ({reason}) -> reselect (not blacklisted)")
+        self._decide(f"SKIP #{obj_id} ({reason})")
+        self.current_target = None
+        self.set_type = 0
+        self._enter("SELECT_TARGET")
+
     def _step_classify(self) -> None:
-        """Pick-gate decision from fresh siglip + shape classifications."""
+        """Phase-aware pick gate from fresh siglip + shape classifications.
+
+        Pick order is enforced here: in phase 1 only a confirmed Set1 shape is picked; a Set2
+        object met here is skipped (NOT blacklisted) so it can be picked in phase 2, and vice
+        versa. Recognition/mapping itself is phase-independent and runs continuously upstream.
+        """
         enter = self.state_enter_s
         siglip = self.siglip if (self.siglip_stamp_s is not None and self.siglip_stamp_s >= enter) else None
         shape = self.shape if (self.shape_stamp_s is not None and self.shape_stamp_s >= enter) else None
 
-        # Set2 fruit gate: a fruit picture face is visible and siglip is confident on today's fruit.
-        if (
+        # Set1 shape confirmation. Anti-mispick cube rule kept as belt-and-suspenders even though
+        # the 5-class YOLO now separates cube (class 0) from fruit_photo_cube (excluded from the
+        # shape stream): if the target is the plain cube, still require siglip to see no fruit face.
+        set1_ok = bool(
+            self.set1_label
+            and shape is not None
+            and shape.label == self.set1_label
+            and shape.confidence >= self.conf_threshold
+            and (self.set1_label != "cube" or (siglip is not None and not siglip.image_face_visible))
+        )
+        # Set2 fruit confirmation: today's fruit, a picture face visible, confident.
+        set2_ok = bool(
             self.set2_label
             and siglip is not None
             and siglip.label == self.set2_label
             and siglip.image_face_visible
             and siglip.confidence >= self.conf_threshold
-        ):
-            self.set_type = 2
-            self._publish_pick(True)
-            self.get_logger().info(
-                f"GATE PICK set2 '{siglip.label}' conf={siglip.confidence:.2f} face_visible"
-            )
-            self._enter("PICK")
-            return
+        )
 
-        # Set1 shape gate: shape matches today's target shape with confidence.
-        # CRITICAL anti-mispick rule: if today's Set1 target is the CUBE, it is visually
-        # identical to a Set2 fruit-cube, so we must NOT decide on shape alone — require a
-        # siglip reading that confirms NO fruit face is visible. For non-cube shapes
-        # (octa/dodeca/icosahedron) there is no Set2 confusion, so siglip is not required.
-        if (
-            self.set1_label
-            and shape is not None
-            and shape.label == self.set1_label
-            and shape.confidence >= self.conf_threshold
-        ):
-            is_cube_target = self.set1_label == "cube"
-            face_clear = siglip is not None and not siglip.image_face_visible
-            if (not is_cube_target) or face_clear:
-                self.set_type = 1
-                self._publish_pick(True)
-                self.get_logger().info(
-                    f"GATE PICK set1 '{shape.label}' conf={shape.confidence:.2f} "
-                    f"{'no_face_confirmed' if is_cube_target else 'non_cube'}"
-                )
-                self._enter("PICK")
+        if self.phase == 1:
+            if set1_ok:
+                self._commit_pick(1, shape.label, f"conf={shape.confidence:.2f}")
+                return
+            if set2_ok:
+                self._skip_target(f"set2 '{siglip.label}' during Set1 phase")
+                return
+        else:  # phase 2
+            if set2_ok:
+                self._commit_pick(2, siglip.label, f"conf={siglip.confidence:.2f} face_visible")
+                return
+            if set1_ok:
+                self._skip_target(f"stray set1 '{shape.label}' during Set2 phase")
                 return
 
-        # No confident pick decision yet: pass (blacklist) once we time out.
+        # No confident phase-appropriate decision: pass (blacklist) once we time out.
         if self._time_in_state() > self.classify_timeout_sec:
             obj_id = self.current_target.id if self.current_target else 0
             self.get_logger().warn(f"GATE PASS id={obj_id} (classify timeout) -> blacklist")
+            self._decide(f"PASS #{obj_id} (classify timeout)")
             self._blacklist(obj_id)
             self.current_target = None
             self.set_type = 0
@@ -344,6 +422,9 @@ class MissionFsmNode(Node):
         msg.current_target_id = self.current_target.id if self.current_target else 0
         msg.stamp = self.get_clock().now().to_msg()
         self.pub_state.publish(msg)
+
+        # 3) publish current pick phase (target selector filters candidates by it)
+        self.pub_phase.publish(Int8(data=int(self.phase)))
 
 
 def main(args=None) -> None:

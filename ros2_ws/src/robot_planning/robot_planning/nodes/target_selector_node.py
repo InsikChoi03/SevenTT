@@ -23,8 +23,11 @@ import math
 import rclpy
 from rclpy.node import Node
 from robot_interfaces.msg import Object, WorldModel
+from std_msgs.msg import Int8
 
 
+# Default per-set base scores (competition: Set2 20 > Set1 10). Overridable via params so a
+# mock test can flip them (set1_base 20 > set2_base 10) to bias toward Set1 first.
 SET1_POINTS = 10.0
 SET2_POINTS = 20.0
 
@@ -37,44 +40,66 @@ class TargetSelectorNode(Node):
         self.declare_parameter("set1_label", "")      # e.g. "icosahedron"
         self.declare_parameter("set2_label", "")      # e.g. "apple"
         self.declare_parameter("rate_hz", 2.0)
-        # Base score for unknown candidates. Kept below set1 (10) so confirmed
+        # Base score for unknown candidates. Kept below set1/set2 so confirmed
         # today-targets always win over unexplored objects.
         self.declare_parameter("explore_base", 5.0)
+        # Per-set base scores (default = competition Set2>Set1). A mock test flips these.
+        self.declare_parameter("set1_base", SET1_POINTS)
+        self.declare_parameter("set2_base", SET2_POINTS)
 
         self.set1_label = str(self.get_parameter("set1_label").value)
         self.set2_label = str(self.get_parameter("set2_label").value)
         rate = float(self.get_parameter("rate_hz").value)
         self.explore_base = float(self.get_parameter("explore_base").value)
+        self.set1_base = float(self.get_parameter("set1_base").value)
+        self.set2_base = float(self.get_parameter("set2_base").value)
+
+        # Pick phase from the FSM: 0 = no filter (competition), 1 = Set1 only, 2 = Set2 only.
+        self.phase = 0
 
         self.world: WorldModel | None = None
 
         self.create_subscription(WorldModel, "/world_model", self.on_world, 10)
+        self.create_subscription(Int8, "/planning/phase", self.on_phase, 10)
         self.pub = self.create_publisher(Object, "/selected_target", 10)
         self.timer = self.create_timer(1.0 / rate, self.tick)
 
         self.get_logger().info(
-            f"set1='{self.set1_label}' set2='{self.set2_label}' "
+            f"set1='{self.set1_label}'(base {self.set1_base}) "
+            f"set2='{self.set2_label}'(base {self.set2_base}) "
             f"explore_base={self.explore_base} rate={rate}Hz"
         )
 
     def on_world(self, msg: WorldModel) -> None:
         self.world = msg
 
+    def on_phase(self, msg: Int8) -> None:
+        self.phase = int(msg.data)
+
     def _score(self, obj: Object, rx: float, ry: float) -> float | None:
         # Blacklisted objects (passed or already picked) are always skipped.
         if obj.blacklisted:
             return None
-        if obj.set_type == 1:
+        st = obj.set_type
+        # Phase filter: in Set1 phase defer every Set2 box; in Set2 phase skip leftover Set1.
+        if self.phase == 1 and st == 2:
+            return None
+        if self.phase == 2 and st == 1:
+            return None
+        if st == 1:
+            # Set1 shapes carry the concrete shape name from YOLO (far), so match today's shape.
             if not self.set1_label or obj.class_label != self.set1_label:
                 return None
-            base = SET1_POINTS
-        elif obj.set_type == 2:
-            if not self.set2_label or obj.class_label != self.set2_label:
+            base = self.set1_base
+        elif st == 2:
+            # Set2 fruit_photo_cube: the specific fruit is only known after a close SigLIP read,
+            # so route to ANY fruit box (generic or fruit-typed); the FSM confirms today's fruit.
+            if not self.set2_label:
                 return None
-            base = SET2_POINTS
-        elif obj.set_type == 0:
-            # Unknown top-cam candidate: investigate it. Lower base than a
-            # confirmed target so known targets outrank unexplored ones.
+            base = self.set2_base
+        elif st == 0:
+            # Unknown candidate: investigate it. Lower base than a confirmed target so
+            # known targets outrank unexplored ones.
             base = self.explore_base
         else:
             # storage_flag (set_type==3) and anything else: not a pick target.

@@ -26,6 +26,7 @@ setup(
         'console_scripts': [
             'mission_fsm_node = robot_planning.nodes.mission_fsm_node:main',
             'target_selector_node = robot_planning.nodes.target_selector_node:main',
+            'explorer_node = robot_planning.nodes.explorer_node:main',
         ],
     },
 )

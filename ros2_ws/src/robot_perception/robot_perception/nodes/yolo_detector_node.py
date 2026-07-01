@@ -1,19 +1,18 @@
 """Custom YOLOv8n detector over two camera streams (replaces yolo_world_node).
 
-One shared YOLOv8n model (models/cube.pt, custom-trained on the 4 white polyhedra:
-cube / octahedron / dodecahedron / icosahedron) serves both cameras:
-  • top  (wide-angle)  -> /camera_top/detections   (world-model object positions)
-  • body (eye-in-hand) -> /camera_body/detections  (visual servo + classification)
+Per-stream 5-class models (as of 2026-07-01; classes
+cube / octahedron / dodecahedron / icosahedron / fruit_photo_cube):
+  • top  (wide-angle)  uses top_model_path  (models/wide.pt) -> /camera_top/detections
+  • body (base-fixed)  uses body_model_path (models/cube.pt) -> /camera_body/detections
+Both models are trained on their own camera's domain, so each stream uses the matching one;
+set top/body to the same path (or leave them empty to fall back to model_path) to share a
+single instance. predict() across both models is serialized with one lock (single GPU).
 
-Because the model is custom-trained with fixed classes there is no set_classes step (unlike
-the deprecated YOLO-World). predict() on the shared model is serialized with a lock so the
-two image callbacks do not interleave.
-
-It ALSO replaces shape_heuristic_node: the best body-cam detection is republished as a
-robot_interfaces/Classification on /classification/shape (set_type=1, source='yolo'), so the
-FSM's existing Set1 shape gate keeps working unchanged. Set2 fruit gating still comes from
-siglip_gate_node, which reads /camera_body/detections (Set2 objects are fruit-picture cubes,
-so cube.pt detects the box and SigLIP reads the printed fruit face).
+It ALSO replaces shape_heuristic_node: the best body-cam SHAPE detection is republished as a
+robot_interfaces/Classification on /classification/shape (set_type=1, source='yolo') for the
+FSM's Set1 gate. Set2 boxes are the fruit_photo_cube class — YOLO establishes they are fruit
+boxes and they are excluded from the shape stream; siglip_gate_node reads the printed fruit
+face for the specific fruit type.
 
 Dry-run safe: if ultralytics/torch or the weights are missing, the node still constructs,
 advertises all topics, logs one error, and the image callbacks early-return.
@@ -46,9 +45,14 @@ class YoloDetectorNode(Node):
     def __init__(self) -> None:
         super().__init__("yolo_detector_node")
 
+        # Per-stream models (5-class wide.pt / cube.pt as of 2026-07-01). `model_path` is the
+        # legacy single-model fallback: if top_model_path / body_model_path are empty, both
+        # streams use model_path (backward compatible with the old single-model config).
         self.declare_parameter(
             "model_path", "/home/seventt/seventt/workspace/models/cube.pt"
         )
+        self.declare_parameter("top_model_path", "")     # wide cam; "" -> model_path
+        self.declare_parameter("body_model_path", "")    # body cam; "" -> model_path
         self.declare_parameter("conf_threshold", 0.5)
         self.declare_parameter("imgsz", 640)
         self.declare_parameter("device", "auto")
@@ -59,6 +63,8 @@ class YoloDetectorNode(Node):
         self.declare_parameter("shape_topic", "/classification/shape")
 
         self.model_path = str(self.get_parameter("model_path").value)
+        self.top_model_path = str(self.get_parameter("top_model_path").value) or self.model_path
+        self.body_model_path = str(self.get_parameter("body_model_path").value) or self.model_path
         self.conf_threshold = float(self.get_parameter("conf_threshold").value)
         self.imgsz = int(self.get_parameter("imgsz").value)
         self.top_min_interval = float(self.get_parameter("top_min_interval_sec").value)
@@ -68,12 +74,17 @@ class YoloDetectorNode(Node):
         self.device = self._resolve_device(str(self.get_parameter("device").value))
 
         self.bridge = CvBridge()
-        self.model: Any | None = None
-        self._model_lock = threading.Lock()   # predict() on shared model must not interleave
+        # One lock serializes predict() across BOTH models (single GPU).
+        self._model_lock = threading.Lock()
         self._last_top = 0.0
         self._last_body = 0.0
 
-        self._load_model()
+        self.top_model = self._load_model(self.top_model_path, "top")
+        # Share the instance when both streams use the same weights (saves ~1 model in memory).
+        if self.body_model_path == self.top_model_path:
+            self.body_model = self.top_model
+        else:
+            self.body_model = self._load_model(self.body_model_path, "body")
 
         self.pub_top = self.create_publisher(DetectionArray, "/camera_top/detections", 10)
         self.pub_body = self.create_publisher(DetectionArray, "/camera_body/detections", 10)
@@ -86,9 +97,12 @@ class YoloDetectorNode(Node):
         self.create_subscription(Image, "/camera_top/image_raw", self.on_top_image, 10)
         self.create_subscription(Image, "/camera_body/image_raw", self.on_body_image, 10)
 
+        shared = self.body_model is self.top_model
         self.get_logger().info(
-            f"model='{self.model_path}' device={self.device} conf={self.conf_threshold} "
-            f"imgsz={self.imgsz} shape_pub={self.publish_shape}"
+            f"top_model='{self.top_model_path}' body_model='{self.body_model_path}' "
+            f"{'(shared instance)' if shared else '(separate instances)'} "
+            f"device={self.device} conf={self.conf_threshold} imgsz={self.imgsz} "
+            f"shape_pub={self.publish_shape}"
         )
 
     # ------------------------------------------------------------------ setup
@@ -102,29 +116,30 @@ class YoloDetectorNode(Node):
                 return "cpu"
         return requested
 
-    def _load_model(self) -> None:
+    def _load_model(self, path: str, tag: str) -> Any | None:
         if not _YOLO_AVAILABLE:
             self.get_logger().error(
                 "ultralytics/torch unavailable; running idle (no inference). "
                 "Detection topics will be advertised but stay empty."
             )
-            return
+            return None
         try:
-            model = YOLO(self.model_path)
+            model = YOLO(path)
             try:
                 model.to(self.device)
             except Exception:  # noqa: BLE001 - device move is best-effort
                 self.get_logger().warn(
-                    f"could not move model to device='{self.device}'", throttle_duration_sec=10.0
+                    f"could not move {tag} model to device='{self.device}'",
+                    throttle_duration_sec=10.0,
                 )
-            self.model = model
             names = getattr(model, "names", None)
-            self.get_logger().info(f"YOLOv8n loaded from '{self.model_path}' classes={names}")
+            self.get_logger().info(f"YOLOv8n {tag} loaded from '{path}' classes={names}")
+            return model
         except Exception as exc:  # noqa: BLE001 - never raise out of __init__
-            self.model = None
             self.get_logger().error(
-                f"failed to load weights '{self.model_path}': {exc}; running idle."
+                f"failed to load {tag} weights '{path}': {exc}; that stream runs idle."
             )
+            return None
 
     def _now_sec(self) -> float:
         return self.get_clock().now().nanoseconds * 1e-9
@@ -135,19 +150,19 @@ class YoloDetectorNode(Node):
         if (now - self._last_top) < self.top_min_interval:
             return
         self._last_top = now
-        self._process(msg, "camera_top", self.pub_top)
+        self._process(msg, "camera_top", self.pub_top, self.top_model)
 
     def on_body_image(self, msg: Image) -> None:
         now = self._now_sec()
         if (now - self._last_body) < self.body_min_interval:
             return
         self._last_body = now
-        arr = self._process(msg, "camera_body", self.pub_body)
+        arr = self._process(msg, "camera_body", self.pub_body, self.body_model)
         if arr is not None and self.pub_shape is not None:
             self._publish_shape(arr)
 
-    def _process(self, msg: Image, frame_id: str, pub) -> DetectionArray | None:
-        if self.model is None or not _YOLO_AVAILABLE:
+    def _process(self, msg: Image, frame_id: str, pub, model: Any | None) -> DetectionArray | None:
+        if model is None or not _YOLO_AVAILABLE:
             return None
         try:
             frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
@@ -158,7 +173,7 @@ class YoloDetectorNode(Node):
             return None
         try:
             with self._model_lock:
-                results = self.model.predict(
+                results = model.predict(
                     frame, conf=self.conf_threshold, imgsz=self.imgsz, verbose=False
                 )
         except Exception as exc:  # noqa: BLE001 - inference must not kill the node
@@ -208,13 +223,15 @@ class YoloDetectorNode(Node):
         return arr
 
     def _publish_shape(self, arr: DetectionArray) -> None:
-        """Best body detection -> Classification on /classification/shape (replaces shape_heuristic).
+        """Best body SHAPE detection -> Classification on /classification/shape (Set1 gate).
 
         The FSM compares shape.label to today's set1_label itself, so is_target stays False here.
+        fruit_photo_cube is a Set2 box (SigLIP owns it), so it is excluded from the shape stream.
         """
-        if not arr.detections:
+        shapes = [d for d in arr.detections if d.label != "fruit_photo_cube"]
+        if not shapes:
             return
-        best = max(arr.detections, key=lambda d: d.confidence)
+        best = max(shapes, key=lambda d: d.confidence)
         c = Classification()
         c.header = arr.header
         c.label = best.label

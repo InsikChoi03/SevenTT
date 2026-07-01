@@ -33,7 +33,7 @@ import cv2
 import numpy as np
 import rclpy
 from cv_bridge import CvBridge
-from geometry_msgs.msg import PoseStamped
+from geometry_msgs.msg import PoseStamped, Vector3
 from rclpy.node import Node
 from sensor_msgs.msg import Image
 from std_msgs.msg import Float32MultiArray
@@ -74,6 +74,17 @@ class LocalizerNode(Node):
         self.declare_parameter("publish_rate_hz", 20.0)
         self.declare_parameter("use_visual_odometry", True)
         self.declare_parameter("broadcast_tf", True)
+        # Snap heading to the nearest cardinal from a dominant wall edge. Great inside the
+        # arena, but OUTSIDE it (mock test) random room/table edges cause spurious snaps, so
+        # allow disabling it (VO yaw stays on and works on any textured floor).
+        self.declare_parameter("use_landmark_correction", True)
+        # Object-landmark pose correction: consume the world model's rigid drift estimate on
+        # /localization/landmark_correction (dx,dy,dtheta) and blend a small, clamped fraction
+        # into the pose. This corrects x/y AND heading using re-observed mapped objects.
+        self.declare_parameter("use_object_landmarks", False)
+        self.declare_parameter("landmark_gain", 0.2)
+        self.declare_parameter("landmark_max_step_m", 0.1)
+        self.declare_parameter("landmark_max_step_rad", 0.1)
 
         # Top-camera intrinsics. If any is 0 -> skip undistort / VO-scale usage.
         self.declare_parameter("top_fx", 0.0)
@@ -96,6 +107,11 @@ class LocalizerNode(Node):
         rate = float(self.get_parameter("publish_rate_hz").value)
         self.use_vo = bool(self.get_parameter("use_visual_odometry").value)
         self.broadcast_tf = bool(self.get_parameter("broadcast_tf").value)
+        self.use_landmark_correction = bool(self.get_parameter("use_landmark_correction").value)
+        self.use_object_landmarks = bool(self.get_parameter("use_object_landmarks").value)
+        self.landmark_gain = float(self.get_parameter("landmark_gain").value)
+        self.landmark_max_step_m = float(self.get_parameter("landmark_max_step_m").value)
+        self.landmark_max_step_rad = float(self.get_parameter("landmark_max_step_rad").value)
 
         self.fx = float(self.get_parameter("top_fx").value)
         self.fy = float(self.get_parameter("top_fy").value)
@@ -139,12 +155,16 @@ class LocalizerNode(Node):
 
         self.create_subscription(Float32MultiArray, "/base/wheel_odom", self.on_wheel_odom, 10)
         self.create_subscription(Image, "/camera_top/image_raw", self.on_top_image, 10)
+        self.create_subscription(
+            Vector3, "/localization/landmark_correction", self.on_landmark_correction, 10
+        )
         self.pub = self.create_publisher(PoseStamped, "/localization/pose", 10)
         self.timer = self.create_timer(1.0 / rate, self.publish_pose)
 
         self.get_logger().info(
             f"localizer start=({self.x:.2f},{self.y:.2f},{self.theta:.2f}) "
-            f"lx={self.lx} ly={self.ly} vo={self.use_vo} tf={self.tf_broadcaster is not None} "
+            f"lx={self.lx} ly={self.ly} vo={self.use_vo} landmark={self.use_landmark_correction} "
+            f"obj_landmarks={self.use_object_landmarks} tf={self.tf_broadcaster is not None} "
             f"intrinsics={'set' if self.have_intrinsics else 'unset'} "
             f"fisheye={self.use_fisheye} rate={rate}Hz"
         )
@@ -186,6 +206,21 @@ class LocalizerNode(Node):
         self.y += vyw * dt
         self.theta = wrap_angle(self.theta + w * dt)
 
+    # ------------------------------------------------------------- object landmarks
+    def on_landmark_correction(self, msg: Vector3) -> None:
+        """Blend a small, clamped fraction of the world model's rigid drift estimate.
+
+        msg = (dx, dy, dtheta) field-frame correction from re-observed mapped objects. Applied
+        gently (gain + per-update clamp) so the pose converges without teleporting; the wheel
+        odometry keeps integrating between corrections.
+        """
+        if not self.use_object_landmarks:
+            return
+        g, mx, mr = self.landmark_gain, self.landmark_max_step_m, self.landmark_max_step_rad
+        self.x += max(-mx, min(mx, g * float(msg.x)))
+        self.y += max(-mx, min(mx, g * float(msg.y)))
+        self.theta = wrap_angle(self.theta + max(-mr, min(mr, g * float(msg.z))))
+
     # ----------------------------------------------------------------- top camera
     def on_top_image(self, msg: Image) -> None:
         """Visual-odometry heading correction + landmark absolute-correction hook."""
@@ -218,14 +253,16 @@ class LocalizerNode(Node):
             # theta=pi sits exactly on it, so this matters from the first frame.
             self.theta = wrap_angle(self.theta + 0.1 * theta_visual)
 
-        # Absolute-correction hook (approximate; see _detect_landmarks docstring).
-        landmark = self._detect_landmarks(gray)
-        if landmark is not None:
-            _, _, theta_land = landmark
-            # Correct ONLY theta: blend the WRAPPED angular error toward the wall-aligned
-            # heading (wrap-safe; linear angle averaging would jump near +/-pi).
-            err = wrap_angle(theta_land - self.theta)
-            self.theta = wrap_angle(self.theta + 0.05 * err)
+        # Absolute-correction hook (approximate; see _detect_landmarks docstring). Skipped
+        # outside the arena, where random edges would snap the heading to a wrong cardinal.
+        if self.use_landmark_correction:
+            landmark = self._detect_landmarks(gray)
+            if landmark is not None:
+                _, _, theta_land = landmark
+                # Correct ONLY theta: blend the WRAPPED angular error toward the wall-aligned
+                # heading (wrap-safe; linear angle averaging would jump near +/-pi).
+                err = wrap_angle(theta_land - self.theta)
+                self.theta = wrap_angle(self.theta + 0.05 * err)
 
         self.prev_gray = gray
 

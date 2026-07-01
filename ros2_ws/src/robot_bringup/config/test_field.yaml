@@ -1,0 +1,152 @@
+# Parameters for the MOCK FIELD TEST (recognition-performance verification, OUTSIDE the arena).
+# Overrides only; started by test_field.launch.py. The arm is NOT used in this test — PICK is
+# logged only (mission_fsm dry_pick:true), and no arm nodes are launched.
+#
+# !!! FILL IN before running !!!
+#   set1_label / set2_label : the shape and fruit you actually place out
+#                             (set1_label one of cube/octahedron/dodecahedron/icosahedron;
+#                              set2_label one of apple/orange/banana/pineapple).
+#   shape_target_total / fruit_target_total : how many of each you place.
+# With the labels left empty the robot still roams + maps + logs recognition (never picks) and
+# ends via select_timeout — a valid perception-only smoke run.
+#
+# Calibration values (wide fisheye intrinsics/extrinsics) are copied verbatim from
+# perception.yaml — DO NOT change them. Model / homography / output paths are absolute so they
+# resolve regardless of the launch working directory.
+
+localizer_node:
+  ros__parameters:
+    initial_x: 0.0
+    initial_y: 0.0
+    initial_theta: 0.0
+    publish_rate_hz: 20.0
+    use_visual_odometry: true
+    use_landmark_correction: false        # no arena walls -> disable cardinal yaw-snap
+    use_object_landmarks: true            # correct x/y/theta drift from re-observed mapped objects
+    landmark_gain: 0.2
+    landmark_max_step_m: 0.1
+    landmark_max_step_rad: 0.1
+    broadcast_tf: true
+    fisheye_model: true
+    top_fx: 857.316
+    top_fy: 860.071
+    top_cx: 789.858
+    top_cy: 541.748
+    dist_coeffs: [-0.085721, 0.053910, -0.034649, 0.007943]
+
+yolo_detector_node:
+  ros__parameters:
+    # Per-stream 5-class models (wide.pt for the fisheye top cam, cube.pt for the body cam).
+    top_model_path: "/home/seventt/seventt/workspace/models/wide.pt"
+    body_model_path: "/home/seventt/seventt/workspace/models/cube.pt"
+    conf_threshold: 0.5
+    imgsz: 640
+    device: "auto"
+    top_min_interval_sec: 0.12
+    body_min_interval_sec: 0.06
+    publish_shape_classification: true
+    shape_topic: "/classification/shape"
+
+siglip_gate_node:
+  ros__parameters:
+    model_id: "google/siglip-base-patch16-224"
+    set2_label: "orange"                  # today's Set2 fruit target
+    fruit_labels: ["apple", "orange", "banana", "pineapple"]
+    confidence_threshold: 0.7
+    device: "auto"
+    min_box_area: 1200                    # raise so only CLOSE body fruit boxes classify
+
+world_model_node:
+  ros__parameters:
+    publish_rate_hz: 10.0
+    # wide fisheye projection (verbatim from perception.yaml — GT-validated)
+    fisheye_model: true
+    image_rotated_180: true
+    top_fx: 857.316
+    top_fy: 860.071
+    top_cx: 789.858
+    top_cy: 541.748
+    dist_coeffs: [-0.085721, 0.053910, -0.034649, 0.007943]
+    cam_height_m: 0.885
+    cam_pitch_deg: 88.0
+    cam_offset_x: 0.204
+    cam_offset_y: 0.052
+    cam_yaw_deg: 180.0
+    object_center_height_m: 0.04
+    assoc_radius_m: 0.18
+    conf_ema: 0.5
+    forget_after_sec: 120.0               # persist the whole-field map (static objects)
+    # object-landmark pose correction (feeds /localization/landmark_correction -> localizer)
+    landmark_correction: true
+    lock_min_obs: 5                       # observations before a track freezes into an anchor
+    lock_min_conf: 0.4
+    landmark_min_pairs: 3                 # need >=3 re-observed anchors to solve the rigid drift
+    landmark_max_resid_m: 0.30
+    unlock_after: 3                       # an anchor off-consensus this many frames = object moved -> unlock
+    # body-cam fusion (base-fixed cam; pick homography H = px -> arm_base cm)
+    body_homography_path: "/home/seventt/seventt/workspace/data/pick/homography.npz"
+    arm_base_offset_x: 0.15
+    arm_base_offset_y: 0.0
+    body_workspace_m: [0.0, 0.6, -0.35, 0.35]   # H-valid near workspace (arm_base metres)
+
+target_selector_node:
+  ros__parameters:
+    set1_label: "icosahedron"             # today's Set1 shape target (20면체)
+    set2_label: "orange"                  # today's Set2 fruit target
+    rate_hz: 2.0
+    explore_base: 5.0
+    set1_base: 20.0                       # Set1 outranks Set2 (approach bias; order enforced by FSM phase)
+    set2_base: 10.0
+
+mission_fsm_node:
+  ros__parameters:
+    set1_label: "icosahedron"             # today's Set1 shape target (20면체) — 3 placed
+    set2_label: "orange"                  # today's Set2 fruit target — 2 placed
+    conf_threshold: 0.7
+    approach_dist_m: 0.25
+    align_settle_sec: 1.0
+    classify_timeout_sec: 2.0
+    pick_duration_sec: 4.0                # dwell at each pick so you can remove the object by hand
+    shape_target_total: 3                 # pick all 3 icosahedrons
+    fruit_target_total: 2                 # pick both oranges
+    publish_rate_hz: 5.0
+    dry_pick: true                        # log the pick, do not fire /arm/pick_trigger
+    end_after_quota: true                 # END once both quotas met (skip storage phase)
+    select_timeout_sec: 15.0              # graceful phase-advance / END if fewer found
+
+go_to_goal_node:
+  ros__parameters:
+    control_rate_hz: 20.0
+    max_lin_speed: 0.20                   # gentle on an open floor
+    max_ang_speed: 1.0
+
+base_controller_node:
+  ros__parameters:
+    lx: 0.10
+    ly: 0.10
+    cmd_timeout_sec: 0.5
+
+explorer_node:
+  ros__parameters:
+    explore_bounds_m: 1.5
+    explore_step_m: 0.5
+    yaw_sweep_step_rad: 0.785
+    waypoint_settle_sec: 1.0
+    scan_state_name: "SCAN"
+
+mcu_bridge_base_node:
+  ros__parameters:
+    port: "/dev/ttyUSB0"                  # base = CH340 (arm ACM is NOT launched)
+    baud: 115200
+
+recognition_viz_node:
+  ros__parameters:
+    output_dir: "/home/seventt/seventt/workspace/data/mock_field_test"
+    field_extent_m: [-2.0, 2.0, -2.0, 2.0]
+    canvas_px: 800
+    snapshot_interval_sec: 5.0
+    show_window: true                     # live cv2 window if a display is present; else live.png fallback
+    show_camera_panels: true              # YOLO-annotated wide + body feeds beside the map
+    write_live_png: true                  # overwrite <run>/live.png each redraw (open it in the IDE)
+    trail_max_points: 2000
+    redraw_rate_hz: 5.0
