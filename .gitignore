@@ -20,11 +20,9 @@ models/*.bin
 !models/.gitkeep
 !models/README.md
 # keep trained models (small, valuable, not trivially reproducible)
-!models/cube.pt
-!models/cube_v1_backup.pt
-!models/cube_v2.pt
-!models/cube_v3.pt
-!models/wide.pt
+# cube*/wide* = 우리가 학습한 것(백업), FastSAM-s/yolov8s-world = 재다운로드 가능(제외)
+!models/cube*.pt
+!models/wide*.pt
 
 # Data (raw recordings, bag files)
 data/**

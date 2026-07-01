@@ -141,6 +141,12 @@ def grab(cam, tries=4):
     return f
 
 
+def _fname(batch, ts, camtag, i):
+    """캡처 파일명: [배치라벨_]세션ts_카메라태그_인덱스 → 배치·캠 간 충돌·혼동 방지."""
+    pfx = f"roam_{batch}_{ts}" if batch else f"roam_{ts}"
+    return f"{pfx}_{camtag}_{i:03d}.jpg"
+
+
 def return_to_start(base, fwd_motion, steps, dur):
     """fwd_motion 으로 steps번 돈 것을 반대로 풀어 시작 위치 복귀(선 꼬임 해제)."""
     opp = {"cw": "ccw", "ccw": "cw"}.get(fwd_motion)
@@ -153,7 +159,7 @@ def return_to_start(base, fwd_motion, steps, dur):
         time.sleep(0.15)
 
 
-def run_manual(base, cams, outdir, step_motion, dur, settle):
+def run_manual(base, cams, outdir, step_motion, dur, settle, batch=""):
     """수동 스텝: SPACE=현재방향 회전+촬영, c=방향전환(cw<->ccw), b=반대로 한스텝(촬영X),
     r=시작복귀, q=복귀후종료. net=부호있는 cw스텝(시작기준)으로 선꼬임 추적 → q/r에서 복귀로 풀림.
     cw로 ~180도 쓸고 c로 ccw 전환해 되쓸면 ±범위 안에서 무한 반복 수집 가능."""
@@ -188,7 +194,7 @@ def run_manual(base, cams, outdir, step_motion, dur, settle):
                     g = grab(cam)
                     if g is None:
                         print(f"  {tag} 캡처실패"); continue
-                    cv2.imwrite(f"{outdir[tag]}/roam_{ts}_{tag}_{shots[tag]:03d}.jpg", g)
+                    cv2.imwrite(f"{outdir[tag]}/" + _fname(batch, ts, tag, shots[tag]), g)
                     shots[tag] += 1
                 print(f"  {cur} net-cw {net}: " + " ".join(f"{t}:{shots[t]}" for t in cams), flush=True)
             elif k == ord("c"):                               # 방향 전환 (cw <-> ccw)
@@ -224,6 +230,7 @@ def main():
     ap.add_argument("--manual", action="store_true",
                     help="수동 스텝 모드: 창에서 SPACE=회전+촬영, q=복귀후종료 (180도만 돌릴 때 권장)")
     ap.add_argument("--step-motion", default="cw", choices=["cw", "ccw"], help="수동 회전 방향")
+    ap.add_argument("--batch", default="", help="파일명 배치 라벨(예: bodyextra2) — 배치 구분·중복 방지. 영숫자/_ 권장")
     ap.add_argument("--dry-run", action="store_true", help="안 움직이고 두 캠 1장씩만 저장+계획")
     args = ap.parse_args()
 
@@ -257,7 +264,7 @@ def main():
             f = grab(cam)
             if f is None:
                 print(f"[dry] {tag} 프레임 실패"); continue
-            p = f"{outdir[tag]}/dryrun_{tag}.jpg"
+            p = f"{outdir[tag]}/dryrun_{args.batch + '_' if args.batch else ''}{tag}.jpg"
             cv2.imwrite(p, f)
             print(f"[dry] {tag} {f.shape[1]}x{f.shape[0]} -> {p}")
         for c in cams.values():
@@ -282,7 +289,7 @@ def main():
     # ---- 수동 스텝 모드: SPACE로 한 스텝씩, 종료 시 시작위치 복귀(선 풀기) ----
     if args.manual:
         try:
-            run_manual(base, cams, outdir, args.step_motion, args.move_dur, args.settle)
+            run_manual(base, cams, outdir, args.step_motion, args.move_dur, args.settle, args.batch)
         finally:
             base.close()
             for c in cams.values():
@@ -301,7 +308,7 @@ def main():
                 f = grab(cam)
                 if f is None:
                     print(f"  {i+1}/{args.cycles} [{m}] {tag} 캡처실패"); continue
-                p = f"{outdir[tag]}/roam_{ts}_{tag}_{i:03d}.jpg"
+                p = f"{outdir[tag]}/" + _fname(args.batch, ts, tag, i)
                 cv2.imwrite(p, f); saved[tag] += 1
             done = " ".join(f"{t}:{saved[t]}" for t in cams)
             print(f"  {i+1}/{args.cycles} [{m}] -> {done}", flush=True)

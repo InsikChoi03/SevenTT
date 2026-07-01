@@ -43,13 +43,17 @@ def yolo_label(path, model_path, conf):
     H, W = frame.shape[:2]
     r = _yolo.predict(frame, imgsz=640, conf=conf, verbose=False, agnostic_nms=True, iou=0.6)[0]
     names = _yolo.names
+    name2id = {v: k for k, v in names.items()}
+    # 부분-전체 쌍: 과일패치는 큐브 안에 nested → dedupe에서 서로 억제 금지(둘 다 유지)
+    exempt = ({frozenset((name2id["cube"], name2id["fruit_photo_cube"]))}
+              if "cube" in name2id and "fruit_photo_cube" in name2id else None)
     lines = []; review = frame.copy(); flags = []
     dets = []
     if r.boxes is not None:
         for b in r.boxes:
             x1, y1, x2, y2 = b.xyxy[0].tolist()
             dets.append((x1, y1, x2, y2, int(b.cls[0]), float(b.conf[0])))
-    for (x1, y1, x2, y2, cls, cf) in box_utils.dedupe(dets):   # 중복/박스속박스 제거
+    for (x1, y1, x2, y2, cls, cf) in box_utils.dedupe(dets, nested_exempt=exempt):   # 중복/박스속박스 제거(단 cube⊃patch는 유지)
         cx = ((x1 + x2) / 2) / W; cy = ((y1 + y2) / 2) / H
         w = (x2 - x1) / W; h = (y2 - y1) / H
         lines.append(f"{cls} {cx:.6f} {cy:.6f} {w:.6f} {h:.6f}")

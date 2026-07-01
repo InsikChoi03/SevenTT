@@ -11,7 +11,7 @@ def _area(b):
     return max(0.0, b[2] - b[0]) * max(0.0, b[3] - b[1])
 
 
-def dedupe(dets, iou_thr=0.6, iomin_thr=0.7, same_cls_iomin=0.45):
+def dedupe(dets, iou_thr=0.6, iomin_thr=0.7, same_cls_iomin=0.45, nested_exempt=None):
     """dets: [(x1,y1,x2,y2,cls,conf), ...] → 중복 제거(신뢰도 높은 것 우선).
 
     낮은 신뢰도 박스가 이미 채택된 박스와
@@ -20,12 +20,18 @@ def dedupe(dets, iou_thr=0.6, iomin_thr=0.7, same_cls_iomin=0.45):
     이면 버린다. IoMin 임계는 클래스 인지형:
       - 같은 클래스 겹침 = 거의 확실히 같은 물체 → same_cls_iomin(0.45, 적극 병합)
       - 다른 클래스 겹침 = 다른 물체 부분가림일 수도 → iomin_thr(0.7, 보수적)
+
+    nested_exempt: {frozenset({clsA, clsB}), ...} — 부분-전체 쌍(예: cube ⊃ fruit_photo_cube).
+      이 클래스 쌍끼리는 서로 포함/겹쳐도 억제하지 않고 **둘 다 유지**(패치가 큐브 안에
+      nested로 공존해야 하는 설계). 미지정이면 기존 동작(모든 포함 억제).
     """
     out = []
     for d in sorted(dets, key=lambda d: d[5], reverse=True):   # conf 내림차순
         a = _area(d)
         drop = False
         for k in out:
+            if nested_exempt and frozenset((d[4], k[4])) in nested_exempt:
+                continue                                       # 부분-전체 쌍 → 서로 억제 안 함
             ix1, iy1 = max(d[0], k[0]), max(d[1], k[1])
             ix2, iy2 = min(d[2], k[2]), min(d[3], k[3])
             inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
