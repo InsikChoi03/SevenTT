@@ -8,7 +8,8 @@ from launch_ros.actions import Node
 
 def generate_launch_description() -> LaunchDescription:
     common = dict(
-        sensor_mode=3, width=1640, height=1232, fps=30, flip_method=0, publish_rate=30.0
+        sensor_mode=3, width=1640, height=1232, fps=30, flip_method=0, publish_rate=30.0,
+        wbmode=8,   # MUST match the training-capture pipeline (csi_capture.py) or YOLO degrades
     )
     top = Node(
         package="robot_hardware",
@@ -33,6 +34,8 @@ def generate_launch_description() -> LaunchDescription:
             "frame_id": "camera_body",
             "topic": "/camera_body/image_raw",
             **common,
+            # body cam training applied fixed WB gains to kill the magenta cast (csi_capture)
+            "wb_gains": [1.16, 1.08, 0.82],
         }],
         output="screen",
     )

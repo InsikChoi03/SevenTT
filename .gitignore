@@ -47,3 +47,5 @@ venv/
 # Secrets / local config
 .env
 *.local.yaml
+
+*.zip

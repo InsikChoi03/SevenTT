@@ -22,13 +22,14 @@ and that camera's fusion is simply skipped (a warning is logged once).
 from __future__ import annotations
 
 import math
+from collections import deque
 from dataclasses import dataclass, field
 
 import rclpy
 from rclpy.node import Node
 
 from geometry_msgs.msg import PoseStamped, Vector3
-from std_msgs.msg import UInt64
+from std_msgs.msg import Float32MultiArray, UInt64
 from robot_interfaces.msg import Classification, DetectionArray, Object, WorldModel
 
 # cv2/numpy only needed for the fisheye ray (top cam is a ~150 deg fisheye). Guarded so the
@@ -58,10 +59,10 @@ _LABEL_TO_SET_TYPE: dict[str, int] = {
 # promoted from fruit_photo_cube to the concrete fruit, keep it typed Set2).
 _FRUIT_LABELS = frozenset({"apple", "orange", "banana", "pineapple"})
 
-# A body-cam observation is closer / more reliable, so its class vote counts this much more
-# than a wide-cam vote. Identity is the argmax of accumulated confidence-weighted votes
-# (aggregated over count AND confidence — NOT a single latest-frame decision).
-_BODY_VOTE_WEIGHT = 3.0
+# Identity is decided PER SOURCE (see Track.body_votes/wide_votes): the body cam is the close,
+# reliable camera, so when it has classified an object its confidence-summed vote wins outright;
+# the wide cam only names objects the body never saw. This beats a single blended weight, which
+# let the high-frame-rate wide cam out-accumulate the body's higher per-vote weight over time.
 
 
 @dataclass
@@ -83,9 +84,14 @@ class Track:
     fruit_label: str = ""         # concrete fruit from SigLIP once a face was read
     fruit_confidence: float = 0.0
     last_body_sec: float = 0.0     # last time a body detection updated this track
+    last_wide_sec: float = 0.0     # last time a wide detection updated this track (for miss penalty)
     n_obs: int = 0                # total detections fused (evidence count)
     n_body: int = 0               # of which from the body cam
-    class_votes: dict = field(default_factory=dict)   # YOLO label -> summed conf*weight
+    # Identity votes kept PER SOURCE. The body cam is the close, reliable camera, so when it
+    # has classified an object its vote decides identity — a distant wide misread (white
+    # polyhedra look alike) never overrides it. Within a source, votes are confidence-summed.
+    wide_votes: dict = field(default_factory=dict)    # wide YOLO label -> summed conf
+    body_votes: dict = field(default_factory=dict)    # body YOLO label -> summed conf
     fruit_votes: dict = field(default_factory=dict)   # SigLIP fruit -> summed conf
     # Landmark anchoring: once a track is stable it LOCKS to a frozen world position, and
     # further re-observations are used to correct the ROBOT pose (not to move the track).
@@ -130,6 +136,19 @@ class WorldModelNode(Node):
         # only with yaw=180). Independent of image_rotated_180 (that is the optical-axis flip).
         self.declare_parameter("cam_yaw_deg", 0.0)
         self.declare_parameter("object_center_height_m", 0.04)  # ~8cm tall -> center 0.04
+        # HEIGHT-PARALLAX correction: a ground homography assumes z=0, but the box-centre pixel of a
+        # standing object is at object_center_height. Both cams anchor on the box CENTRE and correct
+        # to the object's true ground centre: P = G - (h/H)(G - C_nadir). The low body cam (H≈0.145,
+        # h/H≈0.28) needs it far more than the top wide cam (H≈0.885, h/H≈0.045). C_nadir/H per cam.
+        self.declare_parameter("height_correct", True)
+        self.declare_parameter("body_cam_nadir_x", 0.065)   # body cam ground nadir (base_link x), fwd
+        self.declare_parameter("body_cam_nadir_y", 0.0)
+        self.declare_parameter("body_cam_height_m", 0.145)  # body cam height above floor
+        # Residual systematic bias: the oblique body cam's box CENTRE sits on the object's FRONT
+        # face, so it reports the object ~half-depth NEARER than its true centroid (measured +3.9cm
+        # radial over a full-turn: wide=centroid is farther). Push the body projection this far
+        # radially OUT (from body nadir) so both cams land on the true centroid. 0 disables.
+        self.declare_parameter("body_radial_trim_m", 0.039)
 
         # --- BODY-cam fusion (base-fixed cam; pick homography H = body px -> arm_base cm) ---
         # H (data/pick/homography.npz) maps the body-cam ground-contact pixel to arm_base
@@ -138,6 +157,14 @@ class WorldModelNode(Node):
         # METRES (arm_base frame): only fuse body detections that project inside H's
         # calibrated near-workspace (outside it the homography extrapolates badly).
         self.declare_parameter("body_homography_path", "data/pick/homography.npz")
+        # Body GROUND homography (raw body pixel -> base_link x,y METRES), from aruco_calib.py
+        # --cam body. Same rotation-centre frame as the wide ground H (no arm_base offset / cm).
+        # When set it replaces the arm_base-cm body path above.
+        self.declare_parameter("body_ground_homography_path", "")
+        # Wide-cam ground homography (fisheye-undistorted normalised point -> base-frame x,y),
+        # from scripts/wide_calib.py. If set, the wide projection uses this measured mapping
+        # instead of the extrinsic pitch/height/offset model (more accurate absolute positions).
+        self.declare_parameter("wide_homography_path", "")
         self.declare_parameter("arm_base_offset_x", 0.15)
         self.declare_parameter("arm_base_offset_y", 0.0)
         self.declare_parameter("body_workspace_m", [0.0, 0.6, -0.35, 0.35])
@@ -153,11 +180,53 @@ class WorldModelNode(Node):
         self.declare_parameter("landmark_min_pairs", 3)
         self.declare_parameter("landmark_max_resid_m", 0.30)
         self.declare_parameter("unlock_after", 3)   # consecutive outlier frames -> object moved
+        # Anchor spread (mean radius from their centroid) at which a heading fix is full-confidence.
+        # Well-spread anchors constrain rotation tightly; clustered ones don't -> lower confidence.
+        self.declare_parameter("landmark_spread_ref_m", 0.4)
+        # HEADING is only trusted when the anchor geometry actually constrains rotation: enough
+        # inliers AND wide spread. A tight/sparse cluster gives an ill-conditioned Umeyama theta
+        # (pure noise) — so below these gates we zero the heading term and keep only translation
+        # (which stays robust with few anchors). Prevents the sparse-view false-rotation jitter.
+        self.declare_parameter("landmark_heading_min_pairs", 5)
+        self.declare_parameter("landmark_heading_min_spread_m", 0.30)
+        # Object-flow odometry (frame-to-frame wide-point scan matching).
+        self.declare_parameter("object_flow", True)
+        self.declare_parameter("object_flow_min_pairs", 4)       # need this many matched points to trust it
+        self.declare_parameter("object_flow_assoc_m", 0.30)      # frame-to-frame NN gate (points barely move)
+        self.declare_parameter("object_flow_max_dtheta", 0.5)    # reject a per-frame yaw jump beyond this (rad)
+        self.declare_parameter("object_flow_trans_deadband_m", 0.008)  # sub-cm per-frame shift = noise -> 0 (no drift)
 
         # Tracker tuning.
         self.declare_parameter("assoc_radius_m", 0.18)     # nearest-neighbour gate
         self.declare_parameter("conf_ema", 0.5)            # EMA weight on new sample
         self.declare_parameter("forget_after_sec", 6.0)    # drop unseen non-blacklisted
+
+        # --- Position vs identity: DIFFERENT confidence cut-offs ---
+        # The detector's own conf_threshold is the POSITION cut-off (a box above it means SOMETHING
+        # is there — the wide cam is good at this). class_conf_threshold is the higher IDENTITY
+        # cut-off: only a detection this confident casts a CLASS vote. A 0.5–0.85 wide box updates
+        # the object's position/presence but leaves its identity unknown (the body cam decides).
+        self.declare_parameter("class_conf_threshold", 0.85)
+        # The body cam is the IDENTITY authority (close, reliable), so its class vote is trusted at a
+        # LOWER bar than the wide cam — otherwise a real 0.6–0.8 body octa/icosa never establishes an
+        # identity, gets no protection, and is swallowed by a neighbouring high-conf cube track.
+        self.declare_parameter("class_conf_threshold_body", 0.50)
+        # --- Negative evidence: an in-FOV object that is NOT seen loses presence ---
+        # Camera coverage SHAPES (base_link, used for BOTH the negative-evidence "should be visible"
+        # test and the map drawing): body = forward SECTOR (부채꼴) apex at the body cam; wide =
+        # forward-biased ELLIPSE (the down-looking fisheye's ground footprint). A track inside a
+        # camera's shape but unseen for see_window_sec is penalised at miss_penalty_per_sec/s; below
+        # min_keep_conf it is dropped (clears phantoms and picked/removed objects).
+        self.declare_parameter("body_fov_half_deg", 34.0)   # half of the body cam horizontal FOV
+        self.declare_parameter("body_fov_near_m", 0.08)
+        self.declare_parameter("body_fov_far_m", 0.6)
+        self.declare_parameter("body_fov_apex_x", 0.065)    # body cam forward offset (sector apex)
+        self.declare_parameter("wide_fov_forward_m", 1.6)   # wide ellipse semi-axis (forward)
+        self.declare_parameter("wide_fov_lateral_m", 1.3)   # wide ellipse semi-axis (lateral)
+        self.declare_parameter("wide_fov_center_x", 0.3)    # wide ellipse centre, forward of robot
+        self.declare_parameter("miss_penalty_per_sec", 0.3)
+        self.declare_parameter("see_window_sec", 0.6)
+        self.declare_parameter("min_keep_conf", 0.05)
 
         rate = float(self.get_parameter("publish_rate_hz").value)
         self.fx = float(self.get_parameter("top_fx").value)
@@ -170,9 +239,27 @@ class WorldModelNode(Node):
         self.cam_offset_y = float(self.get_parameter("cam_offset_y").value)
         self.cam_yaw_deg = float(self.get_parameter("cam_yaw_deg").value)
         self.object_center_height = float(self.get_parameter("object_center_height_m").value)
+        self.height_correct = bool(self.get_parameter("height_correct").value)
+        self.body_cam_nadir_x = float(self.get_parameter("body_cam_nadir_x").value)
+        self.body_cam_nadir_y = float(self.get_parameter("body_cam_nadir_y").value)
+        self.body_cam_height = float(self.get_parameter("body_cam_height_m").value)
+        self.body_radial_trim = float(self.get_parameter("body_radial_trim_m").value)
         self.assoc_radius = float(self.get_parameter("assoc_radius_m").value)
         self.conf_ema = float(self.get_parameter("conf_ema").value)
         self.forget_after = float(self.get_parameter("forget_after_sec").value)
+        self.class_conf_threshold = float(self.get_parameter("class_conf_threshold").value)
+        self.class_conf_threshold_body = float(self.get_parameter("class_conf_threshold_body").value)
+        self.body_fov_half = math.radians(float(self.get_parameter("body_fov_half_deg").value))
+        self.body_fov_near = float(self.get_parameter("body_fov_near_m").value)
+        self.body_fov_far = float(self.get_parameter("body_fov_far_m").value)
+        self.body_fov_apex_x = float(self.get_parameter("body_fov_apex_x").value)
+        self.wide_fov_fwd = float(self.get_parameter("wide_fov_forward_m").value)
+        self.wide_fov_lat = float(self.get_parameter("wide_fov_lateral_m").value)
+        self.wide_fov_cx = float(self.get_parameter("wide_fov_center_x").value)
+        self.miss_penalty_per_sec = float(self.get_parameter("miss_penalty_per_sec").value)
+        self.see_window = float(self.get_parameter("see_window_sec").value)
+        self.min_keep_conf = float(self.get_parameter("min_keep_conf").value)
+        self.tick_dt = 1.0 / rate
 
         self.arm_base_off_x = float(self.get_parameter("arm_base_offset_x").value)
         self.arm_base_off_y = float(self.get_parameter("arm_base_offset_y").value)
@@ -185,6 +272,14 @@ class WorldModelNode(Node):
         self.landmark_min_pairs = int(self.get_parameter("landmark_min_pairs").value)
         self.landmark_max_resid = float(self.get_parameter("landmark_max_resid_m").value)
         self.unlock_after = int(self.get_parameter("unlock_after").value)
+        self.landmark_spread_ref = float(self.get_parameter("landmark_spread_ref_m").value)
+        self.landmark_heading_min_pairs = int(self.get_parameter("landmark_heading_min_pairs").value)
+        self.landmark_heading_min_spread = float(self.get_parameter("landmark_heading_min_spread_m").value)
+        self.object_flow = bool(self.get_parameter("object_flow").value)
+        self.object_flow_min_pairs = int(self.get_parameter("object_flow_min_pairs").value)
+        self.object_flow_assoc = float(self.get_parameter("object_flow_assoc_m").value)
+        self.object_flow_max_dtheta = float(self.get_parameter("object_flow_max_dtheta").value)
+        self.object_flow_trans_deadband = float(self.get_parameter("object_flow_trans_deadband_m").value)
         self._corr_pairs: list[tuple[int, float, float, float, float]] = []  # (tid,obs_x,obs_y,anchor_x,anchor_y)
 
         self.can_project = self.fx != 0.0 and self.fy != 0.0 and self.cx != 0.0 and self.cy != 0.0
@@ -203,7 +298,29 @@ class WorldModelNode(Node):
                 )
         elif not _CV2_AVAILABLE:
             self.get_logger().warn("cv2/numpy unavailable; body-cam fusion disabled")
-        self.can_project_body = self._body_H is not None
+
+        # Body GROUND homography (raw px -> base_link METRES, rotation-centre frame). Overrides
+        # the arm_base-cm path when present (unifies wide+body into one frame).
+        self._body_ground_H = None
+        bg_path = str(self.get_parameter("body_ground_homography_path").value)
+        if _CV2_AVAILABLE and bg_path:
+            try:
+                self._body_ground_H = np.asarray(np.load(bg_path)["H"], dtype=np.float64)
+            except Exception as exc:  # noqa: BLE001
+                self.get_logger().warn(f"body ground homography '{bg_path}' unavailable ({exc})")
+        self.can_project_body = self._body_H is not None or self._body_ground_H is not None
+
+        # Wide-cam ground homography (optional, from scripts/wide_calib.py). When present it
+        # replaces the extrinsic wide projection with the measured pixel->ground mapping.
+        self._wide_H = None
+        wide_h_path = str(self.get_parameter("wide_homography_path").value)
+        if _CV2_AVAILABLE and wide_h_path:
+            try:
+                self._wide_H = np.asarray(np.load(wide_h_path)["H"], dtype=np.float64)
+            except Exception as exc:  # noqa: BLE001
+                self.get_logger().warn(
+                    f"wide homography '{wide_h_path}' unavailable ({exc}); using extrinsic projection"
+                )
 
         # Fisheye ray setup (top cam ~150 deg fisheye). Falls back to pinhole if cv2 is
         # missing or fisheye_model is false.
@@ -242,13 +359,22 @@ class WorldModelNode(Node):
         self.robot_y: float = 0.0
         self.robot_theta: float = 0.0
         self.have_pose: bool = False
+        # Short robot-pose history (t, x, y, theta) so a detection can be projected at the ROBOT POSE
+        # AT IMAGE-CAPTURE TIME (see _pose_at) rather than at message-arrival time — the inference
+        # delay otherwise smears the map during rotation. ~3 s at the 20 Hz pose rate covers any
+        # realistic capture->inference->arrival latency.
+        self._pose_hist: "deque[tuple[float, float, float, float]]" = deque(maxlen=64)
 
         # Track store.
         self.tracks: dict[int, Track] = {}
         self._next_id: int = 1
         # Last track updated by a body-cam fruit_photo_cube detection — the SigLIP fruit
-        # result (which carries no position) is attached to this track.
+        # result (which carries no position) is attached to this track, but only if that detection
+        # was recent (see on_siglip): a stale id would bind the fruit type to the wrong track.
         self._last_body_fruit_id: int | None = None
+        self._last_body_fruit_sec: float = 0.0
+        self._fruit_attach_window: float = 1.0   # s; SigLIP result older than this after the last
+        #                                          fruit-cube sighting is dropped (no fresh box to bind)
 
         self.create_subscription(DetectionArray, "/camera_top/detections", self.on_detections, 10)
         self.create_subscription(DetectionArray, "/camera_body/detections", self.on_body_detections, 10)
@@ -257,8 +383,22 @@ class WorldModelNode(Node):
         self.create_subscription(UInt64, "/world_model/blacklist_add", self.on_blacklist_add, 10)
 
         self.pub = self.create_publisher(WorldModel, "/world_model", 10)
-        # Pose correction delta (dx, dy, dtheta in field frame) for the localizer.
-        self.pub_corr = self.create_publisher(Vector3, "/localization/landmark_correction", 10)
+        # Pose correction for the localizer: Float32MultiArray [dx, dy, dtheta, confidence]. The
+        # confidence lets the localizer trust a well-conditioned landmark heading fix as an ABSOLUTE
+        # reference (YOLO nails object bearings) instead of a tiny clamped nudge.
+        self.pub_corr = self.create_publisher(Float32MultiArray, "/localization/landmark_correction", 10)
+        # Per-camera RAW projected detections (field xy) for the viz overlay: flat [x,y,src,...]
+        # with src=0 wide, src=1 body — lets you SEE whether the two homographies land together.
+        self.pub_proj = self.create_publisher(Float32MultiArray, "/world_model/projected_dets", 10)
+        self._proj_wide: list[tuple[float, float]] = []
+        self._proj_body: list[tuple[float, float]] = []
+        # OBJECT-FLOW ODOMETRY: the wide cam nails object POSITION, so tracking how the wide points
+        # move between consecutive frames (in the robot frame, BEFORE pose) recovers the robot's own
+        # rotation/translation — grounded in the real world, so it does NOT hallucinate motion from
+        # motor vibration the way dense LK optical flow does. Published as [dtheta, dfwd, dleft, conf]
+        # (robot-frame per-frame delta) for the localizer to use as the PRIMARY yaw source.
+        self.pub_odom = self.create_publisher(Float32MultiArray, "/localization/object_odom", 10)
+        self._prev_wide_base: list[tuple[float, float, str]] = []   # (bx, by, label) previous wide frame
         self.timer = self.create_timer(1.0 / rate, self.tick)
 
         if not self.can_project:
@@ -331,16 +471,50 @@ class WorldModelNode(Node):
     def _now_sec(self) -> float:
         return self.get_clock().now().nanoseconds * 1e-9
 
+    @staticmethod
+    def _stamp_to_sec(stamp) -> float:
+        """builtin_interfaces/Time -> float seconds (same clock domain as the camera capture stamp
+        and the localizer pose stamp)."""
+        return float(stamp.sec) + float(stamp.nanosec) * 1e-9
+
+    def _pose_at(self, stamp) -> tuple[float, float, float]:
+        """Robot pose (x, y, theta) interpolated at image-CAPTURE time `stamp`.
+
+        Falls back to the latest pose when the history can't bracket the stamp (startup, a zero/
+        missing stamp, or a stamp newer than the last pose). This is what lets projection use the
+        pose AT CAPTURE rather than at inference-completion time, so a rotating robot's map does not
+        smear by the (80-300 ms) capture->detection latency.
+        """
+        latest = (self.robot_x, self.robot_y, self.robot_theta)
+        hist = list(self._pose_hist)
+        if not hist:
+            return latest
+        t = self._stamp_to_sec(stamp)
+        if t <= 0.0 or t >= hist[-1][0]:
+            return latest
+        if t <= hist[0][0]:
+            return (hist[0][1], hist[0][2], hist[0][3])
+        for i in range(len(hist) - 1):
+            t0, x0, y0, th0 = hist[i]
+            t1, x1, y1, th1 = hist[i + 1]
+            if t0 <= t <= t1:
+                a = (t - t0) / (t1 - t0) if t1 > t0 else 0.0
+                dth = math.atan2(math.sin(th1 - th0), math.cos(th1 - th0))  # shortest-arc interp
+                return (x0 + a * (x1 - x0), y0 + a * (y1 - y0), th0 + a * dth)
+        return latest
+
     # ----------------------------------------------------------------- projection
 
-    def _project_pixel(self, u: float, v: float) -> tuple[float, float] | None:
+    def _project_pixel(self, u: float, v: float, pose=None) -> tuple[float, float] | None:
         """Project a top-cam pixel (u,v) onto the object-center ground plane -> field xy.
 
+        `pose` = (x, y, theta) at IMAGE-CAPTURE TIME (from _pose_at); None -> latest pose.
         Returns None when intrinsics are unset, no pose yet, or the ray does not point
         down into the plane (parallel / upward). Intrinsics & extrinsics need calibration.
         """
         if not self.can_project or not self.have_pose:
             return None
+        rx, ry, rth = pose if pose is not None else (self.robot_x, self.robot_y, self.robot_theta)
 
         # Ray in camera optical frame. Fisheye: undistort the pixel to a normalized pinhole
         # ray (x,y,1); pinhole fallback: d = ((u-cx)/fx,(v-cy)/fy,1). The top cam is a ~150 deg
@@ -357,13 +531,13 @@ class WorldModelNode(Node):
             d_cam = ((u - self.cx) / self.fx, (v - self.cy) / self.fy, 1.0)
 
         # R_field_cam = Rz(theta) @ R_base_cam.
-        r_field_cam = self._matmul3(self._rz(self.robot_theta), self._R_base_cam)
+        r_field_cam = self._matmul3(self._rz(rth), self._R_base_cam)
         ray = self._matvec3(r_field_cam, d_cam)
 
         # Camera position in field:
         #   pcam = (rx,ry,0) + Rz(theta)*(off_x,off_y,0) + (0,0,cam_height)
-        off = self._matvec3(self._rz(self.robot_theta), (self.cam_offset_x, self.cam_offset_y, 0.0))
-        pcam = (self.robot_x + off[0], self.robot_y + off[1], self.cam_height + off[2])
+        off = self._matvec3(self._rz(rth), (self.cam_offset_x, self.cam_offset_y, 0.0))
+        pcam = (rx + off[0], ry + off[1], self.cam_height + off[2])
 
         # Intersect pcam + t*ray with plane z = object_center_height.
         # Need ray.z < 0 (pointing down) and t > 0.
@@ -373,6 +547,45 @@ class WorldModelNode(Node):
         if t <= 0.0:
             return None
         return (pcam[0] + t * ray[0], pcam[1] + t * ray[1])
+
+    def _height_correct(self, bx: float, by: float, cnx: float, cny: float, cam_h: float) -> tuple[float, float]:
+        """Remove ground-homography parallax for a box-CENTRE anchor at object_center_height.
+        A point at height h projects (assuming z=0) to G displaced outward from the cam nadir C;
+        the true ground point is P = G - (h/H)(G - C). Exact for a pinhole ray hitting the plane."""
+        if not self.height_correct or cam_h <= self.object_center_height:
+            return bx, by
+        k = self.object_center_height / cam_h
+        return bx - k * (bx - cnx), by - k * (by - cny)
+
+    def _wide_pixel_to_base(self, u: float, v: float) -> tuple[float, float] | None:
+        """Wide pixel -> base_link xy (metres, x forward / y left) via the ground homography.
+        POSE-INDEPENDENT: this is the raw robot-frame measurement used for object-flow odometry."""
+        if self._wide_H is None or self._fish_K is None:
+            return None
+        und = cv2.fisheye.undistortPoints(
+            np.array([[[u, v]]], dtype=np.float64), self._fish_K, self._fish_D
+        )
+        xn, yn = und[0, 0]
+        if self.rotated_180:
+            xn, yn = -xn, -yn
+        p = cv2.perspectiveTransform(
+            np.array([[[float(xn), float(yn)]]], dtype=np.float64), self._wide_H
+        )[0, 0]
+        return (float(p[0]), float(p[1]))   # base-frame x forward, y left
+
+    def _project_wide_H(self, u: float, v: float, pose=None) -> tuple[float, float] | None:
+        """Wide pixel -> field xy via the measured ground homography (fisheye-undistorted).
+        `pose` = (x, y, theta) at IMAGE-CAPTURE TIME (from _pose_at); None -> latest pose."""
+        if not self.have_pose:
+            return None
+        base = self._wide_pixel_to_base(u, v)
+        if base is None:
+            return None
+        # Height-correct the box-centre anchor to the object's true ground centre (wide nadir).
+        bx, by = self._height_correct(base[0], base[1], self.cam_offset_x, self.cam_offset_y, self.cam_height)
+        rx, ry, rth = pose if pose is not None else (self.robot_x, self.robot_y, self.robot_theta)
+        ct, st = math.cos(rth), math.sin(rth)
+        return (rx + bx * ct - by * st, ry + bx * st + by * ct)
 
     # ----------------------------------------------------------------- callbacks
 
@@ -385,6 +598,12 @@ class WorldModelNode(Node):
         cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
         self.robot_theta = math.atan2(siny_cosp, cosy_cosp)
         self.have_pose = True
+        # Record this pose in the capture-time history, keyed by the localizer's publish stamp (same
+        # clock as the camera capture stamp propagated through yolo_detector). Fall back to node-now
+        # only if the stamp is unset. See _pose_at.
+        t = self._stamp_to_sec(msg.header.stamp)
+        self._pose_hist.append((t if t > 0.0 else self._now_sec(),
+                                self.robot_x, self.robot_y, self.robot_theta))
 
     def on_blacklist_add(self, msg: UInt64) -> None:
         track = self.tracks.get(int(msg.data))
@@ -412,19 +631,45 @@ class WorldModelNode(Node):
             return
 
         now = self._now_sec()
+        rpose = self._pose_at(msg.header.stamp)   # robot pose at IMAGE-CAPTURE time (anti-smear)
         self._corr_pairs.clear()
+        wide_pts: list[tuple[float, float]] = []
+        wide_base: list[tuple[float, float, str]] = []   # (bx, by, label) robot-frame, for object-flow
         for det in msg.detections:
-            # Ground-contact pixel: box bottom-center, averaged with center for stability.
+            base = None   # base-frame projection; only set on the _wide_H path — init so the body-FOV
+            #               skip check below (and the extrinsic fallback) never hits UnboundLocalError.
             u_center = float(det.x_center)
             v_center = float(det.y_center)
             v_bottom = v_center + float(det.height) * 0.5
-            v = 0.5 * (v_center + v_bottom)
-            xy = self._project_pixel(u_center, v)
+            label = str(det.label)
+            if self._wide_H is not None:
+                # The wide cam is ~TOP-DOWN: a standing object leans radially from the image nadir,
+                # so the box BOTTOM is NOT the ground contact — the box CENTRE is the best proxy for
+                # the object's ground xy. (Body, being oblique/low, correctly uses the box bottom.)
+                base = self._wide_pixel_to_base(u_center, v_center)
+                if base is not None:
+                    wide_base.append((base[0], base[1], label))
+                xy = self._project_wide_H(u_center, v_center, rpose)
+            else:
+                # Extrinsic model intersects the object-CENTRE-height plane, so aim above the
+                # bottom (quarter-down from centre) to hit that plane.
+                xy = self._project_pixel(u_center, 0.5 * (v_center + v_bottom), rpose)
             if xy is None:
                 continue
-            label = str(det.label)
+            wide_pts.append((xy[0], xy[1]))
+            # NEAR field (inside the body sector): the BODY cam owns position AND identity — the
+            # top-down fisheye is both position-inaccurate and mis-classifies shapes there (measured:
+            # wide calls near cubes octa/icosa, lands 13-18cm off), which cross-matches and pulls
+            # body tracks off their accurate spot. So skip wide MAP association here; the wide point
+            # still feeds object-flow (below) and the viz overlay. Wide owns the FAR field only.
+            if base is not None and self._in_body_fov_base(base[0], base[1]):
+                continue
             set_type = _LABEL_TO_SET_TYPE.get(label, 0)
             self._associate(xy[0], xy[1], float(det.confidence), label, set_type, now, "wide")
+        self._proj_wide = wide_pts
+        # Object-flow odometry BEFORE the absolute correction: robot motion from how the raw
+        # robot-frame points moved since the last wide frame (the vibration-proof yaw source).
+        self._publish_object_flow(wide_base)
         self._maybe_publish_correction()   # wide frame sees many objects -> best rigid solve
 
     def on_body_detections(self, msg: DetectionArray) -> None:
@@ -438,59 +683,119 @@ class WorldModelNode(Node):
         if not self.have_pose:
             return
         now = self._now_sec()
+        rpose = self._pose_at(msg.header.stamp)   # robot pose at IMAGE-CAPTURE time (anti-smear)
         self._corr_pairs.clear()
+        body_pts: list[tuple[float, float]] = []
+        best_fruit = (-1.0, None)   # (conf, tid) of the PRIMARY fruit cube this frame
         for det in msg.detections:
-            # Ground-contact pixel = box bottom-center (matches pick_calib's anchor).
+            # Box CENTRE anchor (at object_center_height); _project_body_pixel height-corrects it to
+            # the true ground centre. (The low body cam has strong height parallax, so anchoring on
+            # the bottom gives the FRONT edge and disagrees with the wide's centre — this unifies.)
             u = float(det.x_center)
-            v = float(det.y_center) + float(det.height) * 0.5
-            xy = self._project_body_pixel(u, v)
+            v = float(det.y_center)
+            xy = self._project_body_pixel(u, v, rpose)
             if xy is None:
                 continue  # outside the homography's calibrated near-workspace
+            body_pts.append((xy[0], xy[1]))
             label = str(det.label)
             set_type = _LABEL_TO_SET_TYPE.get(label, 0)
             tid = self._associate(xy[0], xy[1], float(det.confidence), label, set_type, now, "body")
-            # Remember which track a body fruit box hit so a following SigLIP result attaches here.
-            if label == "fruit_photo_cube":
-                self._last_body_fruit_id = tid
+            if label == "fruit_photo_cube" and float(det.confidence) > best_fruit[0]:
+                best_fruit = (float(det.confidence), tid)
+        # A following SigLIP result attaches to the HIGHEST-conf fruit cube (== the box SigLIP
+        # itself cropped as its primary), so with several fruit cubes in view the fruit type lands
+        # on the right one instead of whichever happened to be last in the list.
+        if best_fruit[1] is not None:
+            self._last_body_fruit_id = best_fruit[1]
+            self._last_body_fruit_sec = now
+        self._proj_body = body_pts
         self._maybe_publish_correction()
 
     def on_siglip(self, msg: Classification) -> None:
         """Attach the concrete fruit (SigLIP argmax) to the most-recent body fruit track.
 
         SigLIP does fruit-TYPE only; YOLO already established the box is a fruit_photo_cube.
-        We use the argmax label (not the hard is_target sigmoid gate, which rarely fires) and
-        keep the confidence for the map/log.
+        msg.confidence is the softmax MARGIN over the runner-up fruit (bigger = more reliable) and
+        is used directly as the vote weight, so a clear winner dominates and a near-tie barely
+        counts. Only record when a fruit FACE is actually visible (else it's a blank/edge face).
         """
         fruit = str(msg.label)
         if fruit not in _FRUIT_LABELS:
+            return
+        if not msg.image_face_visible:      # no printed fruit face in view -> don't guess a type
+            return
+        # Only attach if a body fruit-cube was detected RECENTLY: SigLIP runs a few frames behind the
+        # body detector, but a result arriving long after any fruit box left view would otherwise bind
+        # to a minutes-old _last_body_fruit_id (a different, possibly wrong, track). Stale -> drop.
+        if (self._last_body_fruit_id is None
+                or (self._now_sec() - self._last_body_fruit_sec) > self._fruit_attach_window):
             return
         tid = self._last_body_fruit_id
         tr = self.tracks.get(tid) if tid is not None else None
         if tr is None:
             return
-        # Vote across faces/frames rather than overwriting with the latest reading.
-        tr.fruit_votes[fruit] = tr.fruit_votes.get(fruit, 0.0) + max(0.05, float(msg.confidence))
+        # Vote across faces/frames, weighted by the margin (reliability). No large floor: a low-
+        # margin reading adds almost nothing, so the map stays type-unknown until a face is read.
+        tr.fruit_votes[fruit] = tr.fruit_votes.get(fruit, 0.0) + max(0.0, float(msg.confidence))
         tr.fruit_confidence = max(tr.fruit_confidence, float(msg.confidence))
         tr.set_type = 2
         self._refresh_identity(tr)
 
-    def _project_body_pixel(self, u: float, v: float) -> tuple[float, float] | None:
-        """Body-cam pixel -> field xy via the pick homography H, or None if out of workspace."""
+    def _project_body_pixel(self, u: float, v: float, pose=None) -> tuple[float, float] | None:
+        """Body-cam pixel -> field xy. Prefers the base_link-metres ground H (aruco_calib);
+        else the arm_base-cm pick H (+offset). None if out of the near workspace.
+        `pose` = (x, y, theta) at IMAGE-CAPTURE TIME (from _pose_at); None -> latest pose."""
         if not self.can_project_body or not self.have_pose:
             return None
         pt = np.array([[[float(u), float(v)]]], dtype=np.float64)
-        out = cv2.perspectiveTransform(pt, self._body_H)[0][0]
-        # H yields arm_base (x forward, y left) in CENTIMETRES -> metres.
-        x_ab, y_ab = float(out[0]) / 100.0, float(out[1]) / 100.0
+        if self._body_ground_H is not None:
+            out = cv2.perspectiveTransform(pt, self._body_ground_H)[0][0]
+            bx, by = float(out[0]), float(out[1])           # base_link METRES directly
+        else:
+            out = cv2.perspectiveTransform(pt, self._body_H)[0][0]
+            x_ab, y_ab = float(out[0]) / 100.0, float(out[1]) / 100.0   # arm_base cm -> m
+            bx = self.arm_base_off_x + x_ab
+            by = self.arm_base_off_y + y_ab
+        # Height-correct the box-centre anchor to the object's true ground centre (body nadir/height).
+        bx, by = self._height_correct(bx, by, self.body_cam_nadir_x, self.body_cam_nadir_y, self.body_cam_height)
+        # Front-face bias trim: push radially OUT from the body nadir so it matches the wide centroid.
+        if self.body_radial_trim != 0.0:
+            dx, dy = bx - self.body_cam_nadir_x, by - self.body_cam_nadir_y
+            d = math.hypot(dx, dy)
+            if d > 0.01:
+                bx += self.body_radial_trim * dx / d
+                by += self.body_radial_trim * dy / d
         x0, x1, y0, y1 = self.body_ws
-        if not (x0 <= x_ab <= x1 and y0 <= y_ab <= y1):
+        if not (x0 <= bx <= x1 and y0 <= by <= y1):          # gate in base_link frame
             return None
-        # arm_base -> base_link (static offset, zero yaw).
-        bx = self.arm_base_off_x + x_ab
-        by = self.arm_base_off_y + y_ab
-        # base_link -> field (rotate by heading, translate by robot xy).
+        # base_link -> field (rotate by heading, translate by robot xy) at CAPTURE-time pose.
+        rx, ry, rth = pose if pose is not None else (self.robot_x, self.robot_y, self.robot_theta)
+        ct, st = math.cos(rth), math.sin(rth)
+        return (rx + bx * ct - by * st, ry + bx * st + by * ct)
+
+    # ------------------------------------------------------------- camera FOV (for negative evidence)
+    def _to_base(self, fx: float, fy: float) -> tuple[float, float]:
+        """Field xy -> base_link xy (inverse of the base->field robot transform)."""
+        dx, dy = fx - self.robot_x, fy - self.robot_y
         ct, st = math.cos(self.robot_theta), math.sin(self.robot_theta)
-        return (self.robot_x + bx * ct - by * st, self.robot_y + bx * st + by * ct)
+        return (ct * dx + st * dy, -st * dx + ct * dy)
+
+    def _in_body_fov(self, fx: float, fy: float) -> bool:
+        """Inside the body cam's forward sector (부채꼴): within +-half angle and [near,far] range."""
+        return self._in_body_fov_base(*self._to_base(fx, fy))
+
+    def _in_body_fov_base(self, bx: float, by: float) -> bool:
+        """Body-cam forward sector test in the base_link frame (pose-independent)."""
+        dx = bx - self.body_fov_apex_x
+        d = math.hypot(dx, by)
+        if not (self.body_fov_near <= d <= self.body_fov_far):
+            return False
+        return abs(math.atan2(by, dx)) <= self.body_fov_half
+
+    def _in_wide_fov(self, fx: float, fy: float) -> bool:
+        """Inside the wide fisheye's forward-biased ground ellipse."""
+        bx, by = self._to_base(fx, fy)
+        return ((bx - self.wide_fov_cx) / self.wide_fov_fwd) ** 2 + (by / self.wide_fov_lat) ** 2 <= 1.0
 
     # ------------------------------------------------------------------- tracker
 
@@ -504,6 +809,11 @@ class WorldModelNode(Node):
         the body cam has already established, and neither clobbers a concrete SigLIP fruit name.
         """
         is_body = source == "body"
+        vote_thresh = self.class_conf_threshold_body if is_body else self.class_conf_threshold
+        # Pure nearest-neighbour within assoc_radius. Distinct objects are kept apart by DISTANCE
+        # (assoc_radius tightened for the cm-accurate 1280 wide) — NOT by label, because the same
+        # object often gets a wrong wide class + a correct body class, and those must still merge
+        # (body then wins identity). Label-based splitting would duplicate that object on the map.
         best_id: int | None = None
         best_d = self.assoc_radius
         for tid, tr in self.tracks.items():
@@ -519,9 +829,11 @@ class WorldModelNode(Node):
                 id=tid, x=x, y=y, confidence=conf, last_seen_sec=now,
                 source=source, seen_body=is_body,
                 last_body_sec=(now if is_body else 0.0),
+                last_wide_sec=(0.0 if is_body else now),
                 n_obs=1, n_body=(1 if is_body else 0),
             )
-            self._vote(tr, label, conf, is_body)
+            if conf >= vote_thresh:   # only confident detections vote on IDENTITY (body: lower bar)
+                self._vote(tr, label, conf, is_body)
             self._refresh_identity(tr)
             self.tracks[tid] = tr
             return tid
@@ -536,18 +848,25 @@ class WorldModelNode(Node):
             pos_a = 0.7 if is_body else self.conf_ema     # body pulls position harder
             tr.x = (1.0 - pos_a) * tr.x + pos_a * x
             tr.y = (1.0 - pos_a) * tr.y + pos_a * y
-        tr.confidence = (1.0 - self.conf_ema) * tr.confidence + self.conf_ema * conf
+        new_conf = (1.0 - self.conf_ema) * tr.confidence + self.conf_ema * conf
         if is_body:
-            tr.confidence = max(tr.confidence, conf)  # trust a confident close look
+            tr.confidence = max(tr.confidence, conf)  # body = quality authority: sticky to its confident look
             tr.seen_body = True
             tr.last_body_sec = now
             tr.n_body += 1
+        elif tr.seen_body:
+            tr.confidence = max(tr.confidence, new_conf)  # wide may REINFORCE a body track, never erode it
+            tr.last_wide_sec = now
+        else:
+            tr.confidence = new_conf                      # wide-only: plain EMA
+            tr.last_wide_sec = now
         tr.n_obs += 1
         tr.last_seen_sec = now
         if source not in tr.source:
             tr.source = "wide+body" if tr.source else source
-        # Accumulate the class vote and re-estimate identity from ALL evidence so far.
-        self._vote(tr, label, conf, is_body)
+        # Position/presence updated above for ANY detection; identity only from CONFIDENT ones.
+        if conf >= vote_thresh:
+            self._vote(tr, label, conf, is_body)
         self._refresh_identity(tr)
         # Lock a stable track into a frozen world anchor once it has enough confident evidence.
         if (
@@ -564,25 +883,49 @@ class WorldModelNode(Node):
 
     @staticmethod
     def _vote(tr: Track, label: str, conf: float, is_body: bool) -> None:
-        """Add one confidence-weighted class vote (body votes weigh more)."""
+        """Add one confidence-weighted class vote into this source's pool."""
         if not label:
             return
-        w = max(0.05, conf) * (_BODY_VOTE_WEIGHT if is_body else 1.0)
-        tr.class_votes[label] = tr.class_votes.get(label, 0.0) + w
+        pool = tr.body_votes if is_body else tr.wide_votes
+        pool[label] = pool.get(label, 0.0) + max(0.05, conf)
 
     @staticmethod
     def _refresh_identity(tr: Track) -> None:
-        """Best-estimate identity = argmax of accumulated votes (fruit votes win for Set2)."""
+        """Best-estimate identity. SigLIP fruit wins for Set2; otherwise the BODY cam's vote
+        decides whenever it has classified the object (close/reliable), falling back to the wide
+        cam only for objects the body never saw. Within the chosen source, argmax of the
+        confidence-summed votes (so YOLO confidence drives the pick)."""
         if tr.fruit_votes:
             tr.class_label = max(tr.fruit_votes, key=tr.fruit_votes.get)
             tr.fruit_label = tr.class_label
             tr.set_type = 2
-        elif tr.class_votes:
-            best = max(tr.class_votes, key=tr.class_votes.get)
-            tr.class_label = best
-            st = _LABEL_TO_SET_TYPE.get(best, 0)
-            if st:
-                tr.set_type = st
+            return
+        # fruit_photo_cube (nested printed-fruit patch, even inside a plain 'cube' box) means this is
+        # a Set2 FRUIT cube, not a Set1 shape. But a SINGLE spurious fpc detection on a white
+        # polyhedron must NOT irreversibly flip a real Set1 target to Set2 (the target then vanishes
+        # from the selector forever). So require the accumulated fpc evidence to be a MEANINGFUL
+        # fraction of the shape evidence — a genuine fruit cube keeps accumulating fpc and clears
+        # this easily, whereas a one-frame misread is out-voted by the shape stream.
+        fpc = tr.body_votes.get("fruit_photo_cube", 0.0) + tr.wide_votes.get("fruit_photo_cube", 0.0)
+        shape_max = max(
+            [v for k, v in tr.body_votes.items() if k != "fruit_photo_cube"]
+            + [v for k, v in tr.wide_votes.items() if k != "fruit_photo_cube"],
+            default=0.0,
+        )
+        if fpc > 0.0 and fpc >= 0.5 * shape_max:
+            tr.class_label = "fruit_photo_cube"
+            tr.set_type = 2
+            return
+        pool = tr.body_votes if tr.body_votes else tr.wide_votes
+        if pool:
+            # fruit_photo_cube handled above; pick the best SHAPE vote for a Set1 object.
+            shapes = {k: v for k, v in pool.items() if k != "fruit_photo_cube"}
+            if shapes:
+                best = max(shapes, key=shapes.get)
+                tr.class_label = best
+                st = _LABEL_TO_SET_TYPE.get(best, 0)
+                if st:
+                    tr.set_type = st
 
     # -------------------------------------------------------- landmark correction
     def _maybe_publish_correction(self) -> None:
@@ -643,12 +986,121 @@ class WorldModelNode(Node):
         dx, dy, dth = c * px - s * py + tcx - px, s * px + c * py + tcy - py, theta_c
         if abs(dx) > 2.0 or abs(dy) > 2.0 or abs(dth) > 1.0:
             return   # implausible -> skip
-        self.pub_corr.publish(Vector3(x=float(dx), y=float(dy), z=float(dth)))
+
+        # Confidence of this heading fix: more inliers + well-spread anchors + low residual => this
+        # is a trustworthy ABSOLUTE heading (YOLO bearings are sharp), so the localizer can apply
+        # most of it rather than a tiny nudge. Clustered / few / high-residual anchors -> low conf.
+        resid_k = [math.hypot((c * p[1] - s * p[2] + tcx) - p[3], (s * p[1] + c * p[2] + tcy) - p[4])
+                   for p in kept]
+        mean_resid = sum(resid_k) / len(resid_k)
+        lxc = sum(p[3] for p in kept) / len(kept)
+        lyc = sum(p[4] for p in kept) / len(kept)
+        spread = sum(math.hypot(p[3] - lxc, p[4] - lyc) for p in kept) / len(kept)
+        n_factor = min(1.0, (len(kept) - 2) / 4.0)                     # 3 anchors -> .25, 6 -> 1
+        resid_factor = max(0.0, 1.0 - mean_resid / max(1e-6, self.landmark_max_resid))
+        spread_factor = min(1.0, spread / max(1e-6, self.landmark_spread_ref))
+        conf = max(0.0, n_factor * resid_factor * spread_factor)
+
+        # Heading gate: only trust the rotation term when the anchor geometry constrains it
+        # (enough inliers AND wide spread). Otherwise keep translation, zero the heading — the
+        # sparse/tight case gives a noisy Umeyama theta that was jittering the robot's yaw.
+        heading_ok = (len(kept) >= self.landmark_heading_min_pairs
+                      and spread >= self.landmark_heading_min_spread)
+        if heading_ok:
+            dth_out, dx_out, dy_out = dth, dx, dy
+        else:
+            # theta_c is ill-conditioned here, so dx,dy (which fold in (R-I)(p-centroid)) carry its
+            # noise amplified by the robot->anchor lever arm. Recompute the correction as a PURE mean
+            # displacement (R = I): dx,dy = centroid(anchors) - centroid(observations). This stays
+            # robust with only 3 clustered anchors and matches the "translation is trustworthy even
+            # when rotation is not" intent, instead of leaking a fake rotation into position.
+            oxc = sum(p[1] for p in kept) / len(kept)
+            oyc = sum(p[2] for p in kept) / len(kept)
+            dth_out, dx_out, dy_out = 0.0, lxc - oxc, lyc - oyc
+
+        m = Float32MultiArray()
+        m.data = [float(dx_out), float(dy_out), float(dth_out), float(conf)]
+        self.pub_corr.publish(m)
         n_locked = sum(1 for t in self.tracks.values() if t.locked)
         self.get_logger().info(
-            f"landmark correction dx={dx:+.3f} dy={dy:+.3f} dth={dth:+.3f} "
-            f"(inliers~{len(kept)}/{len(pairs)}, {n_locked} locked)",
+            f"landmark correction dx={dx_out:+.3f} dy={dy_out:+.3f} dth={dth_out:+.3f}"
+            f"{'' if heading_ok else '(heading gated)'} conf={conf:.2f} "
+            f"(inliers~{len(kept)}/{len(pairs)} spread={spread:.2f}m, {n_locked} locked)",
             throttle_duration_sec=2.0,
+        )
+
+    def _publish_object_flow(self, curr_base: list[tuple[float, float, str]]) -> None:
+        """Frame-to-frame odometry from the wide cam's robot-frame object points.
+
+        Match this frame's points to the previous frame's (nearest-neighbour; points barely move
+        between frames, and a same-label match is preferred to break ties), then fit the rigid
+        transform. A static world seen from a rotating/translating robot moves rigidly in the robot
+        frame, so this recovers the robot's OWN per-frame motion — from real objects, so it reports
+        ~0 when the robot is still even while the motors buzz (unlike dense LK flow, which sees the
+        vibration as rotation). Published [dtheta, dfwd, dleft, conf] in the robot frame.
+        """
+        prev = self._prev_wide_base
+        self._prev_wide_base = curr_base
+        if not self.object_flow or len(prev) < self.object_flow_min_pairs or len(curr_base) < self.object_flow_min_pairs:
+            return
+        gate = self.object_flow_assoc
+        pairs = []   # (px, py, qx, qy)
+        used = [False] * len(prev)
+        for qx, qy, qlbl in curr_base:
+            best = -1
+            best_d = gate
+            for i, (px, py, plbl) in enumerate(prev):
+                if used[i]:
+                    continue
+                d = math.hypot(qx - px, qy - py)
+                if plbl == qlbl:
+                    d *= 0.6   # same shape -> prefer this pairing (body/wide labels aid association)
+                if d < best_d:
+                    best_d = d
+                    best = i
+            if best >= 0:
+                used[best] = True
+                px, py, _ = prev[best]
+                pairs.append((px, py, qx, qy))
+        if len(pairs) < self.object_flow_min_pairs:
+            return
+        # Solve prev->curr, trim mismatches once by residual, re-solve.
+        phi, tx, ty = self._umeyama_2d(pairs)
+        if phi is None:
+            return
+        for _ in range(2):
+            c, s = math.cos(phi), math.sin(phi)
+            resid = [math.hypot((c * p[0] - s * p[1] + tx) - p[2], (s * p[0] + c * p[1] + ty) - p[3]) for p in pairs]
+            kept = [p for p, r in zip(pairs, resid) if r <= gate * 0.5]
+            if len(kept) < self.object_flow_min_pairs or len(kept) == len(pairs):
+                break
+            pairs = kept
+            phi, tx, ty = self._umeyama_2d(pairs)
+            if phi is None:
+                return
+        c, s = math.cos(phi), math.sin(phi)
+        resid = [math.hypot((c * p[0] - s * p[1] + tx) - p[2], (s * p[0] + c * p[1] + ty) - p[3]) for p in pairs]
+        mean_resid = sum(resid) / len(resid)
+        # Robot per-frame delta (robot frame): world rotates by phi in the robot frame => robot
+        # yawed by -phi; translation likewise inverts (first order for small per-frame motion).
+        dtheta = -phi
+        dfwd, dleft = -tx, -ty
+        if abs(dtheta) > self.object_flow_max_dtheta:
+            return   # implausible per-frame jump -> bad association, drop this frame
+        # Sub-cm per-frame translation is match noise, not motion — zero it so a stationary robot
+        # does NOT random-walk away (drift). Real driving exceeds this each frame.
+        if math.hypot(dfwd, dleft) < self.object_flow_trans_deadband:
+            dfwd = dleft = 0.0
+        n_factor = min(1.0, (len(pairs) - 2) / 5.0)                 # 4 pts -> .4, 7 -> 1
+        resid_factor = max(0.0, 1.0 - mean_resid / max(1e-6, gate * 0.5))
+        conf = max(0.0, n_factor * resid_factor)
+        m = Float32MultiArray()
+        m.data = [float(dtheta), float(dfwd), float(dleft), float(conf)]
+        self.pub_odom.publish(m)
+        self.get_logger().info(
+            f"object-flow dθ={math.degrees(dtheta):+5.1f}° dfwd={dfwd*100:+.0f} dleft={dleft*100:+.0f}cm "
+            f"conf={conf:.2f} ({len(pairs)} pts, resid={mean_resid*100:.1f}cm)",
+            throttle_duration_sec=1.0,
         )
 
     @staticmethod
@@ -675,21 +1127,113 @@ class WorldModelNode(Node):
         ty = lym - (s * oxm + c * oym)
         return theta, tx, ty
 
+    def _apply_negative_evidence(self, now: float) -> None:
+        """Penalise tracks inside a camera's FOV that were NOT seen recently. If an object should be
+        visible there and isn't, its presence belief decays -> eventually dropped (clears phantoms
+        and objects picked up / moved away). Only an ACTIVE camera penalises (a disabled one never
+        does), and the wide cam's disk models its all-around fisheye view."""
+        if not self.have_pose:
+            return
+        for tr in self.tracks.values():
+            if tr.blacklisted:
+                continue
+            miss = 0
+            in_body = self._in_body_fov(tr.x, tr.y)
+            if (self.can_project_body and in_body
+                    and (now - tr.last_body_sec) > self.see_window):
+                miss += 1
+            # Wide miss only counts OUTSIDE the body sector: on_detections deliberately drops wide
+            # associations inside that sector (body owns the near field), so last_wide_sec is never
+            # refreshed there even though the wide cam IS seeing the object — counting a wide miss
+            # then would double-penalise a fully-visible near track and delete it. Body owns presence
+            # in its sector.
+            if (self.can_project and not in_body and self._in_wide_fov(tr.x, tr.y)
+                    and (now - tr.last_wide_sec) > self.see_window):
+                miss += 1
+            if miss:
+                tr.confidence = max(
+                    0.0, tr.confidence - self.miss_penalty_per_sec * miss * self.tick_dt
+                )
+
     def _forget_stale(self, now: float) -> None:
+        # A LOCKED anchor is the field's absolute position reference (in test_field there are no
+        # walls, so anchors are the ONLY absolute fix). Exempt it from the TIME-based forget so the
+        # whole-field map persists while the robot is elsewhere >forget_after — but still drop it on
+        # confidence collapse (miss-penalty below min_keep_conf), which is how a picked/removed anchor
+        # is retired. Unlock-on-move (unlock_after) already handles anchors that physically shifted.
         stale = [
             tid
             for tid, tr in self.tracks.items()
-            if not tr.blacklisted and (now - tr.last_seen_sec) > self.forget_after
+            if not tr.blacklisted and (
+                (not tr.locked and (now - tr.last_seen_sec) > self.forget_after)
+                or tr.confidence < self.min_keep_conf
+            )
         ]
         for tid in stale:
             del self.tracks[tid]
         if stale:
-            self.get_logger().info(f"forgot {len(stale)} stale track(s)")
+            self.get_logger().info(f"forgot {len(stale)} stale/low-presence track(s)")
+
+    def _merge_duplicates(self) -> None:
+        """Collapse tracks that sit within assoc_radius of each other into ONE.
+
+        _associate is a pure per-detection greedy NN with no frame-level 1:1 constraint, so
+        projection jitter can split a single object across two ids (and a duplicate never re-merges
+        on its own). A stray duplicate/phantom is a top scoring risk (duplicate/phantom penalty) and
+        would let the FSM re-approach and re-count the same object after it was picked+blacklisted.
+        Merge the NEWER track into the OLDER (kept) id: fuse vote pools, OR the flags, max confidence,
+        sum evidence counts. Two CONFIRMED (locked) anchors with different concrete classes are kept
+        apart (they are genuinely distinct objects, not a jitter split)."""
+        ids = sorted(self.tracks.keys())   # ascending id = oldest first (kept)
+        removed: set[int] = set()
+        for i, a in enumerate(ids):
+            if a in removed:
+                continue
+            ta = self.tracks.get(a)
+            if ta is None:
+                continue
+            for b in ids[i + 1:]:
+                if b in removed:
+                    continue
+                tb = self.tracks.get(b)
+                if tb is None:
+                    continue
+                if math.hypot(ta.x - tb.x, ta.y - tb.y) > self.assoc_radius:
+                    continue
+                if (ta.locked and tb.locked and ta.class_label and tb.class_label
+                        and ta.class_label != tb.class_label):
+                    continue   # two confirmed, differently-classified anchors -> keep distinct
+                for pa, pb in ((ta.wide_votes, tb.wide_votes),
+                               (ta.body_votes, tb.body_votes),
+                               (ta.fruit_votes, tb.fruit_votes)):
+                    for k, v in pb.items():
+                        pa[k] = pa.get(k, 0.0) + v
+                ta.confidence = max(ta.confidence, tb.confidence)
+                ta.fruit_confidence = max(ta.fruit_confidence, tb.fruit_confidence)
+                ta.n_obs += tb.n_obs
+                ta.n_body += tb.n_body
+                ta.seen_body = ta.seen_body or tb.seen_body
+                ta.blacklisted = ta.blacklisted or tb.blacklisted
+                ta.last_seen_sec = max(ta.last_seen_sec, tb.last_seen_sec)
+                ta.last_body_sec = max(ta.last_body_sec, tb.last_body_sec)
+                ta.last_wide_sec = max(ta.last_wide_sec, tb.last_wide_sec)
+                if tb.locked and not ta.locked:   # inherit the confirmed anchor position
+                    ta.locked = True
+                    ta.anchor_x, ta.anchor_y, ta.x, ta.y = tb.anchor_x, tb.anchor_y, tb.x, tb.y
+                if self._last_body_fruit_id == b:
+                    self._last_body_fruit_id = a
+                self._refresh_identity(ta)
+                removed.add(b)
+                del self.tracks[b]
+        if removed:
+            self.get_logger().info(f"merged {len(removed)} duplicate track(s)")
 
     # ------------------------------------------------------------------- publish
 
     def tick(self) -> None:
         now = self._now_sec()
+        self._merge_duplicates()
+        self._apply_negative_evidence(now)
         self._forget_stale(now)
 
         msg = WorldModel()
@@ -718,6 +1262,16 @@ class WorldModelNode(Node):
         msg.robot_y = float(self.robot_y)
         msg.robot_theta = float(self.robot_theta)
         self.pub.publish(msg)
+
+        # Per-camera RAW projections (field xy) for the viz overlay: flat [x,y,src,...] (src 0=wide,1=body).
+        proj = Float32MultiArray()
+        pdata: list[float] = []
+        for (x, y) in self._proj_wide:
+            pdata += [float(x), float(y), 0.0]
+        for (x, y) in self._proj_body:
+            pdata += [float(x), float(y), 1.0]
+        proj.data = pdata
+        self.pub_proj.publish(proj)
 
         # periodic map summary (debug): track counts by set + locked + robot pose
         n1 = sum(1 for t in self.tracks.values() if t.set_type == 1)

@@ -19,15 +19,16 @@ gi.require_version("Gst", "1.0")
 from gi.repository import Gst  # noqa: E402
 
 
-def make_gst_pipeline(sensor_id: int, sensor_mode: int, width: int, height: int, fps: int, flip: int) -> str:
+def make_gst_pipeline(sensor_id: int, sensor_mode: int, width: int, height: int, fps: int,
+                      flip: int, wbmode: int) -> str:
     return (
-        f"nvarguscamerasrc sensor-id={sensor_id} sensor-mode={sensor_mode} "
+        f"nvarguscamerasrc sensor-id={sensor_id} sensor-mode={sensor_mode} wbmode={wbmode} "
         f"! video/x-raw(memory:NVMM), width={width}, height={height}, "
         f"framerate={fps}/1, format=NV12 "
         f"! nvvidconv flip-method={flip} "
         f"! video/x-raw, format=BGRx "
-        f"! videoconvert "
-        f"! video/x-raw, format=BGR "
+        # NO CPU videoconvert: appsink takes BGRx (GPU nvvidconv output) and read() strips the X
+        # byte in numpy. videoconvert(BGRx->BGR) was ~135% CPU/cam at 1640x1232 -> the rate cap.
         f"! appsink name=sink emit-signals=false max-buffers=1 drop=true sync=false"
     )
 
@@ -61,10 +62,11 @@ class GstCsiCapture:
         if not ok:
             return None
         try:
-            # Rows can be 4-byte-stride padded; reshape by actual row length then crop.
+            # BGRx = 4 bytes/pixel (B,G,R,X). Reshape by actual (possibly padded) row length,
+            # crop to w*4, view as (h,w,4), drop the X byte -> BGR. Cheaper than a CPU videoconvert.
             row = info.size // h
             arr = np.frombuffer(info.data, np.uint8, count=row * h).reshape(h, row)
-            frame = arr[:, : w * 3].reshape(h, w, 3).copy()
+            frame = arr[:, : w * 4].reshape(h, w, 4)[:, :, :3].copy()
         finally:
             buf.unmap(info)
         return frame, w, h
@@ -83,6 +85,12 @@ class CameraCsiNode(Node):
         self.declare_parameter("height", 1232)
         self.declare_parameter("fps", 30)
         self.declare_parameter("flip_method", 0)
+        # MUST match the training-capture pipeline (csi_capture.py): wbmode=8 (shade). The old
+        # default (no wbmode -> nvargus auto) fed YOLO a different colour cast than it trained on.
+        self.declare_parameter("wbmode", 8)
+        # Post-capture per-channel WB gains [B,G,R] (body cam training used 1.16/1.08/0.82 to kill
+        # the magenta cast). [1,1,1] = off (wide cam).
+        self.declare_parameter("wb_gains", [1.0, 1.0, 1.0])
         self.declare_parameter("frame_id", "camera")
         self.declare_parameter("topic", "image_raw")
         self.declare_parameter("publish_rate", 30.0)
@@ -94,12 +102,17 @@ class CameraCsiNode(Node):
         self.height = int(self.get_parameter("height").value)
         self.fps = int(self.get_parameter("fps").value)
         self.flip = int(self.get_parameter("flip_method").value)
+        self.wbmode = int(self.get_parameter("wbmode").value)
+        gains = [float(g) for g in self.get_parameter("wb_gains").value]
+        self._wb = np.array(gains[:3], dtype=np.float32).reshape(1, 1, 3) if len(gains) >= 3 else None
+        self._apply_wb = self._wb is not None and not np.allclose(self._wb, 1.0)
         self.frame_id = str(self.get_parameter("frame_id").value)
         topic = str(self.get_parameter("topic").value)
         rate = float(self.get_parameter("publish_rate").value)
         self.pull_timeout = float(self.get_parameter("pull_timeout").value)
 
-        pipeline = make_gst_pipeline(self.sensor_id, self.sensor_mode, self.width, self.height, self.fps, self.flip)
+        pipeline = make_gst_pipeline(self.sensor_id, self.sensor_mode, self.width, self.height,
+                                     self.fps, self.flip, self.wbmode)
         self.get_logger().info(f"GStreamer pipeline: {pipeline}")
 
         self.cap = GstCsiCapture(pipeline)
@@ -117,6 +130,8 @@ class CameraCsiNode(Node):
             self.get_logger().warn("frame pull timed out", throttle_duration_sec=2.0)
             return
         frame, w, h = result
+        if self._apply_wb:
+            frame = np.clip(frame.astype(np.float32) * self._wb, 0, 255).astype(np.uint8)
         msg = Image()
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.header.frame_id = self.frame_id

@@ -27,11 +27,16 @@ from __future__ import annotations
 
 import math
 
+import cv2
+import numpy as np
 import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import PoseStamped
-from robot_interfaces.msg import Classification, MissionState, Object, WorldModel
+from robot_interfaces.msg import BaseCommand, Classification, DetectionArray, MissionState, Object, WorldModel
 from std_msgs.msg import Bool, Empty, Int8, String, UInt64
+
+# Body detection label -> set_type (mirror of world_model), for the ALIGN visual-servo filter.
+_LABEL_ST = {"cube": 1, "octahedron": 1, "dodecahedron": 1, "icosahedron": 1, "fruit_photo_cube": 2}
 
 
 STATES = [
@@ -48,9 +53,29 @@ class MissionFsmNode(Node):
         self.declare_parameter("set1_label", "")      # e.g. "icosahedron"
         self.declare_parameter("set2_label", "")      # e.g. "apple"
         self.declare_parameter("conf_threshold", 0.7)
+        self.declare_parameter("pick_track_conf", 0.5)   # min world-model track confidence to pick the latched target
         self.declare_parameter("approach_dist_m", 0.25)
         self.declare_parameter("align_settle_sec", 1.0)
         self.declare_parameter("classify_timeout_sec", 2.0)
+        # ALIGN visual servo: drive the mecanum base so the target lands on the arm's fixed grab
+        # point (base_link m, measured 2026-07-04: 26.4cm fwd / 0.7cm left). SAFETY: never advance
+        # the target past grab_min_x — the body cam blind-limit (~25cm) is only ~1cm nearer, so an
+        # overshoot loses sight of the object right before the grab.
+        self.declare_parameter("grab_x", 0.264)
+        self.declare_parameter("grab_y", 0.007)
+        self.declare_parameter("grab_min_x", 0.255)     # never push the target closer than this
+        self.declare_parameter("align_tol_m", 0.04)     # aligned within this -> grab (gripper absorbs)
+        self.declare_parameter("align_kp", 0.6)         # m/s per m of error
+        self.declare_parameter("align_vmax", 0.16)      # cap
+        # STICTION: the heavy base won't move below ~this speed (motor just buzzes), so any nonzero
+        # servo command is boosted to at least this. Bigger tol above absorbs the coarser steps.
+        self.declare_parameter("align_vmin", 0.13)
+        self.declare_parameter("align_timeout_sec", 12.0)
+        # Pulse+settle: the heavy base coasts after a command, so instead of a continuous servo we
+        # nudge briefly, let it FULLY STOP (inertia dissipates), then measure the settled position
+        # and grab if within tolerance (gripper opening absorbs the residual). Repeat otherwise.
+        self.declare_parameter("align_pulse_sec", 0.15)     # burst length per nudge
+        self.declare_parameter("align_settle_pulse_sec", 0.8)  # wait for the base to fully stop
         self.declare_parameter("pick_duration_sec", 3.0)
         self.declare_parameter("storage_x", 0.2)
         self.declare_parameter("storage_y", 0.2)
@@ -69,9 +94,40 @@ class MissionFsmNode(Node):
         self.set1_label = str(self.get_parameter("set1_label").value)
         self.set2_label = str(self.get_parameter("set2_label").value)
         self.conf_threshold = float(self.get_parameter("conf_threshold").value)
+        self.pick_track_conf = float(self.get_parameter("pick_track_conf").value)
         self.approach_dist_m = float(self.get_parameter("approach_dist_m").value)
         self.align_settle_sec = float(self.get_parameter("align_settle_sec").value)
         self.classify_timeout_sec = float(self.get_parameter("classify_timeout_sec").value)
+        self.grab_x = float(self.get_parameter("grab_x").value)
+        self.grab_y = float(self.get_parameter("grab_y").value)
+        self.grab_min_x = float(self.get_parameter("grab_min_x").value)
+        self.align_tol = float(self.get_parameter("align_tol_m").value)
+        self.align_kp = float(self.get_parameter("align_kp").value)
+        self.align_vmax = float(self.get_parameter("align_vmax").value)
+        self.align_vmin = float(self.get_parameter("align_vmin").value)
+        self.align_timeout_sec = float(self.get_parameter("align_timeout_sec").value)
+        self.align_pulse_sec = float(self.get_parameter("align_pulse_sec").value)
+        self.align_settle_pulse_sec = float(self.get_parameter("align_settle_pulse_sec").value)
+        self._align_phase = "measure"      # measure -> pulse -> settle -> measure ...
+        self._align_phase_start = 0.0
+        self._pulse_vx = 0.0
+        self._pulse_vy = 0.0
+        # Body-cam ground homography for POSE-INDEPENDENT servo: project the object's body pixel
+        # straight to base_link (no robot pose), so pose drift can't wander the servo target.
+        self.declare_parameter("body_ground_homography_path",
+                               "/home/seventt/seventt/workspace/data/calib/body_ground.npz")
+        self.declare_parameter("body_cam_nadir_x", 0.065)
+        self.declare_parameter("body_cam_height_m", 0.145)
+        self.declare_parameter("object_center_height_m", 0.04)
+        self._body_H = None
+        try:
+            self._body_H = np.load(str(self.get_parameter("body_ground_homography_path").value))["H"].astype(np.float64)
+        except Exception as exc:  # noqa: BLE001
+            self.get_logger().warn(f"body homography load failed ({exc}); ALIGN servo uses pose-based fallback")
+        self._bnx = float(self.get_parameter("body_cam_nadir_x").value)
+        self._bH = float(self.get_parameter("body_cam_height_m").value)
+        self._boh = float(self.get_parameter("object_center_height_m").value)
+        self._body_dets: list = []   # latest /camera_body/detections as (u, v_center, set_type)
         self.pick_duration_sec = float(self.get_parameter("pick_duration_sec").value)
         self.storage_x = float(self.get_parameter("storage_x").value)
         self.storage_y = float(self.get_parameter("storage_y").value)
@@ -105,12 +161,14 @@ class MissionFsmNode(Node):
         self.create_subscription(Object, "/selected_target", self.on_target, 10)
         self.create_subscription(Classification, "/classification/siglip", self.on_siglip, 10)
         self.create_subscription(Classification, "/classification/shape", self.on_shape, 10)
+        self.create_subscription(DetectionArray, "/camera_body/detections", self.on_body_dets, 10)
         self.create_subscription(Empty, "/state_advance", self.on_advance, 10)
 
         self.pub_state = self.create_publisher(MissionState, "/mission_state", 10)
         self.pub_blacklist = self.create_publisher(UInt64, "/world_model/blacklist_add", 10)
         self.pub_goal = self.create_publisher(PoseStamped, "/base/goal_pose", 10)
         self.pub_pick = self.create_publisher(Bool, "/arm/pick_trigger", 10)
+        self.pub_cmd = self.create_publisher(BaseCommand, "/base_command", 10)   # ALIGN visual servo
         # Current pick phase (1=Set1, 2=Set2) for the target selector's phase filter.
         self.pub_phase = self.create_publisher(Int8, "/planning/phase", 10)
         # Human-readable decision feed (PICK / PASS / SKIP / PHASE / END) for the visualiser.
@@ -136,6 +194,8 @@ class MissionFsmNode(Node):
         prev = self.state
         self.state = new_state
         self.state_enter_s = self._now_s()
+        if new_state == "ALIGN":
+            self._align_phase = "measure"       # start each ALIGN by measuring the settled position
         self.get_logger().info(
             f"transition {prev} -> {new_state}  "
             f"tray=(shape:{self.tray_shape}, fruit:{self.tray_fruit})  "
@@ -150,6 +210,64 @@ class MissionFsmNode(Node):
             if obj.id == obj_id:
                 return obj
         return None
+
+    def _to_base(self, fx: float, fy: float) -> tuple[float, float] | None:
+        """Field xy -> base_link xy (x fwd, y left) using the world model's robot pose."""
+        if self.world is None:
+            return None
+        dx, dy = fx - self.world.robot_x, fy - self.world.robot_y
+        ct, st = math.cos(self.world.robot_theta), math.sin(self.world.robot_theta)
+        return (ct * dx + st * dy, -st * dx + ct * dy)
+
+    def _front_target(self, set_type: int, max_r: float = 0.45) -> Object | None:
+        """The non-blacklisted object of this set_type nearest the arm grab point (base_link).
+        Used in ALIGN/CLASSIFY instead of a latched track id, which churns as tracks are dropped
+        and recreated during the approach — the object physically in front IS the target."""
+        if self.world is None:
+            return None
+        best = None
+        bestd = max_r
+        for o in self.world.objects:
+            if o.blacklisted or o.set_type != set_type:
+                continue
+            base = self._to_base(o.x, o.y)
+            if base is None:
+                continue
+            d = math.hypot(base[0] - self.grab_x, base[1] - self.grab_y)
+            if d < bestd:
+                bestd = d
+                best = o
+        return best
+
+    def on_body_dets(self, msg: DetectionArray) -> None:
+        self._body_dets = [(float(d.x_center), float(d.y_center), _LABEL_ST.get(str(d.label), 0))
+                           for d in msg.detections]
+
+    def _body_target_base(self, set_type: int) -> tuple[float, float] | None:
+        """POSE-INDEPENDENT servo target: project each body detection of this set_type straight to
+        base_link (body homography + 8cm height correction), return the one nearest the grab point.
+        No robot pose used -> pose drift cannot wander the target (that was the back-and-forth)."""
+        if self._body_H is None or not self._body_dets:
+            return None
+        best = None
+        bestd = 0.5
+        k = self._boh / self._bH
+        for u, v, st in self._body_dets:
+            if st != set_type:
+                continue
+            p = cv2.perspectiveTransform(np.array([[[u, v]]], np.float64), self._body_H)[0][0]
+            bx, by = float(p[0]) - k * (float(p[0]) - self._bnx), float(p[1]) - k * float(p[1])
+            d = math.hypot(bx - self.grab_x, by - self.grab_y)
+            if d < bestd:
+                bestd = d
+                best = (bx, by)
+        return best
+
+    def _drive(self, vx: float, vy: float, omega: float = 0.0) -> None:
+        c = BaseCommand()
+        c.header.stamp = self.get_clock().now().to_msg()
+        c.vx, c.vy, c.omega = float(vx), float(vy), float(omega)
+        self.pub_cmd.publish(c)
 
     def _robot_xy(self) -> tuple[float, float] | None:
         if self.world is None:
@@ -284,11 +402,7 @@ class MissionFsmNode(Node):
                 self._enter("ALIGN")
 
         elif self.state == "ALIGN":
-            if self._time_in_state() >= self.align_settle_sec:
-                # clear stale classifications so CLASSIFY only trusts fresh ones
-                self.siglip_stamp_s = None
-                self.shape_stamp_s = None
-                self._enter("CLASSIFY")
+            self._step_align()
 
         elif self.state == "CLASSIFY":
             self._step_classify()
@@ -354,6 +468,61 @@ class MissionFsmNode(Node):
         self.set_type = 0
         self._enter("SELECT_TARGET")
 
+    def _step_align(self) -> None:
+        """Pulse+settle visual align: nudge the base briefly, let it FULLY STOP (inertia dissipates),
+        then measure the object's body-cam base_link position (pose-independent) and grab if within
+        tolerance (the gripper opening absorbs the residual). Otherwise nudge again. The base is
+        stationary at grab time, so the object won't drift while the arm descends."""
+        now = self._now_s()
+        if self._time_in_state() > self.align_timeout_sec:
+            self._drive(0.0, 0.0)
+            self.get_logger().warn("ALIGN: timeout -> reselect")
+            self._enter("SELECT_TARGET")
+            return
+
+        if self._align_phase == "pulse":
+            if now - self._align_phase_start < self.align_pulse_sec:
+                self._drive(self._pulse_vx, self._pulse_vy)     # brief nudge
+            else:
+                self._drive(0.0, 0.0)
+                self._align_phase = "settle"
+                self._align_phase_start = now
+            return
+        if self._align_phase == "settle":
+            self._drive(0.0, 0.0)                                # let the heavy base fully stop
+            if now - self._align_phase_start >= self.align_settle_pulse_sec:
+                self._align_phase = "measure"
+            return
+
+        # measure (base is settled/stationary)
+        want = 1 if self.phase == 1 else 2
+        base = self._body_target_base(want)
+        if base is None:
+            self._drive(0.0, 0.0)
+            self.get_logger().info("ALIGN: target lost -> reselect")
+            self._enter("SELECT_TARGET")
+            return
+        obj_x, obj_y = base
+        ex, ey = obj_x - self.grab_x, obj_y - self.grab_y
+        if math.hypot(ex, ey) < self.align_tol:                 # settled + within gripper tol -> grab
+            self._drive(0.0, 0.0)
+            self.get_logger().info(f"ALIGN ok: obj=({obj_x:.3f},{obj_y:.3f}) err={math.hypot(ex,ey)*100:.1f}cm -> grab")
+            self.siglip_stamp_s = None
+            self.shape_stamp_s = None
+            self._enter("CLASSIFY")
+            return
+        # Latch a nudge toward the error (stiction-boosted), per axis, with the forward safety.
+        vx = max(-self.align_vmax, min(self.align_vmax, self.align_kp * ex))
+        vy = max(-self.align_vmax, min(self.align_vmax, self.align_kp * ey))
+        vx = 0.0 if abs(ex) <= self.align_tol else math.copysign(max(abs(vx), self.align_vmin), ex)
+        vy = 0.0 if abs(ey) <= self.align_tol else math.copysign(max(abs(vy), self.align_vmin), ey)
+        if obj_x <= self.grab_min_x and vx > 0.0:               # never push nearer than the blind limit
+            vx = 0.0
+        self._pulse_vx, self._pulse_vy = vx, vy
+        self._align_phase = "pulse"
+        self._align_phase_start = now
+        self._drive(vx, vy)
+
     def _step_classify(self) -> None:
         """Phase-aware pick gate from fresh siglip + shape classifications.
 
@@ -361,42 +530,51 @@ class MissionFsmNode(Node):
         object met here is skipped (NOT blacklisted) so it can be picked in phase 2, and vice
         versa. Recognition/mapping itself is phase-independent and runs continuously upstream.
         """
-        enter = self.state_enter_s
-        siglip = self.siglip if (self.siglip_stamp_s is not None and self.siglip_stamp_s >= enter) else None
-        shape = self.shape if (self.shape_stamp_s is not None and self.shape_stamp_s >= enter) else None
+        # SPATIAL gate: confirm from the CURRENT TARGET's own world-model track (its fused wide+body
+        # identity at THIS track's position), not a frame-global /classification/shape or /siglip
+        # that may belong to a neighbouring distractor. Set1 = the track already carries the shape
+        # (YOLO, wide+body); Set2 = the track carries the SigLIP fruit in fruit_label. Re-look it up
+        # fresh so close-range body/siglip observations during APPROACH are included.
+        # Target = object of this phase's set_type nearest the grab point (robust to id churn).
+        want = 1 if self.phase == 1 else 2
+        tgt = self._front_target(want)
+        if tgt is None:
+            # target vanished before a decision -> RE-ACQUIRE, never blacklist a lost target.
+            self.get_logger().info("CLASSIFY: target lost -> reselect")
+            self.current_target = None
+            self._enter("SELECT_TARGET")
+            return
+        self.current_target = tgt   # keep the FSM latched to the object actually in front
 
-        # Set1 shape confirmation. Anti-mispick cube rule kept as belt-and-suspenders even though
-        # the 5-class YOLO now separates cube (class 0) from fruit_photo_cube (excluded from the
-        # shape stream): if the target is the plain cube, still require siglip to see no fruit face.
         set1_ok = bool(
             self.set1_label
-            and shape is not None
-            and shape.label == self.set1_label
-            and shape.confidence >= self.conf_threshold
-            and (self.set1_label != "cube" or (siglip is not None and not siglip.image_face_visible))
+            and tgt is not None
+            and tgt.set_type == 1
+            and tgt.class_label == self.set1_label
+            and tgt.confidence >= self.pick_track_conf
         )
-        # Set2 fruit confirmation: today's fruit, a picture face visible, confident.
+        # Set2 fruit: the track's SigLIP-derived fruit_label (only set when a face was actually read).
         set2_ok = bool(
             self.set2_label
-            and siglip is not None
-            and siglip.label == self.set2_label
-            and siglip.image_face_visible
-            and siglip.confidence >= self.conf_threshold
+            and tgt is not None
+            and tgt.set_type == 2
+            and tgt.fruit_label == self.set2_label
+            and tgt.confidence >= self.pick_track_conf
         )
 
         if self.phase == 1:
             if set1_ok:
-                self._commit_pick(1, shape.label, f"conf={shape.confidence:.2f}")
+                self._commit_pick(1, tgt.class_label, f"track conf={tgt.confidence:.2f}")
                 return
             if set2_ok:
-                self._skip_target(f"set2 '{siglip.label}' during Set1 phase")
+                self._skip_target(f"set2 '{tgt.fruit_label}' during Set1 phase")
                 return
         else:  # phase 2
             if set2_ok:
-                self._commit_pick(2, siglip.label, f"conf={siglip.confidence:.2f} face_visible")
+                self._commit_pick(2, tgt.fruit_label, f"track conf={tgt.confidence:.2f} (siglip fruit)")
                 return
             if set1_ok:
-                self._skip_target(f"stray set1 '{shape.label}' during Set2 phase")
+                self._skip_target(f"stray set1 '{tgt.class_label}' during Set2 phase")
                 return
 
         # No confident phase-appropriate decision: pass (blacklist) once we time out.

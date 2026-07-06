@@ -59,6 +59,12 @@ class SiglipGateNode(Node):
         self.declare_parameter("confidence_threshold", 0.7)
         self.declare_parameter("device", "auto")
         self.declare_parameter("min_box_area", 400)
+        # Only fruit_photo_cube boxes go to SigLIP (fruit-type is meaningless on a shape). And the
+        # crop must be "croppable": big enough (min_box_area) AND square-ish aspect (a fruit face
+        # seen roughly head-on). A far/edge-on box is elongated or tiny -> skip (SigLIP would guess).
+        self.declare_parameter("target_label", "fruit_photo_cube")
+        self.declare_parameter("aspect_ratio_min", 0.6)   # w/h lower bound
+        self.declare_parameter("aspect_ratio_max", 1.7)   # w/h upper bound
 
         self.model_id = str(self.get_parameter("model_id").value)
         self.set2_label = str(self.get_parameter("set2_label").value)
@@ -66,6 +72,9 @@ class SiglipGateNode(Node):
         self.confidence_threshold = float(self.get_parameter("confidence_threshold").value)
         device_param = str(self.get_parameter("device").value)
         self.min_box_area = int(self.get_parameter("min_box_area").value)
+        self.target_label = str(self.get_parameter("target_label").value)
+        self.aspect_ratio_min = float(self.get_parameter("aspect_ratio_min").value)
+        self.aspect_ratio_max = float(self.get_parameter("aspect_ratio_max").value)
 
         self.bridge = CvBridge()
         self.latest_frame: Optional[np.ndarray] = None
@@ -152,12 +161,15 @@ class SiglipGateNode(Node):
         self._classify_and_publish(crop, msg.header.stamp)
 
     def _primary_detection(self, detections, w: int, h: int) -> Optional[Detection]:
-        """Highest-confidence box; tie-break = closest to image center."""
+        """Highest-confidence fruit_photo_cube box; tie-break = closest to image center.
+        Only the target label (fruit_photo_cube) is classified — SigLIP reads the fruit face."""
         cx_img, cy_img = w / 2.0, h / 2.0
         best: Optional[Detection] = None
         best_conf = -1.0
         best_dist = float("inf")
         for det in detections:
+            if str(det.label) != self.target_label:
+                continue
             conf = float(det.confidence)
             dist = (float(det.x_center) - cx_img) ** 2 + (float(det.y_center) - cy_img) ** 2
             if conf > best_conf or (conf == best_conf and dist < best_dist):
@@ -180,9 +192,19 @@ class SiglipGateNode(Node):
 
         if x2 <= x1 or y2 <= y1:
             return None
-        if (x2 - x1) * (y2 - y1) < self.min_box_area:
+        bw, bh = x2 - x1, y2 - y1
+        if bw * bh < self.min_box_area:
             self.get_logger().info(
-                f"box area {(x2 - x1) * (y2 - y1)} < min_box_area {self.min_box_area}; skipping",
+                f"box area {bw * bh} < min_box_area {self.min_box_area}; skipping (너무 멀다)",
+                throttle_duration_sec=5.0,
+            )
+            return None
+        # Aspect gate: a fruit face seen head-on is roughly square; an edge-on / far box is skewed.
+        ar = bw / float(bh)
+        if not (self.aspect_ratio_min <= ar <= self.aspect_ratio_max):
+            self.get_logger().info(
+                f"aspect {ar:.2f} out of [{self.aspect_ratio_min},{self.aspect_ratio_max}]; "
+                f"skipping (각도 나쁨/얼굴면 아님)",
                 throttle_duration_sec=5.0,
             )
             return None
@@ -203,24 +225,33 @@ class SiglipGateNode(Node):
             # prompts. This keeps confidence_threshold meaningful ("P(this fruit) >= 0.7")
             # instead of being diluted across the prompt set, and keeps the cube
             # image-vs-plain discriminator independent of the fruit scores.
-            probs = torch.sigmoid(outputs.logits_per_image)[0].detach().cpu().numpy()
+            logits = outputs.logits_per_image[0].detach().cpu().numpy()
         except Exception as exc:
             self.get_logger().warn(f"SigLIP inference failed: {exc}", throttle_duration_sec=5.0)
             return
 
         n_fruits = len(self.fruit_labels)
-        fruit_probs = probs[:n_fruits]
-        prob_image_face = float(probs[n_fruits])
-        prob_plain_cube = float(probs[n_fruits + 1])
-
-        best_idx = int(np.argmax(fruit_probs))
-        best_label = self.fruit_labels[best_idx]
-        best_conf = float(fruit_probs[best_idx])
-
+        sig = 1.0 / (1.0 + np.exp(-logits))              # sigmoid for the face discriminator
+        prob_image_face = float(sig[n_fruits])
+        prob_plain_cube = float(sig[n_fruits + 1])
         image_face_visible = prob_image_face > prob_plain_cube
+
+        # Fruit TYPE = SOFTMAX over the fruit prompts (relative: WHICH fruit among the options).
+        # The raw sigmoid is tiny (~0.005) for every fruit so an absolute gate never fires. The
+        # reliability is the MARGIN over the runner-up (user: the bigger the gap, the more we trust
+        # it) — published as `confidence` so the world model vote-weights the fruit by that margin.
+        fl = logits[:n_fruits]
+        e = np.exp(fl - fl.max())
+        soft = e / e.sum()
+        order = np.argsort(soft)[::-1]
+        best_idx = int(order[0])
+        best_label = self.fruit_labels[best_idx]
+        best_soft = float(soft[best_idx])
+        margin = best_soft - float(soft[order[1]]) if n_fruits > 1 else best_soft
+        # Confident target IF a fruit face is visible AND this fruit clearly beats the others.
         is_target = (
             best_label == self.set2_label
-            and best_conf >= self.confidence_threshold
+            and margin >= self.confidence_threshold
             and image_face_visible
         )
 
@@ -229,15 +260,16 @@ class SiglipGateNode(Node):
         out.header.frame_id = "camera_body"
         out.label = best_label
         out.set_type = 2
-        out.confidence = best_conf
+        out.confidence = float(margin)          # reliability = margin over the runner-up fruit
         out.is_target = is_target
         out.image_face_visible = image_face_visible
         out.source = "siglip"
         self.pub.publish(out)
 
         self.get_logger().info(
-            f"siglip: label={best_label} conf={best_conf:.3f} "
-            f"face_visible={image_face_visible} is_target={is_target}"
+            f"siglip: {best_label} soft={best_soft:.2f} margin={margin:.2f} "
+            f"face={image_face_visible} target={is_target}",
+            throttle_duration_sec=1.0,
         )
 
 

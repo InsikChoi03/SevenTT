@@ -43,6 +43,12 @@ class McuBridgeBaseNode(Node):
         self.sub = self.create_subscription(
             Float32MultiArray, "/base/wheel_speeds", self.on_wheel_speeds, 10
         )
+        # 2R ARM passthrough on the SAME combined board (ttyUSB0): the firmware takes both
+        # <BASE,...> and <ARM,shoulder,wrist,gripper> on one port, so the arm can't have its own
+        # bridge here. /arm2r/target = [shoulder, wrist, gripper] servo degrees.
+        self.sub_arm = self.create_subscription(
+            Float32MultiArray, "/arm2r/target", self.on_arm_target, 10
+        )
         self.pub_odom = self.create_publisher(Float32MultiArray, "/base/wheel_odom", 10)
 
         self._open_serial()
@@ -74,6 +80,26 @@ class McuBridgeBaseNode(Node):
                 self.ser.write(line.encode("ascii"))
             except (serial.SerialException, OSError) as e:
                 self.get_logger().warn(f"serial write failed ({e}); closing")
+                try:
+                    self.ser.close()
+                finally:
+                    self.ser = None
+
+    def on_arm_target(self, msg: Float32MultiArray) -> None:
+        if len(msg.data) < 3:
+            self.get_logger().warn(f"arm target expected >=3 (shoulder,wrist,gripper), got {len(msg.data)}")
+            return
+        sh, wr, gr = (int(round(v)) for v in msg.data[:3])
+        line = f"<ARM,{sh},{wr},{gr}>\n"
+        with self.ser_lock:
+            if self.ser is None:
+                self._open_serial()
+            if self.ser is None:
+                return
+            try:
+                self.ser.write(line.encode("ascii"))
+            except (serial.SerialException, OSError) as e:
+                self.get_logger().warn(f"arm serial write failed ({e}); closing")
                 try:
                     self.ser.close()
                 finally:

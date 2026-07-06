@@ -21,7 +21,7 @@ import math
 import rclpy
 from geometry_msgs.msg import PoseStamped
 from rclpy.node import Node
-from robot_interfaces.msg import BaseCommand, WorldModel
+from robot_interfaces.msg import BaseCommand, MissionState, WorldModel
 
 
 def yaw_from_quat(qz: float, qw: float) -> float:
@@ -73,6 +73,9 @@ class GoToGoalNode(Node):
 
         self.create_subscription(PoseStamped, "/base/goal_pose", self.on_goal, 10)
         self.create_subscription(PoseStamped, "/localization/pose", self.on_pose, 10)
+        # Yield /base_command to the FSM during ALIGN/PICK (it visual-servos the base itself).
+        self._mission_state = ""
+        self.create_subscription(MissionState, "/mission_state", self.on_mission_state, 10)
         if self.use_wm_fallback:
             self.create_subscription(WorldModel, "/world_model", self.on_world, 10)
 
@@ -110,6 +113,9 @@ class GoToGoalNode(Node):
         self._stopped = (vx == 0.0 and vy == 0.0 and omega == 0.0)
 
     # -------------------------------------------------------------- callbacks
+    def on_mission_state(self, msg: MissionState) -> None:
+        self._mission_state = str(msg.state)
+
     def on_goal(self, msg: PoseStamped) -> None:
         yaw = yaw_from_quat(msg.pose.orientation.z, msg.pose.orientation.w)
         new = (msg.pose.position.x, msg.pose.position.y, yaw)
@@ -128,6 +134,12 @@ class GoToGoalNode(Node):
 
     # --------------------------------------------------------------------- tick
     def tick(self) -> None:
+        # Yield during ALIGN/PICK: the FSM drives the base directly (visual servo to grab point),
+        # so stay silent here to avoid two publishers on /base_command overshooting the object.
+        if self._mission_state in ("ALIGN", "PICK"):
+            if not self._stopped:
+                self._publish(0.0, 0.0, 0.0)
+            return
         # No goal, or goal went stale -> command one zero, then go quiet (watchdog holds).
         if self.goal is None or self.goal_stamp_s is None:
             return

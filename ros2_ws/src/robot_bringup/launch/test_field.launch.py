@@ -36,6 +36,7 @@ def generate_launch_description() -> LaunchDescription:
 
     with_base = LaunchConfiguration("with_base")
     with_siglip = LaunchConfiguration("with_siglip")
+    with_arm = LaunchConfiguration("with_arm")     # 2R pick_sequencer (real grasp via combined board)
     output_dir = LaunchConfiguration("output_dir")
     cam_yaw = LaunchConfiguration("cam_yaw")      # wide-cam mount rotation about base z (0/90/180/270)
     rot180 = LaunchConfiguration("rot180")        # optical-axis flip for the 180-rotated top image
@@ -57,12 +58,14 @@ def generate_launch_description() -> LaunchDescription:
                               description="start base drive (explorer + go_to_goal + base + bridge)"),
         DeclareLaunchArgument("with_siglip", default_value="true",
                               description="start siglip_gate (fruit type); false saves VRAM"),
+        DeclareLaunchArgument("with_arm", default_value="false",
+                              description="start 2R pick_sequencer (real grasp); needs with_base (shares ttyUSB0)"),
         DeclareLaunchArgument(
             "output_dir",
             default_value="/home/seventt/seventt/workspace/data/mock_field_test",
             description="recognition_viz run-output base dir (script points it at the run folder)"),
-        DeclareLaunchArgument("cam_yaw", default_value="180",
-                              description="wide-cam mount yaw override (try 0/90/180/270 to fix front/left/right)"),
+        DeclareLaunchArgument("cam_yaw", default_value="90",
+                              description="wide-cam mount yaw (2026-07-02: 90 by physical align; try 0/90/180/270)"),
         DeclareLaunchArgument("rot180", default_value="true",
                               description="wide-cam 180-image optical-axis flip (try true/false)"),
         cameras,
@@ -90,4 +93,7 @@ def generate_launch_description() -> LaunchDescription:
              condition=IfCondition(with_base)),
         node("robot_hardware", "mcu_bridge_base_node", "mcu_bridge_base_node",
              condition=IfCondition(with_base)),
+        # 2R arm pick sequencer (real grasp). Publishes /arm2r/target -> mcu_bridge_base (ttyUSB0).
+        node("robot_control", "pick_sequencer_node", "pick_sequencer_node",
+             condition=IfCondition(with_arm)),
     ])

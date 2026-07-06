@@ -141,10 +141,10 @@ def grab(cam, tries=4):
     return f
 
 
-def _fname(batch, ts, camtag, i):
+def _fname(batch, ts, camtag, i, ext="jpg"):
     """캡처 파일명: [배치라벨_]세션ts_카메라태그_인덱스 → 배치·캠 간 충돌·혼동 방지."""
     pfx = f"roam_{batch}_{ts}" if batch else f"roam_{ts}"
-    return f"{pfx}_{camtag}_{i:03d}.jpg"
+    return f"{pfx}_{camtag}_{i:03d}.{ext}"
 
 
 def return_to_start(base, fwd_motion, steps, dur):
@@ -159,8 +159,8 @@ def return_to_start(base, fwd_motion, steps, dur):
         time.sleep(0.15)
 
 
-def run_manual(base, cams, outdir, step_motion, dur, settle, batch=""):
-    """수동 스텝: SPACE=현재방향 회전+촬영, c=방향전환(cw<->ccw), b=반대로 한스텝(촬영X),
+def run_manual(base, cams, outdir, step_motion, dur, settle, batch="", ext="jpg"):
+    """수동 스텝(GUI): SPACE=현재방향 회전+촬영, c=방향전환(cw<->ccw), b=반대로 한스텝(촬영X),
     r=시작복귀, q=복귀후종료. net=부호있는 cw스텝(시작기준)으로 선꼬임 추적 → q/r에서 복귀로 풀림.
     cw로 ~180도 쓸고 c로 ccw 전환해 되쓸면 ±범위 안에서 무한 반복 수집 가능."""
     pv = "wide" if "wide" in cams else next(iter(cams))   # 미리보기 캠(광각 우선)
@@ -194,7 +194,7 @@ def run_manual(base, cams, outdir, step_motion, dur, settle, batch=""):
                     g = grab(cam)
                     if g is None:
                         print(f"  {tag} 캡처실패"); continue
-                    cv2.imwrite(f"{outdir[tag]}/" + _fname(batch, ts, tag, shots[tag]), g)
+                    cv2.imwrite(f"{outdir[tag]}/" + _fname(batch, ts, tag, shots[tag], ext), g)
                     shots[tag] += 1
                 print(f"  {cur} net-cw {net}: " + " ".join(f"{t}:{shots[t]}" for t in cams), flush=True)
             elif k == ord("c"):                               # 방향 전환 (cw <-> ccw)
@@ -213,6 +213,77 @@ def run_manual(base, cams, outdir, step_motion, dur, settle, batch=""):
     print("[manual] 종료. 저장: " + ", ".join(f"{t}={shots[t]} ({outdir[t]})" for t in cams), flush=True)
 
 
+def run_manual_tty(base, cams, outdir, step_motion, dur, settle, batch="", ext="jpg"):
+    """헤드리스 수동 스텝(창 없음) — 이 SSH 터미널에서 키 입력, 로봇을 눈으로 보며 한 스텝씩.
+    SPACE/Enter=현재방향 회전+촬영, c=방향전환(cw<->ccw), b=반대로 한스텝(촬영X),
+    r=시작복귀(선 풀기), q/ESC=복귀 후 종료. Ctrl-C=즉시 정지(복귀 생략, 비상용).
+    net=부호있는 cw스텝(시작기준) → q/r에서 반대로 풀어 케이블 꼬임 해제."""
+    import termios
+    import tty
+    import select
+
+    if not sys.stdin.isatty():
+        print("[err] --tty(터미널 수동)는 실제 대화형 터미널에서 실행해야 합니다 "
+              "(파이프/백그라운드 불가). SSH 셸에서 직접 실행하세요.", file=sys.stderr)
+        return
+
+    ts = int(time.time())
+    net = 0                                               # 부호있는 cw 스텝(시작 기준) = 선꼬임 지표
+    cur = step_motion                                     # 현재 회전 방향
+    shots = {t: 0 for t in cams}
+    print("[manual-tty] 창 없음(헤드리스). 이 터미널에 포커스 두고 로봇 보며 키 입력:", flush=True)
+    print("  SPACE/Enter=회전+촬영  c=방향전환(cw<->ccw)  b=반대로(촬영X)  r=시작복귀  q=복귀후종료",
+          flush=True)
+    print(f"  현재 방향={cur.upper()}  |  Ctrl-C=즉시 정지(비상)", flush=True)
+
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    aborted = False
+    try:
+        tty.setcbreak(fd)                                 # 한 글자씩 즉시 읽기(ISIG 유지 → Ctrl-C 살아있음)
+        while True:
+            r, _, _ = select.select([sys.stdin], [], [], 0.2)   # 0.2s 폴링(Ctrl-C 반응성)
+            if not r:
+                continue
+            k = sys.stdin.read(1)
+            if k in ("q", "\x1b"):                         # q / ESC
+                break
+            if k in (" ", "\r", "\n"):                     # SPACE/Enter: 현재방향 회전+촬영
+                base.move(cur, dur)
+                time.sleep(settle)
+                net += 1 if cur == "cw" else -1
+                for tag, cam in cams.items():
+                    g = grab(cam)
+                    if g is None:
+                        print(f"  {tag} 캡처실패", flush=True)
+                        continue
+                    cv2.imwrite(f"{outdir[tag]}/" + _fname(batch, ts, tag, shots[tag], ext), g)
+                    shots[tag] += 1
+                print(f"  {cur} net-cw {net}: " + " ".join(f"{t}:{shots[t]}" for t in cams), flush=True)
+            elif k == "c":                                # 방향 전환 (cw <-> ccw)
+                cur = "ccw" if cur == "cw" else "cw"
+                print(f"  방향 전환 -> {cur.upper()}", flush=True)
+            elif k == "b":                                # 반대로 한 스텝(촬영 안 함)
+                opp = "ccw" if cur == "cw" else "cw"
+                base.move(opp, dur)
+                time.sleep(settle)
+                net += 1 if opp == "cw" else -1
+                print(f"  back({opp}) -> net-cw {net}", flush=True)
+            elif k == "r":                                # 시작 위치 복귀(선 풀기)
+                return_to_start(base, "cw", net, dur)
+                net = 0
+    except KeyboardInterrupt:
+        aborted = True
+        print("\n[stop] Ctrl-C — 즉시 정지(선 복귀 생략). 필요하면 다음 실행에서 반대로 풀거나 손으로 정리.",
+              flush=True)
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)     # 터미널 원복
+    if not aborted:
+        return_to_start(base, "cw", net, dur)             # 정상 종료 시에만 시작위치 복귀
+    print("[manual-tty] 종료. 저장: " + ", ".join(f"{t}={shots[t]} ({outdir[t]})" for t in cams),
+          flush=True)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--base-port", default="/dev/ttyUSB0", help="메카넘 베이스(CH340)")
@@ -224,11 +295,19 @@ def main():
     ap.add_argument("--pattern", default=DEFAULT_PATTERN, help="사이클별 모션 시퀀스(쉼표)")
     ap.add_argument("--wide-flip", type=int, default=2, help="광각 flip-method (wide_capture_label과 동일=2)")
     ap.add_argument("--raw", action="store_true", help="본체캠 WB 보정 끔")
+    ap.add_argument("--session", default="",
+                    help="세션명 — 지정 시 출력이 data/roam_capture/<세션>/{body,wide}로 분리되고 batch도 세션명이 됨. "
+                         "촬영 세션(장면 재배치)마다 새 이름 주면 배치가 절대 안 섞임. 예: --session s0704pm1")
     ap.add_argument("--out-body", default="data/roam_capture/body")
     ap.add_argument("--out-wide", default="data/roam_capture/wide")
     ap.add_argument("--no-arm-home", action="store_true", help="팔 HOME 이동 생략")
+    ap.add_argument("--arm-port", default="/dev/ttyUSB0",
+                    help="팔 HOME 보낼 포트(통합보드=베이스와 동일 ttyUSB0). base_yaw 구형 분리보드는 /dev/ttyACM0")
     ap.add_argument("--manual", action="store_true",
-                    help="수동 스텝 모드: 창에서 SPACE=회전+촬영, q=복귀후종료 (180도만 돌릴 때 권장)")
+                    help="수동 스텝 모드: SPACE=회전+촬영, c=방향전환, q=복귀후종료 (180도만 돌릴 때 권장)")
+    ap.add_argument("--tty", action="store_true",
+                    help="수동 모드를 터미널 키입력으로(창 없이, 헤드리스). DISPLAY 없으면 자동 적용")
+    ap.add_argument("--ext", default="jpg", choices=["jpg", "png"], help="저장 이미지 형식")
     ap.add_argument("--step-motion", default="cw", choices=["cw", "ccw"], help="수동 회전 방향")
     ap.add_argument("--batch", default="", help="파일명 배치 라벨(예: bodyextra2) — 배치 구분·중복 방지. 영숫자/_ 권장")
     ap.add_argument("--dry-run", action="store_true", help="안 움직이고 두 캠 1장씩만 저장+계획")
@@ -240,16 +319,31 @@ def main():
     pattern = [m.strip() for m in args.pattern.split(",") if m.strip() in MOTIONS and m.strip() != "stop"]
     if not pattern:
         print("--pattern 에 유효 모션 없음"); return 1
+
+    # --session: 세션명으로 캠별 전용 폴더 자동 분리(배치 안 섞임) + batch=세션명.
+    if args.session:
+        sroot = os.path.join("data/roam_capture", args.session)
+        args.out_body = os.path.join(sroot, "body")
+        args.out_wide = os.path.join(sroot, "wide")
+        if not args.batch:
+            args.batch = args.session
     outdir = {"body": args.out_body, "wide": args.out_wide}
     for t in which:
         os.makedirs(outdir[t], exist_ok=True)
+        # 섞임 가드: 기존 이미지가 있으면 경고(다른 장면 배치가 덮이지 않게 세션명 바꾸라고 안내).
+        existing = [f for f in os.listdir(outdir[t])
+                    if f.lower().endswith((".jpg", ".png")) and not f.startswith("dryrun")]
+        if existing:
+            print(f"[warn] {outdir[t]} 에 이미 {len(existing)}장 있음 — 같은 세션에 누적됩니다. "
+                  f"새 배치면 --session 이름을 바꾸세요(안 섞이게).")
 
     print(f"[plan] cams={which}  cycles={args.cycles}  speed={args.speed}  move-dur={args.move_dur}s  settle={args.settle}s")
+    print(f"[plan] 저장위치: " + ", ".join(f"{t}->{outdir[t]}" for t in which) + f"  batch={args.batch or '(없음)'}")
     print(f"[plan] pattern={pattern}  (사이클 i 모션 = pattern[i % {len(pattern)}])")
     print(f"[plan] 예상 저장 = {args.cycles} x {len(which)} = {args.cycles*len(which)}장")
 
     if not args.no_arm_home and not args.dry_run:
-        arm_home_once()
+        arm_home_once(args.arm_port)
 
     cams = open_cams(which, args.wide_flip, args.raw)
     if not cams:
@@ -264,7 +358,7 @@ def main():
             f = grab(cam)
             if f is None:
                 print(f"[dry] {tag} 프레임 실패"); continue
-            p = f"{outdir[tag]}/dryrun_{args.batch + '_' if args.batch else ''}{tag}.jpg"
+            p = f"{outdir[tag]}/dryrun_{args.batch + '_' if args.batch else ''}{tag}.{args.ext}"
             cv2.imwrite(p, f)
             print(f"[dry] {tag} {f.shape[1]}x{f.shape[0]} -> {p}")
         for c in cams.values():
@@ -288,8 +382,11 @@ def main():
 
     # ---- 수동 스텝 모드: SPACE로 한 스텝씩, 종료 시 시작위치 복귀(선 풀기) ----
     if args.manual:
+        use_tty = args.tty or not os.environ.get("DISPLAY")   # 헤드리스(DISPLAY 없음)면 터미널 키입력
+        runner = run_manual_tty if use_tty else run_manual
+        print(f"[manual] 모드={'터미널(창없음)' if use_tty else 'GUI(창)'}  형식={args.ext}", flush=True)
         try:
-            run_manual(base, cams, outdir, args.step_motion, args.move_dur, args.settle, args.batch)
+            runner(base, cams, outdir, args.step_motion, args.move_dur, args.settle, args.batch, args.ext)
         finally:
             base.close()
             for c in cams.values():
@@ -308,7 +405,7 @@ def main():
                 f = grab(cam)
                 if f is None:
                     print(f"  {i+1}/{args.cycles} [{m}] {tag} 캡처실패"); continue
-                p = f"{outdir[tag]}/" + _fname(args.batch, ts, tag, i)
+                p = f"{outdir[tag]}/" + _fname(args.batch, ts, tag, i, args.ext)
                 cv2.imwrite(p, f); saved[tag] += 1
             done = " ".join(f"{t}:{saved[t]}" for t in cams)
             print(f"  {i+1}/{args.cycles} [{m}] -> {done}", flush=True)

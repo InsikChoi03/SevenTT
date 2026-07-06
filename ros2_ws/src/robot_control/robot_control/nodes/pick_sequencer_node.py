@@ -1,131 +1,84 @@
-"""Pick sequencer: turns the FSM's /arm/pick_trigger (Bool) into a timed arm motion.
+"""Pick sequencer (2R arm): turns the FSM's /arm/pick_trigger (Bool) into a timed 2R servo
+sequence, published as /arm2r/target = [shoulder, wrist, gripper] (degrees). The combined-board
+bridge (mcu_bridge_base) forwards it as <ARM,shoulder,wrist,gripper> on ttyUSB0.
 
-Closes the gap between the FSM and the arm controller:
-    mission_fsm_node --/arm/pick_trigger (Bool)--> [THIS NODE]
-    [THIS NODE] --/arm/target_pose (Pose, arm_base m)--> arm_controller_node
-                --/arm/gripper      (Float32 servo deg)--> arm_controller_node
-                --/arm/servo_correction (Vector3)--> arm_controller_node  (neutral here)
+Transplanted from the VERIFIED scripts/arm_pick2r.py (fixed-blind 2R grasp; pick confirmed by
+pick_verify). Replaces the old arm_ik / 6-DOF path (arm_controller_node + mcu_bridge_arm), which
+does not match the physical 2R arm.
 
-trigger True  -> run an open-loop look→descend→grasp→lift→tray→drop→return sequence.
-trigger False -> release (open gripper at stow). The physical tray-dump mechanism is
-                 separate (TODO); here we just open the gripper so anything held drops.
+    trigger True  -> GRASP: reach to PICK pose (open) -> close -> lift back to INIT (holding).
+    trigger False -> PLACE: move to PLACE pose (holding) -> open -> return to INIT.
 
-Grasp target: a fixed default pose (params, arm_base frame, meters). If `use_aruco` is set
-and a fresh /aruco/marker_pose arrives, the grasp xyz is refined by transforming the marker
-into arm_base via TF — guarded, and falling back to the default pose if TF is unavailable or
-uncalibrated. This matches the planned look-then-grab→ArUco pickup; ArUco refinement stays
-OFF until the camera→arm_base static TF is measured (the rig TFs are still placeholders).
-
-Timing: the whole sequence should finish within the FSM's pick_duration_sec (default 3.0s)
-or the FSM advances regardless. Tune the per-step dwells (sum) and/or the FSM param together.
+The arm boots LIMP and snaps to the first <ARM> it receives, so INIT is published on startup to
+absorb that snap safely. Angles are the arm_pick2r verified values (params to tune).
 """
 from __future__ import annotations
 
 import rclpy
-from geometry_msgs.msg import Pose, PoseStamped, Vector3
 from rclpy.node import Node
-from std_msgs.msg import Bool, Float32
-
-from robot_control import arm_ik
-
-# TF is optional: only needed for ArUco-refined grasping. Guarded so the node runs without it.
-try:
-    import tf2_ros
-    from tf2_geometry_msgs import do_transform_pose_stamped  # noqa: F401
-
-    _TF_AVAILABLE = True
-except Exception:  # noqa: BLE001
-    tf2_ros = None  # type: ignore[assignment]
-    _TF_AVAILABLE = False
+from std_msgs.msg import Bool, Float32MultiArray
 
 
 class PickSequencerNode(Node):
     def __init__(self) -> None:
         super().__init__("pick_sequencer_node")
 
-        # --- default poses (arm_base frame, meters) ---
-        self.declare_parameter("grasp_xyz", [0.18, 0.0, 0.04])   # at the object
-        self.declare_parameter("pregrasp_dz", 0.08)              # height above grasp for look/lift
-        self.declare_parameter("tray_xyz", [0.05, 0.0, 0.20])    # body tray drop point
-        self.declare_parameter("stow_xyz", [0.10, 0.0, 0.20])    # safe rest pose
-        # --- step dwell times (s) ---
-        self.declare_parameter("look_sec", 0.6)
-        self.declare_parameter("move_sec", 0.5)
-        self.declare_parameter("grasp_sec", 0.5)
-        self.declare_parameter("control_rate_hz", 20.0)
-        # --- ArUco refinement (off until camera->arm_base TF is calibrated) ---
-        self.declare_parameter("use_aruco", False)
-        self.declare_parameter("aruco_topic", "/aruco/marker_pose")
-        self.declare_parameter("arm_base_frame", "arm_base")
-        self.declare_parameter("aruco_timeout_sec", 0.5)
-        self.declare_parameter("grasp_z_offset_m", 0.0)          # added to ArUco z
+        # 2R verified poses (re-taught 2026-07-04 after the arm angles shifted). Servo degrees.
+        self.declare_parameter("init_pose", [170.0, 10.0, 100.0])   # shoulder, wrist, gripper (idle)
+        self.declare_parameter("pick_shoulder_wrist", [95.0, 150.0])
+        self.declare_parameter("place_shoulder_wrist", [170.0, 30.0])
+        self.declare_parameter("grip_open", 85.0)
+        self.declare_parameter("grip_closed", 130.0)
+        self.declare_parameter("move_sec", 2.5)     # dwell for an arm move (>= firmware smooth time)
+        self.declare_parameter("grasp_sec", 0.7)    # dwell for a gripper open/close
+        self.declare_parameter("rate_hz", 20.0)
 
-        self.grasp = self._xyz("grasp_xyz")
-        self.pregrasp_dz = float(self.get_parameter("pregrasp_dz").value)
-        self.tray = self._xyz("tray_xyz")
-        self.stow = self._xyz("stow_xyz")
-        self.look_sec = float(self.get_parameter("look_sec").value)
+        self.init_pose = [float(v) for v in self.get_parameter("init_pose").value]
+        psw = [float(v) for v in self.get_parameter("pick_shoulder_wrist").value]
+        plsw = [float(v) for v in self.get_parameter("place_shoulder_wrist").value]
+        self.pick_sw = (psw[0], psw[1])
+        self.place_sw = (plsw[0], plsw[1])
+        self.grip_open = float(self.get_parameter("grip_open").value)
+        self.grip_closed = float(self.get_parameter("grip_closed").value)
         self.move_sec = float(self.get_parameter("move_sec").value)
         self.grasp_sec = float(self.get_parameter("grasp_sec").value)
-        rate = float(self.get_parameter("control_rate_hz").value)
-        self.use_aruco = bool(self.get_parameter("use_aruco").value)
-        self.arm_base_frame = str(self.get_parameter("arm_base_frame").value)
-        self.aruco_timeout = float(self.get_parameter("aruco_timeout_sec").value)
-        self.grasp_z_offset = float(self.get_parameter("grasp_z_offset_m").value)
+        rate = float(self.get_parameter("rate_hz").value)
 
-        # --- runtime sequencer state ---
-        self.running = False
-        self.kind = ""
-        self.seq: list[tuple[str, float, tuple[float, float, float], float]] = []
+        self.pub = self.create_publisher(Float32MultiArray, "/arm2r/target", 10)
+        self.create_subscription(Bool, "/arm/pick_trigger", self.on_trigger, 10)
+
+        # sequence state
+        self.seq: list[tuple[str, float, tuple[float, float, float]]] = []
         self.cum: list[float] = []
         self.total = 0.0
         self.seq_start_s = 0.0
+        self.running = False
+        self.kind = ""
         self._last_step = ""
         self._last_trigger: bool | None = None
 
-        # latest ArUco marker pose
-        self.marker: PoseStamped | None = None
-        self.marker_stamp_s: float | None = None
-
-        # TF buffer only if we actually intend to use ArUco
-        self.tf_buffer = None
-        if self.use_aruco and _TF_AVAILABLE:
-            self.tf_buffer = tf2_ros.Buffer()
-            self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
-        elif self.use_aruco and not _TF_AVAILABLE:
-            self.get_logger().warn("use_aruco set but tf2 unavailable; using default grasp pose")
-            self.use_aruco = False
-
-        self.create_subscription(Bool, "/arm/pick_trigger", self.on_trigger, 10)
-        if self.use_aruco:
-            self.create_subscription(
-                PoseStamped, str(self.get_parameter("aruco_topic").value), self.on_marker, 10
-            )
-
-        self.pub_pose = self.create_publisher(Pose, "/arm/target_pose", 10)
-        self.pub_grip = self.create_publisher(Float32, "/arm/gripper", 10)
-        self.pub_corr = self.create_publisher(Vector3, "/arm/servo_correction", 10)
+        # Absorb the boot-limp snap: hold INIT for the first ~1.5 s before accepting triggers.
+        self._init_until = self._now_s() + 1.5
         self.timer = self.create_timer(1.0 / rate, self.tick)
 
         self.get_logger().info(
-            f"pick_sequencer ready: grasp={self.grasp} tray={self.tray} stow={self.stow} "
-            f"dwell(look={self.look_sec},move={self.move_sec},grasp={self.grasp_sec})s "
-            f"use_aruco={self.use_aruco}"
+            f"pick_sequencer(2R) ready: init={self.init_pose} pick={self.pick_sw} "
+            f"place={self.place_sw} grip(open={self.grip_open}/closed={self.grip_closed}) "
+            f"move={self.move_sec}s grasp={self.grasp_sec}s -> /arm2r/target"
         )
-
-    # ------------------------------------------------------------------ utils
-    def _xyz(self, name: str) -> tuple[float, float, float]:
-        v = [float(x) for x in self.get_parameter(name).value]
-        return (v[0], v[1], v[2])
 
     def _now_s(self) -> float:
         return self.get_clock().now().nanoseconds * 1e-9
 
+    def _publish(self, pose: tuple[float, float, float]) -> None:
+        m = Float32MultiArray()
+        m.data = [float(pose[0]), float(pose[1]), float(pose[2])]
+        self.pub.publish(m)
+
     # -------------------------------------------------------------- callbacks
     def on_trigger(self, msg: Bool) -> None:
         trig = bool(msg.data)
-        # edge / latch: only (re)start when not already running the matching sequence
-        if self.running:
+        if self.running or self._now_s() < self._init_until:
             return
         if trig and self._last_trigger is not True:
             self._start_pick()
@@ -133,53 +86,31 @@ class PickSequencerNode(Node):
             self._start_release()
         self._last_trigger = trig
 
-    def on_marker(self, msg: PoseStamped) -> None:
-        self.marker = msg
-        self.marker_stamp_s = self._now_s()
-
     # -------------------------------------------------------------- sequences
-    def _grasp_pose(self) -> tuple[float, float, float]:
-        """Default grasp pose, optionally refined by a fresh ArUco marker via TF."""
-        if not self.use_aruco or self.tf_buffer is None:
-            return self.grasp
-        if self.marker is None or self.marker_stamp_s is None:
-            return self.grasp
-        if (self._now_s() - self.marker_stamp_s) > self.aruco_timeout:
-            return self.grasp
-        try:
-            tf = self.tf_buffer.lookup_transform(
-                self.arm_base_frame, self.marker.header.frame_id, rclpy.time.Time()
-            )
-            p = do_transform_pose_stamped(self.marker, tf).pose.position
-            self.get_logger().info(
-                f"ArUco grasp refine -> ({p.x:.3f},{p.y:.3f},{p.z:.3f}) arm_base",
-                throttle_duration_sec=1.0,
-            )
-            return (p.x, p.y, p.z + self.grasp_z_offset)
-        except Exception as exc:  # noqa: BLE001 - TF missing/uncalibrated -> default
-            self.get_logger().warn(
-                f"ArUco TF transform failed ({exc}); using default grasp pose",
-                throttle_duration_sec=2.0,
-            )
-            return self.grasp
-
     def _start_pick(self) -> None:
-        grasp = self._grasp_pose()
-        pre = (grasp[0], grasp[1], grasp[2] + self.pregrasp_dz)
-        o, c = float(arm_ik.GRIPPER_OPEN), float(arm_ik.GRIPPER_CLOSED)
+        # FULL pick+place on one True trigger: the 2R has a single gripper, so it can't hold an
+        # object while chasing the next target — grab it and immediately place it (behind), then
+        # return to idle ready for the next target. (release-only stays available via False.)
+        psh, pwr = self.pick_sw
+        plsh, plwr = self.place_sw
+        ish, iwr, _ig = self.init_pose
         self.seq = [
-            ("LOOK",    self.look_sec,  pre,        o),
-            ("DESCEND", self.move_sec,  grasp,      o),
-            ("GRASP",   self.grasp_sec, grasp,      c),
-            ("LIFT",    self.move_sec,  pre,        c),
-            ("TO_TRAY", self.move_sec,  self.tray,  c),
-            ("DROP",    self.grasp_sec, self.tray,  o),
-            ("RETURN",  self.move_sec,  self.stow,  o),
+            ("REACH",    self.move_sec,  (psh, pwr, self.grip_open)),      # down to pick pose, open
+            ("GRASP",    self.grasp_sec, (psh, pwr, self.grip_closed)),    # close (grab)
+            ("LIFT",     self.move_sec,  (ish, iwr, self.grip_closed)),    # lift to init, holding
+            ("TO_PLACE", self.move_sec,  (plsh, plwr, self.grip_closed)),  # move to place pose
+            ("PLACE",    self.grasp_sec, (plsh, plwr, self.grip_open)),    # open (place behind)
+            ("RETURN",   self.move_sec,  tuple(self.init_pose)),           # back to idle
         ]
-        self._launch("PICK")
+        self._launch("PICK_PLACE")
 
     def _start_release(self) -> None:
-        self.seq = [("RELEASE", self.grasp_sec, self.stow, float(arm_ik.GRIPPER_OPEN))]
+        sh, wr = self.place_sw
+        self.seq = [
+            ("TO_PLACE", self.move_sec,  (sh, wr, self.grip_closed)),  # to place pose, holding
+            ("PLACE",    self.grasp_sec, (sh, wr, self.grip_open)),    # open (release)
+            ("RETURN",   self.move_sec,  tuple(self.init_pose)),       # back to init
+        ]
         self._launch("RELEASE")
 
     def _launch(self, kind: str) -> None:
@@ -189,42 +120,34 @@ class PickSequencerNode(Node):
         self._last_step = ""
         t = 0.0
         self.cum = []
-        for (_n, d, _p, _g) in self.seq:
+        for (_n, d, _p) in self.seq:
             t += d
             self.cum.append(t)
         self.total = t
         self.get_logger().info(f"{kind} sequence start: {len(self.seq)} steps, {self.total:.1f}s")
 
-    def _publish(self, xyz: tuple[float, float, float], grip: float) -> None:
-        pose = Pose()
-        pose.position.x, pose.position.y, pose.position.z = xyz
-        pose.orientation.w = 1.0
-        self.pub_pose.publish(pose)
-        self.pub_grip.publish(Float32(data=float(grip)))
-        self.pub_corr.publish(Vector3())   # neutral; visual-servo correction wired later
-
     # --------------------------------------------------------------------- tick
     def tick(self) -> None:
         if not self.running:
+            if self._now_s() < self._init_until:
+                self._publish(tuple(self.init_pose))   # snap-absorb: hold INIT on boot
             return
         el = self._now_s() - self.seq_start_s
         if el >= self.total:
-            name, _, xyz, grip = self.seq[-1]
-            self._publish(xyz, grip)           # hold final pose, then idle
+            self._publish(self.seq[-1][2])
             self.running = False
             self.get_logger().info(f"{self.kind} sequence complete")
             return
-
         idx = len(self.seq) - 1
         for i, cend in enumerate(self.cum):
             if el < cend:
                 idx = i
                 break
-        name, _, xyz, grip = self.seq[idx]
+        name, _, pose = self.seq[idx]
         if name != self._last_step:
-            self.get_logger().info(f"step {name}: pose={tuple(round(v,3) for v in xyz)} grip={grip}")
+            self.get_logger().info(f"step {name}: pose={tuple(round(v) for v in pose)}")
             self._last_step = name
-        self._publish(xyz, grip)
+        self._publish(pose)
 
 
 def main(args=None) -> None:

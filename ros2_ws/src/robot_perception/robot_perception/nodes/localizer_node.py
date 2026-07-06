@@ -85,6 +85,9 @@ class LocalizerNode(Node):
         self.declare_parameter("landmark_gain", 0.2)
         self.declare_parameter("landmark_max_step_m", 0.1)
         self.declare_parameter("landmark_max_step_rad", 0.1)
+        # HEADING authority for a CONFIDENT landmark fix (scaled by the fix's confidence). Higher
+        # than landmark_gain because a well-conditioned object-bearing heading is an absolute ref.
+        self.declare_parameter("landmark_theta_gain", 0.7)
 
         # Top-camera intrinsics. If any is 0 -> skip undistort / VO-scale usage.
         self.declare_parameter("top_fx", 0.0)
@@ -110,8 +113,31 @@ class LocalizerNode(Node):
         self.use_landmark_correction = bool(self.get_parameter("use_landmark_correction").value)
         self.use_object_landmarks = bool(self.get_parameter("use_object_landmarks").value)
         self.landmark_gain = float(self.get_parameter("landmark_gain").value)
+        self.landmark_theta_gain = float(self.get_parameter("landmark_theta_gain").value)
         self.landmark_max_step_m = float(self.get_parameter("landmark_max_step_m").value)
         self.landmark_max_step_rad = float(self.get_parameter("landmark_max_step_rad").value)
+        # VO now OWNS rotation (applies the FULL measured yaw delta). Wheel-odom rotation is only a
+        # FALLBACK used when VO has been stale this long, so the two never double-count theta.
+        self.declare_parameter("vo_stale_sec", 0.25)
+        self.vo_stale_sec = float(self.get_parameter("vo_stale_sec").value)
+        self.last_vo_time = None
+        # Per-frame VO yaw below this is treated as NOISE and not integrated — otherwise a stationary
+        # robot slowly drifts (random-walk of the frame-to-frame estimate). Real turns exceed it.
+        self.declare_parameter("vo_deadband_rad", 0.004)
+        self.vo_deadband = float(self.get_parameter("vo_deadband_rad").value)
+        # OBJECT-FLOW odometry is the PRIMARY rotation source: it comes from real wide-cam object
+        # points (world_model /localization/object_odom), so it does NOT hallucinate yaw from motor
+        # vibration the way dense LK optical flow does. When object-flow is fresh, the LK VO is
+        # demoted to a fallback (few-object frames only) and never fights it.
+        self.declare_parameter("use_object_flow", True)
+        self.use_object_flow = bool(self.get_parameter("use_object_flow").value)
+        self.declare_parameter("object_flow_min_conf", 0.25)   # ignore a low-confidence flow estimate
+        self.object_flow_min_conf = float(self.get_parameter("object_flow_min_conf").value)
+        self.declare_parameter("object_flow_stale_sec", 0.5)   # LK VO wakes up if flow older than this
+        self.object_flow_stale_sec = float(self.get_parameter("object_flow_stale_sec").value)
+        self.declare_parameter("object_flow_trans", True)      # also apply flow translation (else yaw only)
+        self.object_flow_trans = bool(self.get_parameter("object_flow_trans").value)
+        self.last_objflow_time = None
 
         self.fx = float(self.get_parameter("top_fx").value)
         self.fy = float(self.get_parameter("top_fy").value)
@@ -156,7 +182,10 @@ class LocalizerNode(Node):
         self.create_subscription(Float32MultiArray, "/base/wheel_odom", self.on_wheel_odom, 10)
         self.create_subscription(Image, "/camera_top/image_raw", self.on_top_image, 10)
         self.create_subscription(
-            Vector3, "/localization/landmark_correction", self.on_landmark_correction, 10
+            Float32MultiArray, "/localization/landmark_correction", self.on_landmark_correction, 10
+        )
+        self.create_subscription(
+            Float32MultiArray, "/localization/object_odom", self.on_object_odom, 10
         )
         self.pub = self.create_publisher(PoseStamped, "/localization/pose", 10)
         self.timer = self.create_timer(1.0 / rate, self.publish_pose)
@@ -185,8 +214,12 @@ class LocalizerNode(Node):
             return
         dt = now - self.last_odom_time
         self.last_odom_time = now
-        # Clamp dt to a sane window so a stale/jumpy clock cannot teleport the pose.
-        dt = max(0.0, min(0.2, dt))
+        # Clamp dt to a sane window so a stale/jumpy clock cannot teleport the pose. Upper bound is
+        # 2x the 5 Hz HB nominal period (0.4 s), NOT 0.2 s: the base echoes HB at ~0.2 s, so a 0.2 s
+        # clamp equal to the period systematically discards the above-nominal half of normal serial
+        # jitter (a 0.25 s gap -> only 0.2 s integrated), under-counting distance. 0.4 s still blocks
+        # a real stall/clock jump while passing ordinary jitter.
+        dt = max(0.0, min(0.4, dt))
         if dt <= 0.0:
             return
 
@@ -202,24 +235,75 @@ class LocalizerNode(Node):
         vxw = vx * ct - vy * st
         vyw = vx * st + vy * ct
 
-        self.x += vxw * dt
-        self.y += vyw * dt
-        self.theta = wrap_angle(self.theta + w * dt)
+        # Translation: object-flow OWNS it when fresh (grounded in real objects), so the wheel
+        # dead-reckons x/y only as a FALLBACK — otherwise the same displacement is integrated twice
+        # (wheel here AND object-flow in on_object_odom) and the pose runs at ~2x speed. This mirrors
+        # the yaw dedup below. LK VO gives no translation (monocular scale is ambiguous), so this
+        # keys on object-flow freshness specifically (last_objflow_time), and only when object-flow
+        # translation is actually enabled (object_flow_trans).
+        flow_trans_fresh = (
+            self.use_object_flow
+            and self.object_flow_trans
+            and self.last_objflow_time is not None
+            and (now - self.last_objflow_time) <= self.object_flow_stale_sec
+        )
+        if not flow_trans_fresh:
+            self.x += vxw * dt
+            self.y += vyw * dt
+        # Rotation: VO owns it. Only integrate the (open-loop, drift-prone) wheel yaw when VO is
+        # stale/absent — so driving never double-counts rotation (VO adds the full delta elsewhere).
+        if self.last_vo_time is None or (now - self.last_vo_time) > self.vo_stale_sec:
+            self.theta = wrap_angle(self.theta + w * dt)
+
+    # ------------------------------------------------------------- object-flow odometry
+    def on_object_odom(self, msg: Float32MultiArray) -> None:
+        """PRIMARY yaw source: per-frame robot motion from wide-cam object points
+        [dtheta, dfwd, dleft, conf] (robot frame). Grounded in real objects, so it stays ~0 when
+        the robot is still (even under motor vibration) — unlike LK flow. Integrated in full."""
+        if not self.use_object_flow:
+            return
+        d = msg.data
+        if len(d) < 3:
+            return
+        dtheta, dfwd, dleft = float(d[0]), float(d[1]), float(d[2])
+        conf = float(d[3]) if len(d) > 3 else 1.0
+        if conf < self.object_flow_min_conf:
+            return
+        now = self.get_clock().now().nanoseconds * 1e-9
+        self.last_objflow_time = now
+        self.last_vo_time = now      # object-flow owns rotation -> keep wheel-yaw AND LK-VO suppressed
+        self.theta = wrap_angle(self.theta + dtheta)
+        if self.object_flow_trans:
+            ct, st = math.cos(self.theta), math.sin(self.theta)
+            self.x += dfwd * ct - dleft * st
+            self.y += dfwd * st + dleft * ct
 
     # ------------------------------------------------------------- object landmarks
-    def on_landmark_correction(self, msg: Vector3) -> None:
-        """Blend a small, clamped fraction of the world model's rigid drift estimate.
+    def on_landmark_correction(self, msg: Float32MultiArray) -> None:
+        """Apply the world model's rigid drift estimate [dx, dy, dtheta, confidence].
 
-        msg = (dx, dy, dtheta) field-frame correction from re-observed mapped objects. Applied
-        gently (gain + per-update clamp) so the pose converges without teleporting; the wheel
-        odometry keeps integrating between corrections.
+        Translation is nudged gently. HEADING is treated as an ABSOLUTE reference scaled by the
+        fit's confidence (well-spread, low-residual, many re-observed anchors -> apply most of it):
+        YOLO object bearings pin heading with NO drift, so a confident fix should correct promptly
+        rather than crawl. The per-update clamp still caps any single step for stability.
         """
         if not self.use_object_landmarks:
             return
-        g, mx, mr = self.landmark_gain, self.landmark_max_step_m, self.landmark_max_step_rad
-        self.x += max(-mx, min(mx, g * float(msg.x)))
-        self.y += max(-mx, min(mx, g * float(msg.y)))
-        self.theta = wrap_angle(self.theta + max(-mr, min(mr, g * float(msg.z))))
+        d = msg.data
+        if len(d) < 3:
+            return
+        dx, dy, dth = float(d[0]), float(d[1]), float(d[2])
+        conf = float(d[3]) if len(d) > 3 else 1.0
+        mx, mr = self.landmark_max_step_m, self.landmark_max_step_rad
+        cf = max(0.0, min(1.0, conf))
+        # POSITION: the locked anchors ARE the wide cam's (now 1280, cm-accurate) map, so this dx/dy
+        # is an ABSOLUTE position fix. Apply most of it (confidence-scaled) to null out odometry
+        # drift rather than crawl — the wide map is the trusted ground truth for where we are.
+        g_xy = self.landmark_gain * cf
+        self.x += max(-mx, min(mx, g_xy * dx))
+        self.y += max(-mx, min(mx, g_xy * dy))
+        g_th = self.landmark_theta_gain * cf                        # confidence-scaled heading authority
+        self.theta = wrap_angle(self.theta + max(-mr, min(mr, g_th * dth)))
 
     # ----------------------------------------------------------------- top camera
     def on_top_image(self, msg: Image) -> None:
@@ -234,6 +318,19 @@ class LocalizerNode(Node):
         if frame is None or frame.size == 0:
             return
 
+        # Object-flow is the primary yaw source; while it is fresh the LK VO result is discarded, so
+        # skip the whole VO pipeline (fisheye remap + gray + LK + RANSAC) — it was running at camera
+        # rate on the Orin for nothing and starving the 20 Hz pose timer / serial callbacks. Only skip
+        # when the wall-cardinal landmark snap (which also needs gray) is off — which it is outside the
+        # arena (test_field). prev_gray is invalidated so LK cleanly re-inits when object-flow goes stale.
+        now = self.get_clock().now().nanoseconds * 1e-9
+        flow_fresh = (self.use_object_flow and self.last_objflow_time is not None
+                      and (now - self.last_objflow_time) <= self.object_flow_stale_sec)
+        if flow_fresh and not self.use_landmark_correction:
+            self.prev_gray = None
+            self.prev_pts = None
+            return
+
         # Optional undistort only when intrinsics are provided. Fisheye rectify for the wide
         # ~150 deg lens (straightens walls for Hough/LK); pinhole undistort otherwise.
         if self.have_intrinsics and np.any(self.dist_coeffs):
@@ -244,14 +341,15 @@ class LocalizerNode(Node):
 
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-        # Frame-to-frame heading from LK-tracked features.
+        # Frame-to-frame heading from LK-tracked features. DEMOTED to a fallback: object-flow (real
+        # object points) is the primary yaw source and does not hallucinate rotation from vibration,
+        # so LK VO only runs when object-flow has been stale (handled by the early-skip above; here
+        # `now`/`flow_fresh` are already set). With landmark-snap on, we reach here even when fresh.
         theta_visual = self._visual_yaw_delta(gray)
-        if theta_visual is not None:
-            # Complementary filter in DELTA space (wrap-safe): nudge heading by a small
-            # fraction of the measured frame-to-frame visual yaw. Averaging absolute angles
-            # linearly would break at the +/-pi wrap boundary — and the start pose
-            # theta=pi sits exactly on it, so this matters from the first frame.
-            self.theta = wrap_angle(self.theta + 0.1 * theta_visual)
+        if theta_visual is not None and not flow_fresh:
+            self.last_vo_time = now                          # LK-VO alive -> wheel yaw stays suppressed
+            if abs(theta_visual) >= self.vo_deadband:        # deadband out stationary jitter (drift)
+                self.theta = wrap_angle(self.theta + theta_visual)
 
         # Absolute-correction hook (approximate; see _detect_landmarks docstring). Skipped
         # outside the arena, where random edges would snap the heading to a wrong cardinal.

@@ -37,7 +37,7 @@ from rclpy.node import Node
 
 from geometry_msgs.msg import PoseStamped
 from sensor_msgs.msg import Image
-from std_msgs.msg import Int8, String
+from std_msgs.msg import Float32MultiArray, Int8, String
 from robot_interfaces.msg import Classification, DetectionArray, MissionState, Object, WorldModel
 
 try:
@@ -55,6 +55,49 @@ try:
 except Exception:  # noqa: BLE001 - camera panels disabled without cv_bridge
     _BRIDGE_AVAILABLE = False
 
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+
+class _MjpegStreamer:
+    """Tiny threaded MJPEG-over-HTTP server. Serves the latest map frame as a continuous
+    multipart stream so a laptop browser (http://<jetson-ip>:<port>/) shows the live map like a
+    video — no file-reload black flicker. Assign the newest JPEG bytes to `.latest` each redraw."""
+
+    def __init__(self, port: int) -> None:
+        self.latest: bytes | None = None
+        streamer = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *a):   # silence per-request console spam
+                pass
+
+            def do_GET(self):
+                if self.path == "/favicon.ico":
+                    self.send_error(404)
+                    return
+                self.send_response(200)
+                self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
+                self.send_header("Cache-Control", "no-cache, private")
+                self.end_headers()
+                try:
+                    while True:
+                        buf = streamer.latest
+                        if buf is not None:
+                            self.wfile.write(
+                                b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: "
+                                + str(len(buf)).encode() + b"\r\n\r\n" + buf + b"\r\n"
+                            )
+                        time.sleep(0.1)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass   # browser tab closed
+
+        self._httpd = ThreadingHTTPServer(("0.0.0.0", port), Handler)
+        self._thread = threading.Thread(target=self._httpd.serve_forever, daemon=True)
+
+    def start(self) -> None:
+        self._thread.start()
+
 
 # BGR colours by set_type (and states).
 _COL_SET1 = (80, 200, 80)      # shapes -> green
@@ -70,12 +113,39 @@ _COL_TEXT = (235, 235, 235)
 _SHAPE_LABELS = frozenset({"cube", "octahedron", "dodecahedron", "icosahedron"})
 _FRUIT_LABELS = frozenset({"apple", "orange", "banana", "pineapple"})
 
+# ---- intuitive encoding: shapes by FORM, fruits by COLOUR ----
+# Shape marker form = (n_sides, rotation): cube=square, octa=diamond, dodeca=pentagon, icosa=triangle.
+_SHAPE_FORM = {
+    "cube": (4, math.pi / 4), "octahedron": (4, 0.0),
+    "dodecahedron": (5, -math.pi / 2), "icosahedron": (3, -math.pi / 2),
+}
+_COL_SHAPE = (110, 225, 130)       # all shapes share this green; the FORM distinguishes them
+# Per-fruit colours (BGR) roughly matching the real fruit.
+_FRUIT_COLORS = {
+    "apple": (48, 48, 220),        # red
+    "orange": (0, 140, 255),       # orange
+    "banana": (70, 225, 245),      # yellow
+    "pineapple": (60, 200, 225),   # gold
+}
+_COL_FRUITCUBE = (205, 90, 200)    # generic fruit_photo_cube (fruit type not read yet) -> purple
+
+
+def _reg_poly(cx: int, cy: int, r: float, n: int, rot: float):
+    return np.array(
+        [[int(round(cx + r * math.cos(rot + 2 * math.pi * k / n))),
+          int(round(cy + r * math.sin(rot + 2 * math.pi * k / n)))] for k in range(n)],
+        np.int32,
+    )
+
 
 def _label_color(label: str):
-    if label in _SHAPE_LABELS:
-        return _COL_SET1
-    if label == "fruit_photo_cube" or label in _FRUIT_LABELS:
-        return _COL_SET2
+    """Camera-panel box colour: shapes green, specific fruit by colour, generic fruit-cube purple."""
+    if label in _SHAPE_FORM:
+        return _COL_SHAPE
+    if label in _FRUIT_COLORS:
+        return _FRUIT_COLORS[label]
+    if label == "fruit_photo_cube":
+        return _COL_FRUITCUBE
     return _COL_UNKNOWN
 
 
@@ -85,6 +155,7 @@ class RecognitionVizNode(Node):
 
         self.declare_parameter("output_dir", "data/mock_field_test")
         self.declare_parameter("field_extent_m", [-2.0, 2.0, -2.0, 2.0])  # [xmin,xmax,ymin,ymax]
+        self.declare_parameter("map_rotate_180", False)   # flip the map to match the wide feed's orientation
         # Auto-fit the map to cover all tracked objects + robot + trail (handles a 4x4 field with
         # 20+ objects placed anywhere; falls back to field_extent_m when nothing is tracked yet).
         self.declare_parameter("auto_extent", True)
@@ -97,24 +168,64 @@ class RecognitionVizNode(Node):
         # live.png every redraw (open it in the IDE for a near-real-time headless view).
         self.declare_parameter("show_camera_panels", True)
         self.declare_parameter("write_live_png", True)
+        # MJPEG stream: open http://<jetson-ip>:<port>/ in a laptop browser for a smooth live map
+        # (no live.png reload flicker). 0 disables. Reachable over the AP (10.42.0.1) / Tailscale.
+        self.declare_parameter("mjpeg_port", 8080)
+        # A track is CONFIRMED (the trustworthy map layer) if both cams matched it, or the reliable
+        # body cam saw it, or a wide-only track reached this many observations (rules out a flicker).
+        # Below that it is PROVISIONAL (drawn hollow) — seen, but not yet map-certain.
+        self.declare_parameter("confirm_min_obs", 6)
+        # Camera coverage drawn on the map (base_link, follows the robot). Body = forward SECTOR
+        # (부채꼴), wide = forward-biased ELLIPSE. Keep in sync with the same-named world_model params.
+        self.declare_parameter("body_fov_half_deg", 34.0)
+        self.declare_parameter("body_fov_near_m", 0.08)
+        self.declare_parameter("body_fov_far_m", 0.6)
+        self.declare_parameter("body_fov_apex_x", 0.065)
+        self.declare_parameter("wide_fov_forward_m", 1.6)
+        self.declare_parameter("wide_fov_lateral_m", 1.3)
+        self.declare_parameter("wide_fov_center_x", 0.3)
 
         ext = [float(v) for v in self.get_parameter("field_extent_m").value]
         self.extent = ext if len(ext) == 4 else [-2.0, 2.0, -2.0, 2.0]
         self.auto_extent = bool(self.get_parameter("auto_extent").value)
         self._extent_now = list(self.extent)   # extent used for the current frame (auto or fixed)
         self.canvas_px = int(self.get_parameter("canvas_px").value)
+        self.map_rotate_180 = bool(self.get_parameter("map_rotate_180").value)
         self.snapshot_interval = float(self.get_parameter("snapshot_interval_sec").value)
         self.show_window = bool(self.get_parameter("show_window").value)
         self.redraw_rate = float(self.get_parameter("redraw_rate_hz").value)
         trail_max = int(self.get_parameter("trail_max_points").value)
         self.show_cams = bool(self.get_parameter("show_camera_panels").value) and _BRIDGE_AVAILABLE
         self.write_live = bool(self.get_parameter("write_live_png").value)
+        self.confirm_min_obs = int(self.get_parameter("confirm_min_obs").value)
+        self.body_fov_half = math.radians(float(self.get_parameter("body_fov_half_deg").value))
+        self.body_fov_near = float(self.get_parameter("body_fov_near_m").value)
+        self.body_fov_far = float(self.get_parameter("body_fov_far_m").value)
+        self.body_fov_apex_x = float(self.get_parameter("body_fov_apex_x").value)
+        self.wide_fov_fwd = float(self.get_parameter("wide_fov_forward_m").value)
+        self.wide_fov_lat = float(self.get_parameter("wide_fov_lateral_m").value)
+        self.wide_fov_cx = float(self.get_parameter("wide_fov_center_x").value)
         self.bridge = CvBridge() if _BRIDGE_AVAILABLE else None
 
         # Run directory (wallclock timestamp -> unique per run).
         base = str(self.get_parameter("output_dir").value)
         self.run_dir = os.path.join(base, time.strftime("%Y%m%d_%H%M%S"))
         os.makedirs(self.run_dir, exist_ok=True)
+
+        # Optional MJPEG stream (smooth browser view, no live.png flicker).
+        self._mjpeg = None
+        mjpeg_port = int(self.get_parameter("mjpeg_port").value)
+        if mjpeg_port > 0 and _CV2_AVAILABLE:
+            try:
+                self._mjpeg = _MjpegStreamer(mjpeg_port)
+                self._mjpeg.start()
+                self.get_logger().info(
+                    f"MJPEG 라이브맵: http://<jetson-ip>:{mjpeg_port}/  "
+                    f"(AP 10.42.0.1 / Tailscale 100.122.190.95)"
+                )
+            except Exception as exc:  # noqa: BLE001 - port busy etc.; live.png still works
+                self._mjpeg = None
+                self.get_logger().warn(f"MJPEG 스트림 시작 실패 ({exc}); live.png 로만 확인")
 
         # Latest inbound state.
         self.world: WorldModel | None = None
@@ -132,6 +243,7 @@ class RecognitionVizNode(Node):
         self.body_img: Image | None = None
         self.top_dets: list = []
         self.body_dets: list = []
+        self.proj_dets: list = []   # per-camera raw projections (x, y, src) from /world_model/projected_dets
 
         self.decisions: deque[str] = deque(maxlen=8)   # recent FSM decisions (PICK/PASS/SKIP/PHASE)
         self._seen_ids: set[int] = set()
@@ -168,6 +280,7 @@ class RecognitionVizNode(Node):
         self.create_subscription(MissionState, "/mission_state", self.on_mission, 10)
         self.create_subscription(Int8, "/planning/phase", self.on_phase, 10)
         self.create_subscription(String, "/planning/decision", self.on_decision, 10)
+        self.create_subscription(Float32MultiArray, "/world_model/projected_dets", self.on_proj, 10)
 
         self.timer = self.create_timer(1.0 / max(0.5, self.redraw_rate), self.tick)
 
@@ -230,6 +343,10 @@ class RecognitionVizNode(Node):
     def on_decision(self, msg: String) -> None:
         self.decisions.append(f"[{time.time() - self._t0:5.0f}s] {msg.data}")
 
+    def on_proj(self, msg: Float32MultiArray) -> None:
+        d = list(msg.data)
+        self.proj_dets = [(d[i], d[i + 1], int(d[i + 2])) for i in range(0, len(d) - 2, 3)]
+
     # ------------------------------------------------------------------ helpers
     def _lookup(self, obj_id: int) -> Object | None:
         if self.world is None or obj_id == 0:
@@ -277,6 +394,8 @@ class RecognitionVizNode(Node):
         W = H = self.canvas_px
         px = int((x - xmin) / max(1e-6, xmax - xmin) * (W - 1))
         py = int((ymax - y) / max(1e-6, ymax - ymin) * (H - 1))   # y up -> invert row
+        if self.map_rotate_180:   # flip both axes -> map faces the same way as the wide feed
+            px, py = (W - 1) - px, (H - 1) - py
         return px, py
 
     def _current_extent(self):
@@ -304,10 +423,20 @@ class RecognitionVizNode(Node):
                 self._can_show = False
                 self.get_logger().warn(f"cv2 window unavailable ({exc}); PNG snapshots only")
         now = time.time()
+        if self._mjpeg is not None:   # feed the browser stream (smooth, no flicker)
+            ok, jpg = cv2.imencode(".jpg", canvas, [cv2.IMWRITE_JPEG_QUALITY, 80])
+            if ok:
+                self._mjpeg.latest = jpg.tobytes()
         if self.write_live:
-            # single overwritten frame -> open live.png in the IDE for a near-real-time view
-            cv2.imwrite(os.path.join(self.run_dir, "live.png"), canvas)
-        if now - self._last_snapshot >= self.snapshot_interval:
+            # atomic write (temp -> rename) so a viewer never catches a half-written frame
+            # (that mid-write read is what flashes black on every live.png reload).
+            live = os.path.join(self.run_dir, "live.png")
+            tmp = os.path.join(self.run_dir, ".live_tmp.png")   # .png ext so imwrite selects PNG
+            if cv2.imwrite(tmp, canvas):
+                os.replace(tmp, live)
+        # Periodic map_<seq>.png snapshots — DISABLED when snapshot_interval<=0 (only live.png is
+        # kept, so a test run doesn't accumulate hundreds of PNGs). live.png above is the live view.
+        if self.snapshot_interval > 0 and now - self._last_snapshot >= self.snapshot_interval:
             self._last_snapshot = now
             cv2.imwrite(os.path.join(self.run_dir, f"map_{self._seq:04d}.png"), canvas)
             self._seq += 1
@@ -360,14 +489,104 @@ class RecognitionVizNode(Node):
         canvas = np.full((H, W, 3), 24, np.uint8)
         self._extent_now = self._current_extent()   # auto-fit (or fixed) for this frame
         self._draw_grid(canvas)
+        self._draw_fov(canvas)                       # camera coverage under the objects
         self._draw_trail(canvas)
         if self.world is not None:
             for obj in self.world.objects:
                 self._draw_object(canvas, obj)
             self._draw_robot(canvas, self.world.robot_x, self.world.robot_y, self.world.robot_theta)
+        self._draw_proj(canvas)   # raw per-camera homography projections on top
         self._draw_hud(canvas)
         self._draw_decisions(canvas)
+        self._draw_legend(canvas)
         return canvas
+
+    def _draw_proj(self, canvas) -> None:
+        """Raw per-camera homography projections of the CURRENT detections: wide = orange x,
+        body = cyan +. A wide-x and body-+ sitting together on a fused track = the two cameras'
+        homographies agree; separated marks = a projection/calibration mismatch to investigate."""
+        for (x, y, src) in self.proj_dets:
+            px, py = self._w2p(x, y)
+            if src == 1:                                   # body -> cyan plus
+                cv2.line(canvas, (px - 4, py), (px + 4, py), (255, 255, 0), 1)
+                cv2.line(canvas, (px, py - 4), (px, py + 4), (255, 255, 0), 1)
+            else:                                          # wide -> orange x
+                cv2.line(canvas, (px - 4, py - 4), (px + 4, py + 4), (0, 165, 255), 1)
+                cv2.line(canvas, (px - 4, py + 4), (px + 4, py - 4), (0, 165, 255), 1)
+
+    def _draw_fov(self, canvas) -> None:
+        """Overlay each camera's coverage on the map (base_link, follows the robot's heading):
+        wide = forward ELLIPSE (orange), body = forward SECTOR / 부채꼴 (cyan). Points are computed
+        in base_link then rotated into the field, so the shapes turn with the robot."""
+        if self.world is None:
+            return
+        rx, ry, th = self.world.robot_x, self.world.robot_y, self.world.robot_theta
+        ct, st = math.cos(th), math.sin(th)
+
+        def b2p(bx, by):   # base_link -> field -> pixel
+            return self._w2p(rx + bx * ct - by * st, ry + bx * st + by * ct)
+
+        # wide FOV — forward-biased ellipse
+        a, b, cx = self.wide_fov_fwd, self.wide_fov_lat, self.wide_fov_cx
+        ell = np.array([b2p(cx + a * math.cos(t), b * math.sin(t))
+                        for t in (i * math.pi / 24 for i in range(48))], np.int32)
+        cv2.polylines(canvas, [ell], True, (0, 120, 200), 1)
+        cv2.putText(canvas, "wide FOV", b2p(cx, b + 0.05), cv2.FONT_HERSHEY_SIMPLEX, 0.38,
+                    (0, 130, 210), 1, cv2.LINE_AA)
+
+        # body FOV — forward sector (annular: near..far arc, +-half angle)
+        half, ax = self.body_fov_half, self.body_fov_apex_x
+        near, far, M = self.body_fov_near, self.body_fov_far, 16
+        arc = [b2p(ax + far * math.cos(-half + 2 * half * i / M), far * math.sin(-half + 2 * half * i / M))
+               for i in range(M + 1)]
+        arc += [b2p(ax + near * math.cos(half - 2 * half * i / M), near * math.sin(half - 2 * half * i / M))
+                for i in range(M + 1)]
+        cv2.polylines(canvas, [np.array(arc, np.int32)], True, (200, 200, 0), 1)
+        cv2.putText(canvas, "body FOV", b2p(ax + far * 0.55, 0), cv2.FONT_HERSHEY_SIMPLEX, 0.36,
+                    (200, 200, 0), 1, cv2.LINE_AA)
+
+    def _draw_legend(self, canvas) -> None:
+        """Top-right key: shape forms (Set1) + fruit colours (Set2)."""
+        x0 = self.canvas_px - 148
+        y = 16
+        cv2.putText(canvas, "shapes (form):", (x0, y), cv2.FONT_HERSHEY_SIMPLEX, 0.4,
+                    _COL_TEXT, 1, cv2.LINE_AA)
+        y += 18
+        for name, (n, rot) in _SHAPE_FORM.items():
+            cv2.fillPoly(canvas, [_reg_poly(x0 + 8, y - 4, 6, n, rot)], _COL_SHAPE)
+            cv2.putText(canvas, name, (x0 + 22, y), cv2.FONT_HERSHEY_SIMPLEX, 0.36, _COL_TEXT, 1,
+                        cv2.LINE_AA)
+            y += 16
+        y += 6
+        cv2.putText(canvas, "fruits (color):", (x0, y), cv2.FONT_HERSHEY_SIMPLEX, 0.4,
+                    _COL_TEXT, 1, cv2.LINE_AA)
+        y += 18
+        for name, col in _FRUIT_COLORS.items():
+            cv2.circle(canvas, (x0 + 8, y - 4), 6, col, -1)
+            cv2.putText(canvas, name, (x0 + 22, y), cv2.FONT_HERSHEY_SIMPLEX, 0.36, _COL_TEXT, 1,
+                        cv2.LINE_AA)
+            y += 16
+        cv2.circle(canvas, (x0 + 8, y - 4), 6, _COL_FRUITCUBE, -1)
+        cv2.putText(canvas, "fruit_cube?", (x0 + 22, y), cv2.FONT_HERSHEY_SIMPLEX, 0.36, _COL_TEXT,
+                    1, cv2.LINE_AA)
+        cv2.circle(canvas, (x0 + 8, y + 12), 6, (120, 120, 120), 1)
+        cv2.circle(canvas, (x0 + 8, y + 12), 9, (255, 255, 255), 1)
+        cv2.putText(canvas, "()=locked", (x0 + 22, y + 16), cv2.FONT_HERSHEY_SIMPLEX, 0.36,
+                    _COL_TEXT, 1, cv2.LINE_AA)
+        # fusion source ring + presence/identity key
+        y3 = y + 34
+        for tag, cc, desc in (("WB", (0, 255, 0), "both"), ("B", (255, 255, 0), "body/id"),
+                              ("W", (0, 165, 255), "wide/pos")):
+            cv2.circle(canvas, (x0 + 8, y3 - 4), 7, cc, 1)
+            cv2.putText(canvas, f"{tag}={desc}", (x0 + 22, y3), cv2.FONT_HERSHEY_SIMPLEX, 0.34,
+                        _COL_TEXT, 1, cv2.LINE_AA)
+            y3 += 15
+        cv2.putText(canvas, "solid=confirmed", (x0, y3 + 2), cv2.FONT_HERSHEY_SIMPLEX, 0.33,
+                    _COL_TEXT, 1, cv2.LINE_AA)
+        cv2.putText(canvas, "hollow=prov  grey?=id unknown", (x0, y3 + 15),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.30, _COL_TEXT, 1, cv2.LINE_AA)
+        cv2.putText(canvas, "x=wide proj  +=body proj", (x0, y3 + 29),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.30, _COL_TEXT, 1, cv2.LINE_AA)
 
     def _draw_grid(self, canvas) -> None:
         xmin, xmax, ymin, ymax = self._extent_now
@@ -395,31 +614,67 @@ class RecognitionVizNode(Node):
 
     def _draw_object(self, canvas, obj: Object) -> None:
         px, py = self._w2p(obj.x, obj.y)
+        label = obj.class_label or ""
+        r = 10
+        # --- fusion source, identity trust, presence tier ---
+        n_obs = getattr(obj, "n_obs", 0)
+        src = getattr(obj, "source", "") or ""
+        seen_body, seen_wide = "body" in src, "wide" in src
+        both = seen_body and seen_wide
+        # IDENTITY is trusted only from the body cam (close/reliable). The wide cam is good at
+        # POSITION but weak at CLASS, so a wide-only object is "something here, identity unknown":
+        # drawn grey with the wide guess only hinted in text — never a committed class shape.
+        identity_known = seen_body or bool(obj.blacklisted)
+        # PRESENCE tier: CONFIRMED (solid) if both matched / body saw it / wide saw it enough times
+        # to rule out a flicker; else PROVISIONAL (hollow).
+        confirmed = bool(obj.blacklisted) or both or seen_body or n_obs >= self.confirm_min_obs
+        if both:
+            stag, sring = "WB", (0, 255, 0)        # matched by BOTH cameras (green)
+        elif seen_body:
+            stag, sring = "B", (255, 255, 0)       # body only (cyan)
+        else:
+            stag, sring = "W", (0, 165, 255)       # wide only (orange)
+        is_shape = identity_known and label in _SHAPE_FORM
+        # colour
         if obj.blacklisted:
             col = _COL_BLACKLIST
-        elif obj.set_type == 1:
-            col = _COL_SET1
-        elif obj.set_type == 2:
-            col = _COL_SET2
+        elif not identity_known:
+            col = _COL_UNKNOWN                      # wide-only -> identity unknown (grey)
+        elif is_shape:
+            col = _COL_SHAPE
+        elif label in _FRUIT_COLORS:
+            col = _FRUIT_COLORS[label]
+        elif label == "fruit_photo_cube" or obj.set_type == 2:
+            col = _COL_FRUITCUBE
         else:
             col = _COL_UNKNOWN
-        locked = bool(getattr(obj, "locked", False))
-        if locked:
-            # frozen pose-correction landmark -> SQUARE marker
-            cv2.rectangle(canvas, (px - 8, py - 8), (px + 8, py + 8), col, -1)
-            cv2.rectangle(canvas, (px - 8, py - 8), (px + 8, py + 8), (20, 20, 20), 1)
+        # marker: identified shape -> form polygon; else circle. CONFIRMED filled, PROVISIONAL hollow.
+        if is_shape:
+            n, rot = _SHAPE_FORM[label]
+            pts = _reg_poly(px, py, r + 1, n, rot)
+            if confirmed:
+                cv2.fillPoly(canvas, [pts], col)
+                cv2.polylines(canvas, [pts], True, (20, 20, 20), 1)
+            else:
+                cv2.polylines(canvas, [pts], True, col, 1)
         else:
-            cv2.circle(canvas, (px, py), 9, col, -1)
-            cv2.circle(canvas, (px, py), 9, (20, 20, 20), 1)
+            cv2.circle(canvas, (px, py), r, col, -1 if confirmed else 1)
+            if confirmed:
+                cv2.circle(canvas, (px, py), r, (20, 20, 20), 1)
+        # source ring (which cameras saw it) just outside the marker
+        cv2.circle(canvas, (px, py), r + 2, sring, 1)
+        # locked landmark -> white ring overlay (doesn't change the class marker)
+        if bool(getattr(obj, "locked", False)):
+            cv2.circle(canvas, (px, py), r + 5, (255, 255, 255), 1)
         if obj.id == self.current_target_id and self.current_target_id != 0:
-            cv2.circle(canvas, (px, py), 14, _COL_TARGET, 2)
+            cv2.circle(canvas, (px, py), r + 7, _COL_TARGET, 2)
         elif obj.id == self.selected_id and self.selected_id != 0:
-            cv2.circle(canvas, (px, py), 13, (0, 200, 200), 1)
-        label = obj.class_label or "?"
-        src = getattr(obj, "source", "") or "?"
-        n_obs = getattr(obj, "n_obs", 0)
-        txt = f"#{obj.id}{'*' if locked else ''} {label} {obj.confidence:.2f} x{n_obs} {src}"
-        cv2.putText(canvas, txt, (px + 12, py + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.4, _COL_TEXT, 1,
+            cv2.circle(canvas, (px, py), r + 6, (0, 200, 200), 1)
+        # text: identified -> class name; wide-only -> "?(wideguess)" (position sure, class tentative)
+        pres = "" if confirmed else "?"
+        name = (label or "?") if identity_known else (f"?({label})" if label else "?")
+        txt = f"#{obj.id}{pres} {name} {obj.confidence:.2f} x{n_obs} [{stag}]"
+        cv2.putText(canvas, txt, (px + 13, py + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.4, _COL_TEXT, 1,
                     cv2.LINE_AA)
 
     def _draw_robot(self, canvas, x: float, y: float, theta: float) -> None:
@@ -436,8 +691,15 @@ class RecognitionVizNode(Node):
             f"state={self.mission_state}  phase={self.phase}  t={time.time() - self._t0:5.0f}s",
             f"objects={n_obj} (picked/bl={n_bl})  tray shape={self.tray_shape} fruit={self.tray_fruit}",
             f"det wide={len(self.top_dets)} body={len(self.body_dets)}",
-            "marker: []=locked landmark  o=track  ring=target",
         ]
+        if self.world is not None:
+            objs = self.world.objects
+            wb = sum(1 for o in objs if "body" in (o.source or "") and "wide" in (o.source or ""))
+            bo = sum(1 for o in objs if (o.source or "") == "body")
+            wo = sum(1 for o in objs if (o.source or "") == "wide")
+            # body CONFIRMS wb+bo tracks (its identity authority); "body-only" alone reads as 0 since
+            # the wide cam now sees almost everything too -> show the real contribution.
+            lines.append(f"tracks: WB={wb}  wide-only={wo}  |  body confirms {wb + bo} (identity)")
         if self.shape is not None:
             lines.append(f"shape: {self.shape.label} {self.shape.confidence:.2f}")
         if self.siglip is not None:
@@ -471,7 +733,8 @@ class RecognitionVizNode(Node):
     # --------------------------------------------------------------------- teardown
     def write_summary(self) -> None:
         try:
-            if _CV2_AVAILABLE:
+            # map_final.png only when snapshots are enabled — otherwise only live.png is kept.
+            if _CV2_AVAILABLE and self.snapshot_interval > 0:
                 canvas = self._compose()
                 cv2.imwrite(os.path.join(self.run_dir, "map_final.png"), canvas)
             lines = [

@@ -55,6 +55,12 @@ class YoloDetectorNode(Node):
         self.declare_parameter("body_model_path", "")    # body cam; "" -> model_path
         self.declare_parameter("conf_threshold", 0.5)
         self.declare_parameter("imgsz", 640)
+        # Per-stream inference size: MUST match each model's TRAINING imgsz or accuracy drops
+        # (wide.pt trained @1280, cube.pt @640). 0 -> fall back to the shared imgsz.
+        self.declare_parameter("top_imgsz", 0)
+        self.declare_parameter("body_imgsz", 0)
+        # FP16 inference: ~1.5-2x faster on the Orin's tensor cores, negligible accuracy loss.
+        self.declare_parameter("half", True)
         self.declare_parameter("device", "auto")
         self.declare_parameter("top_min_interval_sec", 0.12)    # ~8 Hz
         self.declare_parameter("body_min_interval_sec", 0.06)   # ~16 Hz
@@ -67,6 +73,9 @@ class YoloDetectorNode(Node):
         self.body_model_path = str(self.get_parameter("body_model_path").value) or self.model_path
         self.conf_threshold = float(self.get_parameter("conf_threshold").value)
         self.imgsz = int(self.get_parameter("imgsz").value)
+        self.top_imgsz = int(self.get_parameter("top_imgsz").value) or self.imgsz
+        self.body_imgsz = int(self.get_parameter("body_imgsz").value) or self.imgsz
+        self.half = bool(self.get_parameter("half").value)
         self.top_min_interval = float(self.get_parameter("top_min_interval_sec").value)
         self.body_min_interval = float(self.get_parameter("body_min_interval_sec").value)
         self.publish_shape = bool(self.get_parameter("publish_shape_classification").value)
@@ -101,7 +110,8 @@ class YoloDetectorNode(Node):
         self.get_logger().info(
             f"top_model='{self.top_model_path}' body_model='{self.body_model_path}' "
             f"{'(shared instance)' if shared else '(separate instances)'} "
-            f"device={self.device} conf={self.conf_threshold} imgsz={self.imgsz} "
+            f"device={self.device} conf={self.conf_threshold} "
+            f"imgsz(top={self.top_imgsz},body={self.body_imgsz}) "
             f"shape_pub={self.publish_shape}"
         )
 
@@ -150,18 +160,19 @@ class YoloDetectorNode(Node):
         if (now - self._last_top) < self.top_min_interval:
             return
         self._last_top = now
-        self._process(msg, "camera_top", self.pub_top, self.top_model)
+        self._process(msg, "camera_top", self.pub_top, self.top_model, self.top_imgsz)
 
     def on_body_image(self, msg: Image) -> None:
         now = self._now_sec()
         if (now - self._last_body) < self.body_min_interval:
             return
         self._last_body = now
-        arr = self._process(msg, "camera_body", self.pub_body, self.body_model)
+        arr = self._process(msg, "camera_body", self.pub_body, self.body_model, self.body_imgsz)
         if arr is not None and self.pub_shape is not None:
             self._publish_shape(arr)
 
-    def _process(self, msg: Image, frame_id: str, pub, model: Any | None) -> DetectionArray | None:
+    def _process(self, msg: Image, frame_id: str, pub, model: Any | None,
+                 imgsz: int) -> DetectionArray | None:
         if model is None or not _YOLO_AVAILABLE:
             return None
         try:
@@ -174,7 +185,7 @@ class YoloDetectorNode(Node):
         try:
             with self._model_lock:
                 results = model.predict(
-                    frame, conf=self.conf_threshold, imgsz=self.imgsz, verbose=False
+                    frame, conf=self.conf_threshold, imgsz=imgsz, half=self.half, verbose=False
                 )
         except Exception as exc:  # noqa: BLE001 - inference must not kill the node
             self.get_logger().warn(
@@ -182,13 +193,16 @@ class YoloDetectorNode(Node):
             )
             return None
 
-        arr = self._build_array(results, frame_id)
+        arr = self._build_array(results, frame_id, msg.header.stamp)
         pub.publish(arr)
         return arr
 
-    def _build_array(self, results: Any, frame_id: str) -> DetectionArray:
+    def _build_array(self, results: Any, frame_id: str, stamp) -> DetectionArray:
         header = Header()
-        header.stamp = self.get_clock().now().to_msg()
+        # Propagate the source image's CAPTURE stamp (not now()): the 1280 fisheye inference takes
+        # ~80-150 ms, and world_model uses this stamp to project each detection at the robot pose AT
+        # CAPTURE TIME. Stamping now() here would smear the map by the inference delay while rotating.
+        header.stamp = stamp
         header.frame_id = frame_id
 
         arr = DetectionArray()

@@ -31,6 +31,8 @@ def main():
     ap.add_argument("--images", required=True, help="라벨링할 이미지 폴더")
     ap.add_argument("--model", default="models/cube.pt")
     ap.add_argument("--conf", type=float, default=0.3)
+    ap.add_argument("--imgsz", type=int, default=640,
+                    help="추론 해상도 — 학습 해상도와 맞출 것(광각 wide.pt=1280, 본체 cube.pt=640)")
     ap.add_argument("--out", required=True, help="출력 데이터셋 폴더(labelImg로 열 곳)")
     ap.add_argument("--extra-classes", default="fruit_photo_cube",
                     help="모델 클래스 뒤에 추가(쉼표). labelImg 손라벨용. 끄려면 빈 문자열")
@@ -48,8 +50,8 @@ def main():
         os.makedirs(rev_dir, exist_ok=True)
 
     # 첫 호출로 모델 로드(_yolo) + 클래스 이름 확보.
-    print(f"[init] 모델 로드 {args.model} ...", flush=True)
-    batch_capture.yolo_label(imgs[0], args.model, args.conf)
+    print(f"[init] 모델 로드 {args.model} (imgsz={args.imgsz}) ...", flush=True)
+    batch_capture.yolo_label(imgs[0], args.model, args.conf, args.imgsz)
     names = batch_capture._yolo.names                 # {id: name}
     base_classes = [names[i] for i in range(len(names))]
     extra = [c.strip() for c in args.extra_classes.split(",") if c.strip()]
@@ -60,7 +62,7 @@ def main():
     per_cls = {c: 0 for c in classes}
     for i, p in enumerate(imgs):
         name = os.path.splitext(os.path.basename(p))[0]
-        out = batch_capture.yolo_label(p, args.model, args.conf)
+        out = batch_capture.yolo_label(p, args.model, args.conf, args.imgsz)
         if out is None:
             print(f"  읽기실패 skip: {p}"); continue
         lines, review, flags = out

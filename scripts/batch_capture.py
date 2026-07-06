@@ -31,8 +31,10 @@ def find_latest_best():
     return max(g, key=lambda p: os.path.getmtime(p)) if g else None
 
 
-def yolo_label(path, model_path, conf):
-    """학습한 YOLO로 한 장 라벨 → (yolo_lines, review, flags). 박스+클래스 동시(혼합장면 OK)."""
+def yolo_label(path, model_path, conf, imgsz=640):
+    """학습한 YOLO로 한 장 라벨 → (yolo_lines, review, flags). 박스+클래스 동시(혼합장면 OK).
+
+    imgsz는 학습 해상도와 맞춰야 검출률이 산다(광각 wide.pt=1280, 본체 cube.pt=640)."""
     global _yolo
     if _yolo is None:
         from ultralytics import YOLO
@@ -41,7 +43,7 @@ def yolo_label(path, model_path, conf):
     if frame is None:
         return None
     H, W = frame.shape[:2]
-    r = _yolo.predict(frame, imgsz=640, conf=conf, verbose=False, agnostic_nms=True, iou=0.6)[0]
+    r = _yolo.predict(frame, imgsz=imgsz, conf=conf, verbose=False, agnostic_nms=True, iou=0.6)[0]
     names = _yolo.names
     name2id = {v: k for k, v in names.items()}
     # 부분-전체 쌍: 과일패치는 큐브 안에 nested → dedupe에서 서로 억제 금지(둘 다 유지)
