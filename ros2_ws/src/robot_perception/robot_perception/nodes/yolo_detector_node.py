@@ -25,6 +25,7 @@ from typing import Any
 import rclpy
 from cv_bridge import CvBridge
 from rclpy.node import Node
+from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import Image
 from std_msgs.msg import Header
 from robot_interfaces.msg import Classification, Detection, DetectionArray
@@ -67,6 +68,10 @@ class YoloDetectorNode(Node):
         # Republish the best body detection as /classification/shape (replaces shape_heuristic).
         self.declare_parameter("publish_shape_classification", True)
         self.declare_parameter("shape_topic", "/classification/shape")
+        # Which stream(s) this instance runs: "top" | "body" | "both". Running two single-camera
+        # instances (top+body) parallelises inference across cores — one node serialises both models
+        # on a single GIL thread, capping the slower (top@1280) stream. "both" = legacy single-node.
+        self.declare_parameter("camera", "both")
 
         self.model_path = str(self.get_parameter("model_path").value)
         self.top_model_path = str(self.get_parameter("top_model_path").value) or self.model_path
@@ -79,6 +84,9 @@ class YoloDetectorNode(Node):
         self.top_min_interval = float(self.get_parameter("top_min_interval_sec").value)
         self.body_min_interval = float(self.get_parameter("body_min_interval_sec").value)
         self.publish_shape = bool(self.get_parameter("publish_shape_classification").value)
+        cam = str(self.get_parameter("camera").value).lower()
+        self._want_top = cam in ("top", "both")
+        self._want_body = cam in ("body", "both")
 
         self.device = self._resolve_device(str(self.get_parameter("device").value))
 
@@ -88,28 +96,38 @@ class YoloDetectorNode(Node):
         self._last_top = 0.0
         self._last_body = 0.0
 
-        self.top_model = self._load_model(self.top_model_path, "top")
-        # Share the instance when both streams use the same weights (saves ~1 model in memory).
-        if self.body_model_path == self.top_model_path:
-            self.body_model = self.top_model
+        # Load only the model(s) this instance serves.
+        self.top_model = self._load_model(self.top_model_path, "top") if self._want_top else None
+        if not self._want_body:
+            self.body_model = None
+        elif self._want_top and self.body_model_path == self.top_model_path:
+            self.body_model = self.top_model      # same weights -> share (saves ~1 model in memory)
         else:
             self.body_model = self._load_model(self.body_model_path, "body")
 
-        self.pub_top = self.create_publisher(DetectionArray, "/camera_top/detections", 10)
-        self.pub_body = self.create_publisher(DetectionArray, "/camera_body/detections", 10)
+        self.pub_top = self.create_publisher(DetectionArray, "/camera_top/detections", 10) \
+            if self._want_top else None
+        self.pub_body = self.create_publisher(DetectionArray, "/camera_body/detections", 10) \
+            if self._want_body else None
         self.pub_shape = None
-        if self.publish_shape:
+        if self.publish_shape and self._want_body:     # shape stream comes from the body detector
             self.pub_shape = self.create_publisher(
                 Classification, str(self.get_parameter("shape_topic").value), 10
             )
 
-        self.create_subscription(Image, "/camera_top/image_raw", self.on_top_image, 10)
-        self.create_subscription(Image, "/camera_body/image_raw", self.on_body_image, 10)
+        # SENSOR_DATA QoS must match the camera publisher (BEST_EFFORT) or no frames arrive.
+        if self._want_top:
+            self.create_subscription(Image, "/camera_top/image_raw", self.on_top_image,
+                                     qos_profile_sensor_data)
+        if self._want_body:
+            self.create_subscription(Image, "/camera_body/image_raw", self.on_body_image,
+                                     qos_profile_sensor_data)
 
-        shared = self.body_model is self.top_model
+        streams = "+".join([s for s, on in (("top", self._want_top), ("body", self._want_body)) if on])
         self.get_logger().info(
-            f"top_model='{self.top_model_path}' body_model='{self.body_model_path}' "
-            f"{'(shared instance)' if shared else '(separate instances)'} "
+            f"streams={streams} "
+            f"top_model='{self.top_model_path if self._want_top else '-'}' "
+            f"body_model='{self.body_model_path if self._want_body else '-'}' "
             f"device={self.device} conf={self.conf_threshold} "
             f"imgsz(top={self.top_imgsz},body={self.body_imgsz}) "
             f"shape_pub={self.publish_shape}"

@@ -43,6 +43,26 @@ MOTIONS = {
 # 기본 로밍 패턴: pivot 위주로 주위를 훑고, 앞뒤는 번갈아 넣어 순(純)드리프트 ~0.
 DEFAULT_PATTERN = "cw,cw,cw,forward,cw,cw,cw,back"
 
+# WASD 넛지 키 → 모션(전진/후진/좌횡/우횡). 회전(SPACE/c)과 별개, 이동은 케이블 안 감김.
+NUDGE_KEYS = {"w": "forward", "s": "back", "a": "left", "d": "right"}
+
+
+def load_lateral_scales():
+    """drive_tests/lateral_motor_scales.json → {'left':[fl,fr,rl,rr],'right':[...]} 또는 None.
+    횡이동(메카넘)은 휠 편차로 틀어져서 튜닝된 per-wheel 스케일을 곱해 직진성을 높인다(best-effort)."""
+    p = os.path.join(os.path.dirname(os.path.abspath(__file__)), "drive_tests", "lateral_motor_scales.json")
+    try:
+        import json
+        d = json.load(open(p))
+        out = {}
+        for k in ("left", "right"):
+            sc = d.get(k, {}).get("scales")
+            if isinstance(sc, list) and len(sc) == 4:
+                out[k] = [float(x) for x in sc]
+        return out or None
+    except Exception:
+        return None
+
 
 class BaseDriver:
     """<BASE,...> 텍스트 프로토콜. 모션은 20Hz 스트리밍, 정지는 0벡터 반복."""
@@ -66,6 +86,19 @@ class BaseDriver:
 
     def move(self, name, dur, hz=20.0):
         sp = tuple(p * self.speed for p in MOTIONS[name])
+        end = time.time() + dur
+        period = 1.0 / hz
+        while time.time() < end:
+            self._send(sp)
+            time.sleep(period)
+        self.stop()
+        self._drain()
+
+    def nudge(self, name, dur, speed, scales=None, hz=20.0):
+        """지정 속도/지속으로 한 방향 이동(오픈루프 근사 넛지). scales=per-wheel 보정(횡이동 직진성)."""
+        base = MOTIONS[name]
+        sc = scales if scales else (1.0, 1.0, 1.0, 1.0)
+        sp = tuple(base[i] * speed * sc[i] for i in range(4))
         end = time.time() + dur
         period = 1.0 / hz
         while time.time() < end:
@@ -159,9 +192,30 @@ def return_to_start(base, fwd_motion, steps, dur):
         time.sleep(0.15)
 
 
-def run_manual(base, cams, outdir, step_motion, dur, settle, batch="", ext="jpg"):
+def _capture_all(cams, outdir, batch, ts, shots, ext):
+    """열린 모든 캠에서 최신 프레임 저장(+shots 증가). 회전/넛지 촬영 공통."""
+    for tag, cam in cams.items():
+        g = grab(cam)
+        if g is None:
+            print(f"  {tag} 캡처실패", flush=True)
+            continue
+        cv2.imwrite(f"{outdir[tag]}/" + _fname(batch, ts, tag, shots[tag], ext), g)
+        shots[tag] += 1
+
+
+def _do_nudge(base, motion, nudge):
+    """WASD 이동 넛지(오픈루프 ~10cm). 횡이동(left/right)은 strafe-dur + per-wheel 스케일."""
+    if motion in ("left", "right"):
+        scales = (nudge.get("scales") or {}).get(motion)
+        base.nudge(motion, nudge["strafe_dur"], nudge["speed"], scales=scales)
+    else:
+        base.nudge(motion, nudge["dur"], nudge["speed"])
+
+
+def run_manual(base, cams, outdir, step_motion, dur, settle, batch="", ext="jpg", nudge=None):
     """수동 스텝(GUI): SPACE=현재방향 회전+촬영, c=방향전환(cw<->ccw), b=반대로 한스텝(촬영X),
-    r=시작복귀, q=복귀후종료. net=부호있는 cw스텝(시작기준)으로 선꼬임 추적 → q/r에서 복귀로 풀림.
+    w/a/s/d=전진/좌횡/후진/우횡 ~10cm 이동+촬영, r=시작복귀, q=복귀후종료.
+    net=부호있는 cw스텝(시작기준)으로 선꼬임 추적 → q/r에서 복귀로 풀림(넛지 이동은 net 무관·복귀 안 함).
     cw로 ~180도 쓸고 c로 ccw 전환해 되쓸면 ±범위 안에서 무한 반복 수집 가능."""
     pv = "wide" if "wide" in cams else next(iter(cams))   # 미리보기 캠(광각 우선)
     win = "roam MANUAL  SPACE=shot  c=flip dir  b=back  r=home  q=quit"
@@ -170,8 +224,8 @@ def run_manual(base, cams, outdir, step_motion, dur, settle, batch="", ext="jpg"
     net = 0                                               # 부호있는 cw 스텝(시작 기준) = 선꼬임 지표
     cur = step_motion                                     # 현재 회전 방향
     shots = {t: 0 for t in cams}
-    print("[manual] SPACE=회전+촬영 / c=방향전환 / b=반대로 / r=복귀 / q=복귀후종료. "
-          "한쪽으로 ~180도면 c로 전환해 되쓸기(무한 반복).", flush=True)
+    print("[manual] SPACE=회전+촬영 / c=방향전환 / b=반대로 / w,a,s,d=전진,좌횡,후진,우횡 이동+촬영 / "
+          "r=복귀 / q=복귀후종료. 한쪽으로 ~180도면 c로 전환해 되쓸기(무한 반복).", flush=True)
     try:
         while True:
             f = grab(cams[pv], tries=1)
@@ -205,6 +259,11 @@ def run_manual(base, cams, outdir, step_motion, dur, settle, batch="", ext="jpg"
                 base.move(opp, dur); time.sleep(settle)
                 net += 1 if opp == "cw" else -1
                 print(f"  back({opp}) -> net-cw {net}", flush=True)
+            elif nudge and 0 <= k < 256 and chr(k) in NUDGE_KEYS:   # w/a/s/d: ~10cm 이동+촬영
+                motion = NUDGE_KEYS[chr(k)]
+                _do_nudge(base, motion, nudge); time.sleep(settle)
+                _capture_all(cams, outdir, batch, ts, shots, ext)
+                print(f"  nudge {motion}: " + " ".join(f"{t}:{shots[t]}" for t in cams), flush=True)
             elif k == ord("r"):                               # 시작 위치 복귀(선 풀기)
                 return_to_start(base, "cw", net, dur); net = 0
     finally:
@@ -213,11 +272,12 @@ def run_manual(base, cams, outdir, step_motion, dur, settle, batch="", ext="jpg"
     print("[manual] 종료. 저장: " + ", ".join(f"{t}={shots[t]} ({outdir[t]})" for t in cams), flush=True)
 
 
-def run_manual_tty(base, cams, outdir, step_motion, dur, settle, batch="", ext="jpg"):
+def run_manual_tty(base, cams, outdir, step_motion, dur, settle, batch="", ext="jpg", nudge=None):
     """헤드리스 수동 스텝(창 없음) — 이 SSH 터미널에서 키 입력, 로봇을 눈으로 보며 한 스텝씩.
     SPACE/Enter=현재방향 회전+촬영, c=방향전환(cw<->ccw), b=반대로 한스텝(촬영X),
-    r=시작복귀(선 풀기), q/ESC=복귀 후 종료. Ctrl-C=즉시 정지(복귀 생략, 비상용).
-    net=부호있는 cw스텝(시작기준) → q/r에서 반대로 풀어 케이블 꼬임 해제."""
+    w/a/s/d=전진/좌횡/후진/우횡 ~10cm 이동+촬영, r=시작복귀(선 풀기), q/ESC=복귀 후 종료.
+    Ctrl-C=즉시 정지(복귀 생략, 비상용). net=부호있는 cw스텝 → q/r에서 풀어 케이블 꼬임 해제
+    (넛지 이동은 net 무관·자동복귀 안 함, 단 이동은 케이블 안 감김)."""
     import termios
     import tty
     import select
@@ -232,8 +292,8 @@ def run_manual_tty(base, cams, outdir, step_motion, dur, settle, batch="", ext="
     cur = step_motion                                     # 현재 회전 방향
     shots = {t: 0 for t in cams}
     print("[manual-tty] 창 없음(헤드리스). 이 터미널에 포커스 두고 로봇 보며 키 입력:", flush=True)
-    print("  SPACE/Enter=회전+촬영  c=방향전환(cw<->ccw)  b=반대로(촬영X)  r=시작복귀  q=복귀후종료",
-          flush=True)
+    print("  SPACE/Enter=회전+촬영  c=방향전환(cw<->ccw)  b=반대로(촬영X)", flush=True)
+    print("  w/a/s/d=전진/좌횡/후진/우횡 ~10cm 이동+촬영  r=시작복귀  q=복귀후종료", flush=True)
     print(f"  현재 방향={cur.upper()}  |  Ctrl-C=즉시 정지(비상)", flush=True)
 
     fd = sys.stdin.fileno()
@@ -269,6 +329,12 @@ def run_manual_tty(base, cams, outdir, step_motion, dur, settle, batch="", ext="
                 time.sleep(settle)
                 net += 1 if opp == "cw" else -1
                 print(f"  back({opp}) -> net-cw {net}", flush=True)
+            elif nudge and k in NUDGE_KEYS:               # w/a/s/d: ~10cm 이동+촬영
+                motion = NUDGE_KEYS[k]
+                _do_nudge(base, motion, nudge)
+                time.sleep(settle)
+                _capture_all(cams, outdir, batch, ts, shots, ext)
+                print(f"  nudge {motion}: " + " ".join(f"{t}:{shots[t]}" for t in cams), flush=True)
             elif k == "r":                                # 시작 위치 복귀(선 풀기)
                 return_to_start(base, "cw", net, dur)
                 net = 0
@@ -309,6 +375,10 @@ def main():
                     help="수동 모드를 터미널 키입력으로(창 없이, 헤드리스). DISPLAY 없으면 자동 적용")
     ap.add_argument("--ext", default="jpg", choices=["jpg", "png"], help="저장 이미지 형식")
     ap.add_argument("--step-motion", default="cw", choices=["cw", "ccw"], help="수동 회전 방향")
+    # 수동모드 WASD 이동 넛지(오픈루프 ~10cm). 엔코더 없어 근사 — 실측 보고 dur 조정.
+    ap.add_argument("--nudge-speed", type=float, default=0.5, help="w/a/s/d 이동 속도(회전 speed와 별개, 짧은이동 신뢰성 위해 0.5)")
+    ap.add_argument("--nudge-dur", type=float, default=0.22, help="전진/후진(w/s) 지속(s) ≈10cm@nudge-speed. 실측 후 조정")
+    ap.add_argument("--strafe-dur", type=float, default=0.42, help="좌/우 횡이동(a/d) 지속(s) ≈10cm(횡이동은 느려 더 김)")
     ap.add_argument("--batch", default="", help="파일명 배치 라벨(예: bodyextra2) — 배치 구분·중복 방지. 영숫자/_ 권장")
     ap.add_argument("--dry-run", action="store_true", help="안 움직이고 두 캠 1장씩만 저장+계획")
     args = ap.parse_args()
@@ -384,9 +454,15 @@ def main():
     if args.manual:
         use_tty = args.tty or not os.environ.get("DISPLAY")   # 헤드리스(DISPLAY 없음)면 터미널 키입력
         runner = run_manual_tty if use_tty else run_manual
-        print(f"[manual] 모드={'터미널(창없음)' if use_tty else 'GUI(창)'}  형식={args.ext}", flush=True)
+        lat = load_lateral_scales()                           # 횡이동 per-wheel 보정(없으면 균일)
+        nudge = {"speed": args.nudge_speed, "dur": args.nudge_dur,
+                 "strafe_dur": args.strafe_dur, "scales": lat}
+        print(f"[manual] 모드={'터미널(창없음)' if use_tty else 'GUI(창)'}  형식={args.ext}  "
+              f"넛지(w/a/s/d): speed={args.nudge_speed} 전후={args.nudge_dur}s 횡={args.strafe_dur}s "
+              f"횡스케일={'적용' if lat else '없음(균일)'}", flush=True)
         try:
-            runner(base, cams, outdir, args.step_motion, args.move_dur, args.settle, args.batch, args.ext)
+            runner(base, cams, outdir, args.step_motion, args.move_dur, args.settle,
+                   args.batch, args.ext, nudge)
         finally:
             base.close()
             for c in cams.values():

@@ -22,6 +22,11 @@ def generate_launch_description() -> LaunchDescription:
             **common,
             "flip_method": 2,   # 180-deg rotate: wide cam mounted inverted. perception.yaml
                                 # top intrinsics are the matching rotated-frame fisheye solve.
+            # GPU downscale 1640x1232 -> 1280x960 (full FOV kept). Cuts per-frame CPU ~40% for 15 Hz.
+            # wide fisheye intrinsics in test_field.yaml are scaled to match (top_fx/fy/cx/cy);
+            # dist_coeffs + wide_ground.npz are resolution-invariant and unchanged.
+            "out_width": 1280,
+            "out_height": 960,
         }],
         output="screen",
     )
@@ -36,6 +41,11 @@ def generate_launch_description() -> LaunchDescription:
             **common,
             # body cam training applied fixed WB gains to kill the magenta cast (csi_capture)
             "wb_gains": [1.16, 1.08, 0.82],
+            # GPU downscale 1640x1232 -> 640x480 (cube.pt trains at imgsz 640, so this is its native
+            # size). Body detection PIXELS are upscaled x2.5625/x2.5667 back to the 1640 calibration
+            # domain in world_model + mission_fsm before the body homography (npz files untouched).
+            "out_width": 640,
+            "out_height": 480,
         }],
         output="screen",
     )

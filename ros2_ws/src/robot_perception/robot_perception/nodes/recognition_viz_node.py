@@ -34,6 +34,7 @@ from collections import deque
 
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import qos_profile_sensor_data
 
 from geometry_msgs.msg import PoseStamped
 from sensor_msgs.msg import Image
@@ -168,6 +169,11 @@ class RecognitionVizNode(Node):
         # live.png every redraw (open it in the IDE for a near-real-time headless view).
         self.declare_parameter("show_camera_panels", True)
         self.declare_parameter("write_live_png", True)
+        # Training-data capture: during a real arena run, dump raw wide/body frames + their YOLO
+        # detections as pre-labels (YOLO txt) so the run doubles as a labelling session. Only frames
+        # that actually carry >=1 detection are saved (empty frames are useless as training data).
+        self.declare_parameter("save_training_data", False)
+        self.declare_parameter("training_interval_sec", 2.0)
         # MJPEG stream: open http://<jetson-ip>:<port>/ in a laptop browser for a smooth live map
         # (no live.png reload flicker). 0 disables. Reachable over the AP (10.42.0.1) / Tailscale.
         self.declare_parameter("mjpeg_port", 8080)
@@ -197,6 +203,12 @@ class RecognitionVizNode(Node):
         trail_max = int(self.get_parameter("trail_max_points").value)
         self.show_cams = bool(self.get_parameter("show_camera_panels").value) and _BRIDGE_AVAILABLE
         self.write_live = bool(self.get_parameter("write_live_png").value)
+        self.save_training = bool(self.get_parameter("save_training_data").value) and _BRIDGE_AVAILABLE
+        self.training_interval = float(self.get_parameter("training_interval_sec").value)
+        self._last_training_save = 0.0
+        # YOLO class order shared by wide.pt / cube.pt (see project_shape_id_finding memory).
+        self._train_classes = ["cube", "octahedron", "dodecahedron", "icosahedron", "fruit_photo_cube"]
+        self._train_cls_idx = {c: i for i, c in enumerate(self._train_classes)}
         self.confirm_min_obs = int(self.get_parameter("confirm_min_obs").value)
         self.body_fov_half = math.radians(float(self.get_parameter("body_fov_half_deg").value))
         self.body_fov_near = float(self.get_parameter("body_fov_near_m").value)
@@ -211,6 +223,19 @@ class RecognitionVizNode(Node):
         base = str(self.get_parameter("output_dir").value)
         self.run_dir = os.path.join(base, time.strftime("%Y%m%d_%H%M%S"))
         os.makedirs(self.run_dir, exist_ok=True)
+
+        # Training-data capture dirs (YOLO layout: images/ + labels/ per camera, shared classes.txt).
+        self._train_saved = 0
+        if self.save_training:
+            self._train_root = os.path.join(self.run_dir, "training")
+            for cam in ("wide", "body"):
+                os.makedirs(os.path.join(self._train_root, cam, "images"), exist_ok=True)
+                os.makedirs(os.path.join(self._train_root, cam, "labels"), exist_ok=True)
+            try:
+                with open(os.path.join(self._train_root, "classes.txt"), "w") as f:
+                    f.write("\n".join(self._train_classes) + "\n")
+            except OSError:
+                pass
 
         # Optional MJPEG stream (smooth browser view, no live.png flicker).
         self._mjpeg = None
@@ -271,9 +296,11 @@ class RecognitionVizNode(Node):
         self.create_subscription(PoseStamped, "/localization/pose", self.on_pose, 10)
         self.create_subscription(DetectionArray, "/camera_top/detections", self.on_top_det, 10)
         self.create_subscription(DetectionArray, "/camera_body/detections", self.on_body_det, 10)
-        if self.show_cams:
-            self.create_subscription(Image, "/camera_top/image_raw", self.on_top_img, 5)
-            self.create_subscription(Image, "/camera_body/image_raw", self.on_body_img, 5)
+        if self.show_cams or self.save_training:
+            self.create_subscription(Image, "/camera_top/image_raw", self.on_top_img,
+                                     qos_profile_sensor_data)  # match camera BEST_EFFORT
+            self.create_subscription(Image, "/camera_body/image_raw", self.on_body_img,
+                                     qos_profile_sensor_data)
         self.create_subscription(Classification, "/classification/siglip", self.on_siglip, 10)
         self.create_subscription(Classification, "/classification/shape", self.on_shape, 10)
         self.create_subscription(Object, "/selected_target", self.on_selected, 10)
@@ -289,7 +316,8 @@ class RecognitionVizNode(Node):
         self.get_logger().info(
             f"recognition_viz -> {self.run_dir}  extent={self.extent} canvas={self.canvas_px}px "
             f"snapshot={self.snapshot_interval}s show_window={self.show_window} "
-            f"cam_panels={self.show_cams} live_png={self.write_live}"
+            f"cam_panels={self.show_cams} live_png={self.write_live} "
+            f"save_training={self.save_training}(every {self.training_interval}s)"
         )
 
     # ------------------------------------------------------------------ callbacks
@@ -440,6 +468,47 @@ class RecognitionVizNode(Node):
             self._last_snapshot = now
             cv2.imwrite(os.path.join(self.run_dir, f"map_{self._seq:04d}.png"), canvas)
             self._seq += 1
+        # Training-data capture (raw frames + YOLO pre-labels) for reuse as training data.
+        if self.save_training and now - self._last_training_save >= self.training_interval:
+            self._last_training_save = now
+            self._save_training_frame("wide", self.top_img, self.top_dets)
+            self._save_training_frame("body", self.body_img, self.body_dets)
+
+    def _save_training_frame(self, cam: str, img_msg, dets) -> None:
+        """Save a raw frame + its YOLO detections as a pre-label (only if >=1 detection)."""
+        if img_msg is None or self.bridge is None or not dets:
+            return
+        try:
+            frame = self.bridge.imgmsg_to_cv2(img_msg, desired_encoding="bgr8")
+        except Exception:  # noqa: BLE001
+            return
+        h, w = frame.shape[:2]
+        if w <= 0 or h <= 0:
+            return
+        lines = []
+        for det in dets:
+            ci = self._train_cls_idx.get(det.label)
+            if ci is None:
+                continue
+            cx, cy = det.x_center / w, det.y_center / h
+            bw, bh = det.width / w, det.height / h
+            # clamp to the [0,1] YOLO range (boxes can graze the frame edge)
+            cx, cy = min(max(cx, 0.0), 1.0), min(max(cy, 0.0), 1.0)
+            bw, bh = min(max(bw, 0.0), 1.0), min(max(bh, 0.0), 1.0)
+            lines.append(f"{ci} {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}")
+        if not lines:
+            return
+        stamp = time.strftime("%Y%m%d_%H%M%S") + f"_{int((time.time() % 1) * 1000):03d}"
+        name = f"{cam}_{stamp}"
+        img_path = os.path.join(self._train_root, cam, "images", name + ".jpg")
+        lbl_path = os.path.join(self._train_root, cam, "labels", name + ".txt")
+        try:
+            if cv2.imwrite(img_path, frame, [cv2.IMWRITE_JPEG_QUALITY, 92]):
+                with open(lbl_path, "w") as f:
+                    f.write("\n".join(lines) + "\n")
+                self._train_saved += 1
+        except OSError:
+            pass
 
     def _compose(self):
         """Full panel: 2D map on the left, YOLO-annotated wide + body feeds stacked on the right."""
@@ -744,6 +813,8 @@ class RecognitionVizNode(Node):
                 f"tray: shape={self.tray_shape} fruit={self.tray_fruit}",
                 f"objects tracked: {len(self._seen_ids)}",
             ]
+            if self.save_training:
+                lines.append(f"training frames saved: {self._train_saved} -> {self._train_root}")
             if self.world is not None:
                 lines.append("final tracks:")
                 for o in self.world.objects:

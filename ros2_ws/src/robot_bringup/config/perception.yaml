@@ -32,6 +32,41 @@ localizer_node:
     top_cy: 541.748
     dist_coeffs: [-0.085721, 0.053910, -0.034649, 0.007943]
 
+wall_localizer_node:
+  ros__parameters:
+    top_fx: 857.316
+    top_fy: 860.071
+    top_cx: 789.858
+    top_cy: 541.748
+    dist_coeffs: [-0.085721, 0.053910, -0.034649, 0.007943]
+    image_rotated_180: true
+    wide_homography_path: "/home/seventt/seventt/workspace/data/calib/wide_ground.npz"
+    field_half_m: 2.0
+    rate_hz: 3.0
+    canny_lo: 35
+    canny_hi: 120
+    hough_thresh: 45
+    hough_min_len: 70
+    hough_max_gap: 28
+    use_lsd: true
+    clahe_clip: 2.0
+    ignore_robot_rect: [0.34, 0.25, 0.66, 0.88]
+    use_color_mask: true
+    color_lab_radius: 24.0
+    color_sat_min: 45
+    color_val_min: 45
+    color_val_max: 235
+    color_morph_kernel: 9
+    color_hough_thresh: 35
+    min_ground_len_m: 0.35
+    wall_gate_m: 0.45
+    endpoint_gate_scale: 1.15
+    axis_tol_deg: 18.0
+    max_range_m: 2.8
+    correction_conf: 0.45
+    max_pos_resid_m: 0.55
+    resid_mad_gate_m: 0.08
+
 yolo_detector_node:
   ros__parameters:
     # Custom YOLOv8n trained on the 4 white polyhedra

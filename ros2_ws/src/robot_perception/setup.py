@@ -29,6 +29,7 @@ setup(
             'siglip_gate_node = robot_perception.nodes.siglip_gate_node:main',
             'world_model_node = robot_perception.nodes.world_model_node:main',
             'recognition_viz_node = robot_perception.nodes.recognition_viz_node:main',
+            'wall_localizer_node = robot_perception.nodes.wall_localizer_node:main',
             # DEPRECATED (kept on disk, deregistered): yolo_world_node, shape_heuristic_node
             # -> replaced by yolo_detector_node (custom YOLOv8n cube.pt; shape class in the
             #    detection label + best body detection republished on /classification/shape).

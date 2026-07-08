@@ -9,9 +9,14 @@ reference-jetson-cv2-no-gstreamer. Verified working reference: scripts/live_pers
 """
 from __future__ import annotations
 
+import array
+
+import cv2
 import numpy as np
+
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import Image
 
 import gi
@@ -20,15 +25,22 @@ from gi.repository import Gst  # noqa: E402
 
 
 def make_gst_pipeline(sensor_id: int, sensor_mode: int, width: int, height: int, fps: int,
-                      flip: int, wbmode: int) -> str:
+                      flip: int, wbmode: int, out_width: int = 0, out_height: int = 0) -> str:
+    # nvvidconv (VIC) rescales on-GPU for free: keep the sensor caps at full FOV (width/height) and
+    # ask the OUTPUT caps for a smaller frame. Per-frame CPU (all the copies + DDS serialize + every
+    # subscriber's deserialize) is O(pixels), so this is the one lever that cuts it enough for 15 Hz.
+    # out_*=0 -> passthrough (full sensor resolution, original behaviour).
+    out_caps = "video/x-raw, format=BGRx"
+    if out_width > 0 and out_height > 0:
+        out_caps += f", width={out_width}, height={out_height}"
     return (
         f"nvarguscamerasrc sensor-id={sensor_id} sensor-mode={sensor_mode} wbmode={wbmode} "
         f"! video/x-raw(memory:NVMM), width={width}, height={height}, "
         f"framerate={fps}/1, format=NV12 "
         f"! nvvidconv flip-method={flip} "
-        f"! video/x-raw, format=BGRx "
+        f"! {out_caps} "
         # NO CPU videoconvert: appsink takes BGRx (GPU nvvidconv output) and read() strips the X
-        # byte in numpy. videoconvert(BGRx->BGR) was ~135% CPU/cam at 1640x1232 -> the rate cap.
+        # byte via cv2.cvtColor (SIMD). videoconvert(BGRx->BGR) was ~135% CPU/cam -> the rate cap.
         f"! appsink name=sink emit-signals=false max-buffers=1 drop=true sync=false"
     )
 
@@ -62,11 +74,12 @@ class GstCsiCapture:
         if not ok:
             return None
         try:
-            # BGRx = 4 bytes/pixel (B,G,R,X). Reshape by actual (possibly padded) row length,
-            # crop to w*4, view as (h,w,4), drop the X byte -> BGR. Cheaper than a CPU videoconvert.
+            # BGRx = 4 bytes/pixel (B,G,R,X). Reshape by actual (possibly padded) row length, crop to
+            # w*4, view as (h,w,4), then cv2.cvtColor(BGRA->BGR) drops the X byte in one SIMD pass —
+            # ~3x faster than the numpy strided [:, :, :3].copy() (per-pixel gather) it replaces.
             row = info.size // h
             arr = np.frombuffer(info.data, np.uint8, count=row * h).reshape(h, row)
-            frame = arr[:, : w * 4].reshape(h, w, 4)[:, :, :3].copy()
+            frame = cv2.cvtColor(arr[:, : w * 4].reshape(h, w, 4), cv2.COLOR_BGRA2BGR)
         finally:
             buf.unmap(info)
         return frame, w, h
@@ -95,6 +108,11 @@ class CameraCsiNode(Node):
         self.declare_parameter("topic", "image_raw")
         self.declare_parameter("publish_rate", 30.0)
         self.declare_parameter("pull_timeout", 0.5)
+        # GPU-side downscale (nvvidconv VIC). 0 = passthrough (full sensor res). Setting these cuts
+        # per-frame CPU ~linearly in pixel count — the lever for 15 Hz. Any consumer that projects
+        # detection pixels (world_model/mission_fsm homographies, wide intrinsics) MUST scale to match.
+        self.declare_parameter("out_width", 0)
+        self.declare_parameter("out_height", 0)
 
         self.sensor_id = int(self.get_parameter("sensor_id").value)
         self.sensor_mode = int(self.get_parameter("sensor_mode").value)
@@ -106,17 +124,31 @@ class CameraCsiNode(Node):
         gains = [float(g) for g in self.get_parameter("wb_gains").value]
         self._wb = np.array(gains[:3], dtype=np.float32).reshape(1, 1, 3) if len(gains) >= 3 else None
         self._apply_wb = self._wb is not None and not np.allclose(self._wb, 1.0)
+        # Precompute a per-channel uint8 LUT so tick() does one cv2.LUT (SIMD) instead of a
+        # float32 multiply over the whole frame (measured 62 ms -> 43 ms full-res). Shape (1,256,3),
+        # gains order [B,G,R] matching bgr8. Numerically identical to clip(x*gain, 0, 255).
+        self._wb_lut = None
+        if self._apply_wb:
+            g = self._wb.reshape(3)  # [B,G,R]
+            lut = np.clip(np.arange(256, dtype=np.float32)[:, None] * g.reshape(1, 3), 0, 255)
+            self._wb_lut = lut.astype(np.uint8).reshape(1, 256, 3)
+        self.out_width = int(self.get_parameter("out_width").value)
+        self.out_height = int(self.get_parameter("out_height").value)
         self.frame_id = str(self.get_parameter("frame_id").value)
         topic = str(self.get_parameter("topic").value)
         rate = float(self.get_parameter("publish_rate").value)
         self.pull_timeout = float(self.get_parameter("pull_timeout").value)
 
         pipeline = make_gst_pipeline(self.sensor_id, self.sensor_mode, self.width, self.height,
-                                     self.fps, self.flip, self.wbmode)
+                                     self.fps, self.flip, self.wbmode,
+                                     self.out_width, self.out_height)
         self.get_logger().info(f"GStreamer pipeline: {pipeline}")
 
         self.cap = GstCsiCapture(pipeline)
-        self.pub = self.create_publisher(Image, topic, 10)
+        # SENSOR_DATA QoS (BEST_EFFORT, keep-last): a 6 MB frame at 30 Hz over RELIABLE to several
+        # subscribers collapsed the delivered rate to ~1 Hz (retransmit storm). BEST_EFFORT lets each
+        # consumer just take the freshest frame and drop the rest — the camera streams at full rate.
+        self.pub = self.create_publisher(Image, topic, qos_profile_sensor_data)
         self.timer = self.create_timer(1.0 / rate, self.tick)
 
         self.get_logger().info(
@@ -130,8 +162,8 @@ class CameraCsiNode(Node):
             self.get_logger().warn("frame pull timed out", throttle_duration_sec=2.0)
             return
         frame, w, h = result
-        if self._apply_wb:
-            frame = np.clip(frame.astype(np.float32) * self._wb, 0, 255).astype(np.uint8)
+        if self._wb_lut is not None:
+            frame = cv2.LUT(frame, self._wb_lut)   # per-channel WB, SIMD (was a float32 whole-frame mul)
         msg = Image()
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.header.frame_id = self.frame_id
@@ -140,7 +172,12 @@ class CameraCsiNode(Node):
         msg.encoding = "bgr8"
         msg.is_bigendian = 0
         msg.step = w * 3
-        msg.data = frame.tobytes()
+        # CRITICAL: array.array('B', frame.tobytes()) is the ONLY fast form (~1 ms). Both
+        #   msg.data = bytes            (rclpy per-element uint8[] setter) and
+        #   array.array('B', memoryview(frame).cast('B'))   (array.array per-element from a buffer)
+        # take ~300-1000 ms for a multi-MB frame and re-cap the camera at <1 Hz. tobytes() first
+        # (its copy is included in the 1 ms) then array.array over that bytes object.
+        msg.data = array.array("B", frame.tobytes())
         self.pub.publish(msg)
 
     def destroy_node(self) -> bool:

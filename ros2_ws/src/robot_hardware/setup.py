@@ -22,6 +22,7 @@ setup(
             'camera_csi_node = robot_hardware.nodes.camera_csi_node:main',
             'mcu_bridge_base_node = robot_hardware.nodes.mcu_bridge_base_node:main',
             'mcu_bridge_arm_node = robot_hardware.nodes.mcu_bridge_arm_node:main',
+            'imu_mpu6050_node = robot_hardware.nodes.imu_mpu6050_node:main',
         ],
     },
 )

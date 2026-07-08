@@ -168,6 +168,10 @@ class WorldModelNode(Node):
         self.declare_parameter("arm_base_offset_x", 0.15)
         self.declare_parameter("arm_base_offset_y", 0.0)
         self.declare_parameter("body_workspace_m", [0.0, 0.6, -0.35, 0.35])
+        # Body-cam downscale compensation: multiply each body detection pixel by these before the
+        # body homography (which is calibrated at full 1640x1232). 1.0 = body published at full res.
+        self.declare_parameter("body_px_scale_x", 1.0)
+        self.declare_parameter("body_px_scale_y", 1.0)
 
         # --- Object-landmark pose correction (lightweight SLAM-style drift fix) ---
         # When enabled, tracks that reach lock_min_obs observations with lock_min_conf freeze to
@@ -197,7 +201,18 @@ class WorldModelNode(Node):
         self.declare_parameter("object_flow_trans_deadband_m", 0.008)  # sub-cm per-frame shift = noise -> 0 (no drift)
 
         # Tracker tuning.
-        self.declare_parameter("assoc_radius_m", 0.18)     # nearest-neighbour gate
+        self.declare_parameter("assoc_radius_m", 0.18)     # tight gate: new-track spacing + duplicate merge
+        # RE-ASSOCIATION gate (generous): a detection near an EXISTING track re-associates to it even
+        # after pose jitter / a few-frame miss, so a re-seen object stays the SAME track instead of
+        # spawning a duplicate. Bigger than assoc_radius but < grid spacing (0.5m) so distinct objects
+        # never merge. This is the fix for "barely-moved = same object" + "missed 2-3 frames != new".
+        self.declare_parameter("reassoc_radius_m", 0.32)
+        # NEW-TRACK CONFIRMATION: a detection at a fresh spot must be re-seen this many times within
+        # candidate_ttl before it becomes a track. Stops a lone motion-jitter/blur detection (while the
+        # base shakes) from spawning a phantom object — that over-creation (hundreds of ids for ~28
+        # real cubes) is what churned targets and caused the back-and-forth.
+        self.declare_parameter("new_track_min_hits", 3)
+        self.declare_parameter("candidate_ttl_sec", 0.8)
         self.declare_parameter("conf_ema", 0.5)            # EMA weight on new sample
         self.declare_parameter("forget_after_sec", 6.0)    # drop unseen non-blacklisted
 
@@ -245,6 +260,10 @@ class WorldModelNode(Node):
         self.body_cam_height = float(self.get_parameter("body_cam_height_m").value)
         self.body_radial_trim = float(self.get_parameter("body_radial_trim_m").value)
         self.assoc_radius = float(self.get_parameter("assoc_radius_m").value)
+        self.reassoc_radius = float(self.get_parameter("reassoc_radius_m").value)
+        self.new_track_min_hits = int(self.get_parameter("new_track_min_hits").value)
+        self.candidate_ttl = float(self.get_parameter("candidate_ttl_sec").value)
+        self._candidates: list[dict] = []   # unconfirmed detections awaiting new_track_min_hits
         self.conf_ema = float(self.get_parameter("conf_ema").value)
         self.forget_after = float(self.get_parameter("forget_after_sec").value)
         self.class_conf_threshold = float(self.get_parameter("class_conf_threshold").value)
@@ -261,6 +280,8 @@ class WorldModelNode(Node):
         self.min_keep_conf = float(self.get_parameter("min_keep_conf").value)
         self.tick_dt = 1.0 / rate
 
+        self.body_px_scale_x = float(self.get_parameter("body_px_scale_x").value)
+        self.body_px_scale_y = float(self.get_parameter("body_px_scale_y").value)
         self.arm_base_off_x = float(self.get_parameter("arm_base_offset_x").value)
         self.arm_base_off_y = float(self.get_parameter("arm_base_offset_y").value)
         ws = [float(v) for v in self.get_parameter("body_workspace_m").value]
@@ -700,8 +721,8 @@ class WorldModelNode(Node):
             label = str(det.label)
             set_type = _LABEL_TO_SET_TYPE.get(label, 0)
             tid = self._associate(xy[0], xy[1], float(det.confidence), label, set_type, now, "body")
-            if label == "fruit_photo_cube" and float(det.confidence) > best_fruit[0]:
-                best_fruit = (float(det.confidence), tid)
+            if tid != 0 and label == "fruit_photo_cube" and float(det.confidence) > best_fruit[0]:
+                best_fruit = (float(det.confidence), tid)   # tid 0 = still a candidate (no track yet)
         # A following SigLIP result attaches to the HIGHEST-conf fruit cube (== the box SigLIP
         # itself cropped as its primary), so with several fruit cubes in view the fruit type lands
         # on the right one instead of whichever happened to be last in the list.
@@ -747,7 +768,10 @@ class WorldModelNode(Node):
         `pose` = (x, y, theta) at IMAGE-CAPTURE TIME (from _pose_at); None -> latest pose."""
         if not self.can_project_body or not self.have_pose:
             return None
-        pt = np.array([[[float(u), float(v)]]], dtype=np.float64)
+        # Body cam may be GPU-downscaled; upscale the detection pixel back to the resolution the
+        # body homographies were calibrated at (1640x1232) before transforming. Scale=1 if not downscaled.
+        pt = np.array([[[float(u) * self.body_px_scale_x, float(v) * self.body_px_scale_y]]],
+                      dtype=np.float64)
         if self._body_ground_H is not None:
             out = cv2.perspectiveTransform(pt, self._body_ground_H)[0][0]
             bx, by = float(out[0]), float(out[1])           # base_link METRES directly
@@ -799,6 +823,48 @@ class WorldModelNode(Node):
 
     # ------------------------------------------------------------------- tracker
 
+    def _candidate_hit(self, x: float, y: float, conf: float, label: str, set_type: int,
+                       now: float, is_body: bool, vote_thresh: float) -> int:
+        """A detection with no matching track: hold it as a CANDIDATE and only spawn a real track once
+        it has been re-observed new_track_min_hits times at ~the same spot. Returns the new track id on
+        promotion, else 0 (no track yet). Kills phantom over-creation from motion jitter."""
+        self._candidates = [c for c in self._candidates if now - c["t"] <= self.candidate_ttl]
+        best = None
+        bd = self.assoc_radius
+        for c in self._candidates:
+            d = math.hypot(c["x"] - x, c["y"] - y)
+            if d <= bd:
+                bd = d
+                best = c
+        if best is None:
+            self._candidates.append({"x": x, "y": y, "n": 1, "t": now, "conf": conf,
+                                     "label": label, "set": set_type, "body": is_body})
+            return 0
+        best["x"] = 0.5 * best["x"] + 0.5 * x
+        best["y"] = 0.5 * best["y"] + 0.5 * y
+        best["n"] += 1
+        best["t"] = now
+        best["conf"] = max(best["conf"], conf)
+        best["body"] = best["body"] or is_body
+        if best["n"] < self.new_track_min_hits:
+            return 0
+        # Confirmed -> promote to a real track.
+        tid = self._next_id
+        self._next_id += 1
+        body = bool(best["body"])
+        tr = Track(
+            id=tid, x=best["x"], y=best["y"], confidence=best["conf"], last_seen_sec=now,
+            source=("body" if body else "wide"), seen_body=body,
+            last_body_sec=(now if is_body else 0.0), last_wide_sec=(0.0 if is_body else now),
+            n_obs=best["n"], n_body=(best["n"] if body else 0),
+        )
+        if conf >= vote_thresh:
+            self._vote(tr, label, conf, is_body)
+        self._refresh_identity(tr)
+        self.tracks[tid] = tr
+        self._candidates.remove(best)
+        return tid
+
     def _associate(
         self, x: float, y: float, conf: float, label: str, set_type: int, now: float, source: str
     ) -> int:
@@ -814,8 +880,11 @@ class WorldModelNode(Node):
         # (assoc_radius tightened for the cm-accurate 1280 wide) — NOT by label, because the same
         # object often gets a wrong wide class + a correct body class, and those must still merge
         # (body then wins identity). Label-based splitting would duplicate that object on the map.
+        # Match to an existing track with the GENEROUS re-association gate so a re-seen object (jittered
+        # or missed a few frames) sticks to its track instead of duplicating. New-track creation below
+        # still uses the tight assoc_radius (via the candidate mechanism), so distinct objects stay apart.
         best_id: int | None = None
-        best_d = self.assoc_radius
+        best_d = self.reassoc_radius
         for tid, tr in self.tracks.items():
             d = math.hypot(tr.x - x, tr.y - y)
             if d <= best_d:
@@ -823,20 +892,9 @@ class WorldModelNode(Node):
                 best_id = tid
 
         if best_id is None:
-            tid = self._next_id
-            self._next_id += 1
-            tr = Track(
-                id=tid, x=x, y=y, confidence=conf, last_seen_sec=now,
-                source=source, seen_body=is_body,
-                last_body_sec=(now if is_body else 0.0),
-                last_wide_sec=(0.0 if is_body else now),
-                n_obs=1, n_body=(1 if is_body else 0),
-            )
-            if conf >= vote_thresh:   # only confident detections vote on IDENTITY (body: lower bar)
-                self._vote(tr, label, conf, is_body)
-            self._refresh_identity(tr)
-            self.tracks[tid] = tr
-            return tid
+            # No existing track within reassoc_radius -> genuinely new spot. DON'T spawn from a single
+            # detection (jitter/blur -> phantoms). Require new_track_min_hits consistent re-obs.
+            return self._candidate_hit(x, y, conf, label, set_type, now, is_body, vote_thresh)
 
         # Fuse into the matched track.
         tr = self.tracks[best_id]
@@ -1198,8 +1256,8 @@ class WorldModelNode(Node):
                 tb = self.tracks.get(b)
                 if tb is None:
                     continue
-                if math.hypot(ta.x - tb.x, ta.y - tb.y) > self.assoc_radius:
-                    continue
+                if math.hypot(ta.x - tb.x, ta.y - tb.y) > self.reassoc_radius:
+                    continue   # generous gate: collapse jitter-split duplicates (still < grid spacing)
                 if (ta.locked and tb.locked and ta.class_label and tb.class_label
                         and ta.class_label != tb.class_label):
                     continue   # two confirmed, differently-classified anchors -> keep distinct

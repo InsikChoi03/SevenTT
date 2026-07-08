@@ -37,6 +37,7 @@ def generate_launch_description() -> LaunchDescription:
     with_base = LaunchConfiguration("with_base")
     with_siglip = LaunchConfiguration("with_siglip")
     with_arm = LaunchConfiguration("with_arm")     # 2R pick_sequencer (real grasp via combined board)
+    with_wall_localizer = LaunchConfiguration("with_wall_localizer")
     output_dir = LaunchConfiguration("output_dir")
     cam_yaw = LaunchConfiguration("cam_yaw")      # wide-cam mount rotation about base z (0/90/180/270)
     rot180 = LaunchConfiguration("rot180")        # optical-axis flip for the 180-rotated top image
@@ -60,6 +61,8 @@ def generate_launch_description() -> LaunchDescription:
                               description="start siglip_gate (fruit type); false saves VRAM"),
         DeclareLaunchArgument("with_arm", default_value="false",
                               description="start 2R pick_sequencer (real grasp); needs with_base (shares ttyUSB0)"),
+        DeclareLaunchArgument("with_wall_localizer", default_value="true",
+                              description="use arena wall/floor lines as absolute pose correction"),
         DeclareLaunchArgument(
             "output_dir",
             default_value="/home/seventt/seventt/workspace/data/mock_field_test",
@@ -70,12 +73,17 @@ def generate_launch_description() -> LaunchDescription:
                               description="wide-cam 180-image optical-axis flip (try true/false)"),
         cameras,
         static_tf,
+        # IMU (MPU6050 on i2c-7 0x68): yaw-rate gyro -> localizer heading (drift fix)
+        node("robot_hardware", "imu_mpu6050_node", "imu_mpu6050_node"),
         # perception core (always)
         node("robot_perception", "localizer_node", "localizer_node"),
         node("robot_perception", "yolo_detector_node", "yolo_detector_node"),
         node("robot_perception", "world_model_node", "world_model_node",
              extra={"cam_yaw_deg": ParameterValue(cam_yaw, value_type=float),
                     "image_rotated_180": ParameterValue(rot180, value_type=bool)}),
+        node("robot_perception", "wall_localizer_node", "wall_localizer_node",
+             condition=IfCondition(with_wall_localizer),
+             extra={"image_rotated_180": ParameterValue(rot180, value_type=bool)}),
         node("robot_perception", "recognition_viz_node", "recognition_viz_node",
              extra={"output_dir": output_dir}),
         # planning (always) -- selector + FSM. explorer is under with_base (it drives the base).
@@ -85,8 +93,10 @@ def generate_launch_description() -> LaunchDescription:
         node("robot_perception", "siglip_gate_node", "siglip_gate_node",
              condition=IfCondition(with_siglip)),
         # base drive layer (optional; robot moves only with this) -- NO arm nodes ever
-        node("robot_planning", "explorer_node", "explorer_node",
-             condition=IfCondition(with_base)),
+        # explorer_node DISABLED: the mission FSM's lane-coverage sweep is now the sole /base/goal_pose
+        # writer during SCAN (a second writer would race/fight the planner). Re-enable only if reverting.
+        # node("robot_planning", "explorer_node", "explorer_node",
+        #      condition=IfCondition(with_base)),
         node("robot_control", "go_to_goal_node", "go_to_goal_node",
              condition=IfCondition(with_base)),
         node("robot_control", "base_controller_node", "base_controller_node",

@@ -1,0 +1,40 @@
+direction,target,unit,used_duration_ms,speed,boost_speed,boost_ms,brake_ms,brake_scale,scales,elapsed_s,actual,note
+forward,30.0,cm,1500,0.2,0.6,100,0,0.5,1.00 1.00 1.00 1.00,1.614,,step1 stiction floor probe @0.20
+forward,30.0,cm,1500,0.14,0.6,100,0,0.5,1.00 1.00 1.00 1.00,1.614,,step1 taper probe @0.14
+forward,30.0,cm,1500,0.1,0.6,100,0,0.5,1.00 1.00 1.00 1.00,1.613,,step1 floor probe @0.10
+right,50.0,cm,1500,0.2,0.6,100,0,0.35,0.88 0.88 1.00 0.88,1.613,,"step2 strafe-right straightness, normalized scales @0.20"
+right,50.0,cm,1500,0.2,0.6,100,0,0.35,0.88 0.88 1.00 0.88,1.614,,step2 strafe-right straightness retry @0.20
+right,50.0,cm,1200,0.5,0.65,100,0,0.35,0.70 0.70 0.80 0.70,1.313,,step2 strafe-right at ORIGINAL tuned point speed0.5 raw scales
+forward,5.0,cm,200,0.18,0.65,0,100,0.5,1.00 1.00 1.00 1.00,0.405,,step3 unit-pulse fwd @0.18/200ms no-boost
+forward,5.0,cm,200,0.18,0.65,0,100,0.5,1.00 1.00 1.00 1.00,0.405,,step3 unit-pulse fwd @0.18/200ms no-boost
+forward,5.0,cm,200,0.18,0.65,0,100,0.5,1.00 1.00 1.00 1.00,0.405,,step3 unit-pulse fwd @0.18/200ms no-boost
+forward,5.0,cm,200,0.18,0.65,0,100,0.5,1.00 1.00 1.00 1.00,0.405,,step3 unit-pulse fwd @0.18/200ms no-boost
+forward,5.0,cm,200,0.18,0.65,0,100,0.5,1.00 1.00 1.00 1.00,0.406,,step3 unit-pulse fwd @0.18/200ms no-boost
+forward,5.0,cm,200,0.18,0.65,0,100,0.5,1.00 1.00 1.00 1.00,0.406,,step3 unit-pulse fwd repeatability check
+backward,5.0,cm,200,0.18,0.65,0,100,0.5,1.00 1.00 1.00 1.00,0.405,,step3 unit-pulse backward @0.18/200ms
+backward,5.0,cm,200,0.18,0.65,0,100,0.5,1.00 1.00 1.00 1.00,0.406,,step3 unit-pulse backward @0.18/200ms
+right,5.0,cm,200,0.18,0.65,0,100,0.5,0.88 0.88 1.00 0.88,0.407,,step3 unit-pulse right strafe @0.18/200ms scaled
+right,5.0,cm,200,0.18,0.65,0,100,0.5,0.88 0.88 1.00 0.88,0.406,,step3 unit-pulse right strafe @0.18/200ms scaled
+right,5.0,cm,200,0.18,0.65,0,100,0.5,0.88 0.88 1.00 0.88,0.406,,step3 unit-pulse right strafe @0.18/200ms scaled
+right,5.0,cm,200,0.18,0.65,0,100,0.5,0.88 0.88 1.00 0.88,0.406,,step3 unit-pulse right strafe @0.18/200ms scaled
+right,5.0,cm,200,0.2,0.65,0,100,0.5,0.88 0.88 1.00 0.88,0.406,,step3 unit-pulse right strafe @0.20/200ms scaled
+right,5.0,cm,200,0.2,0.65,0,100,0.5,0.88 0.88 1.00 0.88,0.405,,step3 unit-pulse right strafe @0.18/200ms scaled
+right,5.0,cm,300,0.2,0.65,0,100,0.5,0.88 0.88 1.00 0.88,0.506,,step3 unit-pulse right strafe @0.18/200ms scaled
+right,5.0,cm,400,0.2,0.65,0,100,0.5,0.88 0.88 1.00 0.88,0.607,,step3 unit-pulse right strafe @0.18/200ms scaled
+right,5.0,cm,400,0.25,0.65,0,100,0.5,0.88 0.88 1.00 0.88,0.608,,step3 unit-pulse right strafe @0.18/200ms scaled
+right,5.0,cm,400,0.3,0.65,0,100,0.5,0.88 0.88 1.00 0.88,0.606,,step3 unit-pulse right strafe @0.18/200ms scaled
+right,5.0,cm,300,0.3,0.65,0,100,0.5,0.88 0.88 1.00 0.88,0.506,,step3 unit-pulse right strafe @0.18/200ms scaled
+right,5.0,cm,300,0.3,0.65,0,100,0.5,0.88 0.88 1.00 0.88,0.506,,step3 unit-pulse right strafe @0.18/200ms scaled
+right,5.0,cm,300,0.3,0.65,0,100,0.5,0.88 0.88 1.00 0.88,0.506,,step3 unit-pulse right strafe @0.18/200ms scaled
+right,5.0,cm,300,0.3,0.65,0,100,0.5,0.88 0.88 1.00 0.88,0.506,,step3 unit-pulse right strafe @0.18/200ms scaled
+right,5.0,cm,300,0.3,0.65,0,100,0.5,0.88 0.88 1.00 0.88,0.506,,step3 unit-pulse right strafe @0.18/200ms scaled
+left,5.0,cm,300,0.3,0.65,0,100,0.5,0.87 1.00 1.00 0.87,0.506,,step3 unit-pulse left strafe @0.30/300ms scaled
+right,5.0,cm,300,0.3,0.65,0,100,0.5,0.88 0.88 1.00 0.88,0.506,,step3 unit-pulse right strafe @0.18/200ms scaled
+left,5.0,cm,300,0.3,0.65,0,100,0.5,0.87 1.00 1.00 0.87,0.506,,step3 unit-pulse left strafe @0.30/300ms scaled
+left,5.0,cm,300,0.3,0.65,0,100,0.5,0.87 1.00 1.00 0.87,0.506,,step3 unit-pulse left strafe @0.30/300ms scaled
+left,5.0,cm,300,0.3,0.65,0,100,0.5,0.87 1.00 1.00 0.87,0.507,,step3 unit-pulse left strafe @0.30/300ms scaled
+left,5.0,cm,300,0.3,0.65,0,100,0.5,0.87 1.00 1.00 0.87,0.506,,step3 unit-pulse left strafe @0.30/300ms scaled
+left,5.0,cm,300,0.3,0.65,0,100,0.5,0.87 1.00 1.00 0.87,0.507,,step3 unit-pulse left strafe @0.30/300ms scaled
+forward,150.0,cm,3000,0.18,0.65,0,120,0.5,1.00 1.00 1.00 1.00,3.238,,scale-diag2
+forward,100.0,cm,2500,0.18,0.65,0,120,0.5,1.00 1.00 1.00 1.00,2.74,,corr-live
+forward,60.0,cm,1500,0.18,0.65,0,120,0.5,1.00 1.00 1.00 1.00,1.729,,clean-diag

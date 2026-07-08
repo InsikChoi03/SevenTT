@@ -7,6 +7,11 @@ This script is intentionally low-level and ROS-free. It is the right place to va
 - whether commanded forward motion roughly matches measured distance
 - whether the robot stops near a requested distance
 - whether the robot rotates near a requested angle
+- whether a short diagonal rolling start helps lateral motion break static friction
+- whether a forward distance segment helps lateral motion start more reliably
+- whether the base can drive a standalone 45-degree forward diagonal path
+- whether a short high-power boost can break static friction before steady lateral motion
+- whether repeated high-power pulses can ratchet the base sideways
 
 Current firmware note:
 - `base_arm_combined.ino` emits `<ODOM,...>` after the encoder-enabled sketch is flashed
@@ -81,7 +86,9 @@ def parse_index_list(text: str) -> list[int]:
 def selected_motion_speed(vals: list[float], wheels: list[int], signs: list[float]) -> float:
     if len(vals) < 4:
         return 0.0
-    samples = [float(signs[i]) * float(vals[i]) for i in wheels]
+    samples = [float(signs[i]) * float(vals[i]) for i in wheels if abs(float(signs[i])) > 1e-9]
+    if not samples:
+        return 0.0
     if len(samples) == 1:
         return samples[0]
     if len(samples) == 2:
@@ -103,6 +110,12 @@ def motion_profile(direction: str, speed: float) -> tuple[list[float], list[floa
     elif direction == "left":
         cmd = [-mag, mag, mag, -mag]
         odom_signs = [-1.0, 1.0, 1.0, -1.0]
+    elif direction == "forward_right":
+        cmd = [mag, 0.0, 0.0, mag]
+        odom_signs = [1.0, 0.0, 0.0, 1.0]
+    elif direction == "forward_left":
+        cmd = [0.0, mag, mag, 0.0]
+        odom_signs = [0.0, 1.0, 1.0, 0.0]
     elif direction == "ccw":
         cmd = [-mag, mag, -mag, mag]
         odom_signs = [-1.0, 1.0, -1.0, 1.0]
@@ -115,11 +128,132 @@ def motion_profile(direction: str, speed: float) -> tuple[list[float], list[floa
     return cmd, brake, odom_signs
 
 
+def diagonal_kick_profile(direction: str, speed: float) -> list[float]:
+    mag = abs(float(speed))
+    if direction == "right":
+        return [mag, 0.0, 0.0, mag]
+    if direction == "left":
+        return [0.0, mag, mag, 0.0]
+    raise ValueError(f"lateral kick only supports left/right, got: {direction}")
+
+
+def run_open_loop(ser: serial.Serial, wheel_speeds: list[float], ms: int, hz: float) -> None:
+    if ms <= 0:
+        return
+    period = 1.0 / max(hz, 1e-6)
+    end = time.monotonic() + (ms / 1000.0)
+    while time.monotonic() < end:
+        send_base(ser, *wheel_speeds)
+        time.sleep(period)
+
+
+def run_closed_loop_segment(
+    ser: serial.Serial,
+    *,
+    direction: str,
+    speed: float,
+    target_m: float,
+    target_deg: float,
+    timeout: float,
+    hz: float,
+    k: float,
+    trusted_wheels: list[int],
+    label: str,
+) -> bool:
+    cmd_wheels, _, odom_signs = motion_profile(direction, speed)
+    rotational = direction in {"cw", "ccw"}
+    target = math.radians(abs(float(target_deg))) if rotational else abs(float(target_m))
+    target_label = f"{math.degrees(target):.1f}deg" if rotational else f"{target:.3f}m"
+    cmd_period = 1.0 / max(hz, 1e-6)
+    start = time.monotonic()
+    last_cmd = 0.0
+    last_odom_t = None
+    progress = 0.0
+    saw_hb = False
+    saw_odom = False
+    rx_buf = b""
+
+    print(f"{label}: direction={direction} wheel_cmd={cmd_wheels} target={target_label}")
+
+    while True:
+        now = time.monotonic()
+        if now - start > timeout:
+            if rotational:
+                print(f"{label} timeout: angle={math.degrees(progress):.1f} deg")
+            else:
+                print(f"{label} timeout: distance={progress:.3f} m")
+            return False
+
+        if now - last_cmd >= cmd_period:
+            send_base(ser, *cmd_wheels)
+            last_cmd = now
+
+        data = ser.read(128)
+        if data:
+            rx_buf += data
+        while b"\n" in rx_buf:
+            raw, rx_buf = rx_buf.split(b"\n", 1)
+            line = raw.strip().decode("ascii", errors="ignore")
+            pkt = parse_packet(line)
+            if pkt is None:
+                continue
+            tag, vals = pkt
+
+            if tag == "HB":
+                saw_hb = True
+            elif tag == "ENC":
+                if len(vals) >= 4:
+                    print(
+                        f"raw enc e1={int(vals[0])} e2={int(vals[1])} "
+                        f"e3={int(vals[2])} e4={int(vals[3])}"
+                    )
+            elif tag == "ODOM":
+                saw_odom = True
+                t_now = time.monotonic()
+                signed_speed = selected_motion_speed(vals, trusted_wheels, odom_signs)
+                if last_odom_t is not None:
+                    dt = max(0.0, min(0.5, t_now - last_odom_t))
+                    if rotational:
+                        progress += (signed_speed / max(float(k), 1e-6)) * dt
+                    else:
+                        progress += signed_speed * dt
+                last_odom_t = t_now
+                if rotational:
+                    print(
+                        f"{label} odom spin={signed_speed:+.3f} "
+                        f"angle={math.degrees(progress):+.1f} / {math.degrees(target):.1f} deg"
+                    )
+                else:
+                    print(f"{label} odom speed={signed_speed:+.3f} distance={progress:+.3f} / {target:.3f} m")
+                if abs(progress) >= target:
+                    print(f"{label} target reached")
+                    return True
+
+        if saw_hb and not saw_odom and (time.monotonic() - start) > 1.5:
+            print("MCU is only sending <HB,...> command echo.")
+            print("Add real encoder output <ODOM,fl,fr,rl,rr,t_ms> in firmware first.")
+            return False
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Closed-loop distance test using MCU encoder packets")
     ap.add_argument("--port", default="/dev/ttyUSB0")
     ap.add_argument("--baud", type=int, default=115200)
-    ap.add_argument("--direction", choices=["forward", "backward", "left", "right", "cw", "ccw"], default="forward")
+    ap.add_argument(
+        "--direction",
+        choices=["forward", "backward", "left", "right", "forward_right", "forward_left", "cw", "ccw"],
+        default="forward",
+    )
+    ap.add_argument(
+        "--mode",
+        choices=["single", "lateral-kick", "forward-then-lateral", "start-boost", "pulse"],
+        default="single",
+        help=(
+            "single keeps the original behavior; lateral-kick adds a timed diagonal start; "
+            "forward-then-lateral drives forward by --pre-m before left/right; "
+            "start-boost briefly uses --boost-speed before --speed; pulse alternates strong lateral bursts and stops"
+        ),
+    )
     ap.add_argument("--speed", type=float, default=0.10, help="wheel speed command magnitude in m/s")
     ap.add_argument("--target-m", type=float, default=0.50, help="requested travel distance in meters")
     ap.add_argument("--target-deg", type=float, default=90.0, help="requested rotation in degrees for cw/ccw")
@@ -143,6 +277,60 @@ def main() -> None:
         default="1,2,3",
         help="comma-separated ODOM wheel indexes to trust; default ignores weak FL encoder",
     )
+    ap.add_argument(
+        "--kick-ms",
+        type=int,
+        default=250,
+        help="lateral-kick diagonal rolling-start duration in ms",
+    )
+    ap.add_argument(
+        "--kick-speed-scale",
+        type=float,
+        default=1.0,
+        help="lateral-kick speed as a fraction of --speed",
+    )
+    ap.add_argument(
+        "--pre-m",
+        type=float,
+        default=0.10,
+        help="forward-then-lateral forward segment target in meters",
+    )
+    ap.add_argument(
+        "--pre-timeout",
+        type=float,
+        default=5.0,
+        help="forward-then-lateral forward segment timeout in seconds",
+    )
+    ap.add_argument(
+        "--boost-speed",
+        type=float,
+        default=0.50,
+        help="start-boost initial wheel speed magnitude in m/s",
+    )
+    ap.add_argument(
+        "--boost-ms",
+        type=int,
+        default=200,
+        help="start-boost duration in ms",
+    )
+    ap.add_argument(
+        "--pulse-speed",
+        type=float,
+        default=0.50,
+        help="pulse mode wheel speed magnitude during each burst in m/s",
+    )
+    ap.add_argument(
+        "--pulse-on-ms",
+        type=int,
+        default=150,
+        help="pulse mode burst duration in ms",
+    )
+    ap.add_argument(
+        "--pulse-off-ms",
+        type=int,
+        default=50,
+        help="pulse mode stop duration between bursts in ms",
+    )
     args = ap.parse_args()
     trusted_wheels = parse_index_list(args.odom_wheels)
 
@@ -159,7 +347,14 @@ def main() -> None:
     stop_base(ser)
     reset_encoders(ser)
 
+    lateral_modes = {"lateral-kick", "forward-then-lateral", "start-boost", "pulse"}
+    if args.mode in lateral_modes and args.direction not in {"left", "right"}:
+        print(f"--mode {args.mode} only supports --direction left/right", file=sys.stderr)
+        sys.exit(2)
+
     cmd_wheels, brake_wheels, odom_signs = motion_profile(args.direction, args.speed)
+    boost_wheels = motion_profile(args.direction, args.boost_speed)[0]
+    pulse_wheels = motion_profile(args.direction, args.pulse_speed)[0]
     brake_scale = max(0.0, float(args.brake_speed_scale))
     brake_wheels = [v * brake_scale for v in brake_wheels]
     rotational = args.direction in {"cw", "ccw"}
@@ -174,12 +369,50 @@ def main() -> None:
     rx_buf = b""
     target_label = f"{math.degrees(target):.1f}deg" if rotational else f"{target:.3f}m"
     print(
-        f"test: direction={args.direction} wheel_cmd={cmd_wheels} "
+        f"test: mode={args.mode} direction={args.direction} wheel_cmd={cmd_wheels} "
         f"target={target_label} odom_wheels={trusted_wheels} "
         f"brake_ms={args.brake_ms} brake_wheels={brake_wheels}"
     )
+    if args.mode == "start-boost":
+        print(f"start boost: wheel_cmd={boost_wheels} for {args.boost_ms} ms, then {cmd_wheels}")
+    elif args.mode == "pulse":
+        print(
+            f"pulse: wheel_cmd={pulse_wheels} on={args.pulse_on_ms} ms "
+            f"off={args.pulse_off_ms} ms"
+        )
 
     try:
+        if args.mode == "lateral-kick":
+            kick_wheels = diagonal_kick_profile(
+                args.direction,
+                args.speed * max(0.0, float(args.kick_speed_scale)),
+            )
+            print(f"diagonal kick: wheel_cmd={kick_wheels} for {args.kick_ms} ms")
+            run_open_loop(ser, kick_wheels, args.kick_ms, args.hz)
+        elif args.mode == "forward-then-lateral":
+            ok = run_closed_loop_segment(
+                ser,
+                direction="forward",
+                speed=args.speed,
+                target_m=args.pre_m,
+                target_deg=args.target_deg,
+                timeout=args.pre_timeout,
+                hz=args.hz,
+                k=args.k,
+                trusted_wheels=trusted_wheels,
+                label="pre-forward",
+            )
+            if not ok:
+                stop_base(ser)
+                return
+            start = time.monotonic()
+            last_cmd = 0.0
+            last_odom_t = None
+            progress = 0.0
+            saw_hb = False
+            saw_odom = False
+            rx_buf = b""
+
         while True:
             now = time.monotonic()
             if now - start > args.timeout:
@@ -190,7 +423,19 @@ def main() -> None:
                 break
 
             if now - last_cmd >= cmd_period:
-                send_base(ser, *cmd_wheels)
+                elapsed_ms = (now - start) * 1000.0
+                if args.mode == "start-boost" and elapsed_ms < max(0, args.boost_ms):
+                    send_base(ser, *boost_wheels)
+                elif args.mode == "pulse":
+                    on_ms = max(1, args.pulse_on_ms)
+                    off_ms = max(0, args.pulse_off_ms)
+                    cycle_ms = on_ms + off_ms
+                    if cycle_ms <= 0 or (elapsed_ms % cycle_ms) < on_ms:
+                        send_base(ser, *pulse_wheels)
+                    else:
+                        stop_base(ser)
+                else:
+                    send_base(ser, *cmd_wheels)
                 last_cmd = now
 
             data = ser.read(128)

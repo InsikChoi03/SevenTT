@@ -36,6 +36,7 @@ def generate_launch_description() -> LaunchDescription:
         perc("yolo_detector_node", "yolo_detector_node"),
         perc("siglip_gate_node", "siglip_gate_node"),
         perc("world_model_node", "world_model_node"),
+        perc("wall_localizer_node", "wall_localizer_node"),
         plan("target_selector_node", "target_selector_node"),
         plan("mission_fsm_node", "mission_fsm_node"),
     ])

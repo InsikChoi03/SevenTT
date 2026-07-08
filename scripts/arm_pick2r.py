@@ -5,21 +5,20 @@ arm_jog2.py로 실측·검증한 서보각(사용자 확인: "잘 잡는다")을
 arm_ik.py는 아직 HOME_CMD/GRIPPER 캘리브 전(TODO)이라, 검증된 raw 서보각을 쓴다.
 
 포즈 (ch0=어깨, ch1=손목, ch2=그리퍼 / t4~6=90 필러 미사용):
-  INIT  어깨 88, 손목 10, 그리퍼 140   ← 연결 직후 스냅하는 초기/대기 자세
-  집기  어깨 10, 손목 170 이동 → 딜레이 → 그리퍼 150(닫힘)
-  놓기  어깨 110, 손목 30 이동(집은 채) → 딜레이 → 그리퍼 80(열림) → 초기복귀 전 대기(--init-delay)
+  INIT  어깨 110, 손목 10, 그리퍼 100  ← 연결 직후 스냅하는 초기/대기 자세
+  집기  어깨 25, 손목 150 이동 → 딜레이 → 그리퍼 40(닫힘)
+  놓기  그리퍼를 닫은 채 PLACE(어깨 110, 손목 30)까지 이동 → 그리퍼 95(열림)
 
 펌웨어가 자체 smooth 보간(MAX_STEP 2°/30ms ≈ 67°/s)이라 목표각만 보내면 됨(호스트 lerp 불필요).
 각 이동은 **거리/속도로 도달시간을 계산해 팔이 다 도착할 때까지 기다린 뒤** move/grip 딜레이만큼
 더 대기하고 다음 동작(그리퍼)으로 넘어간다 → 도착 전에 그리퍼가 급히 닫히는 문제 방지.
-⚠️ 첫 <ARM> 명령은 boot-limp 해제와 함께 즉시 스냅 → 연결 직후 INIT(88,10,140)으로 흡수.
+⚠️ 첫 <ARM> 명령은 boot-limp 해제와 함께 즉시 스냅 → 연결 직후 INIT(110,10,100)으로 흡수.
 
 ── 모듈로 쓰기 (추후 pick_run / mission_fsm 등에서) ──
     from arm_pick2r import Arm2R
     with Arm2R("/dev/ttyUSB0") as arm:   # 열고 INIT로 스냅
         arm.grip()                        # 집기: pick 자세 → 닫기
-        arm.release()                     # 놓기: place 자세 → 열기
-        arm.go_init()                     # 대기 자세 복귀
+        arm.release()                     # 놓기: 현재 올린 자세에서 열기
 
 ── CLI 테스트 ──
     python3 scripts/arm_pick2r.py               # 집기 → 놓기 1회
@@ -34,13 +33,13 @@ import argparse
 import glob
 import time
 
-# ── 검증된 포즈 (2026-07-03 arm_jog2.py 실측, 사용자 "잘 잡는다" 확인) ──
-GRIP_OPEN = 80       # 그리퍼 열림(놓기)
-GRIP_CLOSED = 150    # 그리퍼 닫힘(잡기)
+# ── 검증된 포즈 (2026-07-08 사용자 직접 테스트 기준) ──
+GRIP_OPEN = 95       # 그리퍼 열림(놓기)
+GRIP_CLOSED = 40     # 그리퍼 닫힘(잡기)
 
-INIT = {"shoulder": 88, "wrist": 10, "gripper": 140}         # 연결 직후/대기 자세
-PICK = {"shoulder": 10, "wrist": 170}                         # 집기 도달 자세(어깨/손목)
-PLACE = {"shoulder": 110, "wrist": 30}                        # 놓기 도달 자세(어깨/손목)
+INIT = {"shoulder": 110, "wrist": 10, "gripper": 100}        # 연결 직후/대기 자세
+PICK = {"shoulder": 25, "wrist": 150}                        # 집기 도달 자세(어깨/손목)
+PLACE = {"shoulder": 110, "wrist": 30}                       # 놓기 자세: 닫은 채 이동 후 열기
 
 # 펌웨어 smooth 보간 속도(MAX_STEP 2°/30ms ≈ 67°/s). 안전 위해 보수적으로 잡아 도달을 확실히 기다림.
 SERVO_SPEED_DPS = 60.0
@@ -112,9 +111,9 @@ class Arm2R:
         self._move(PICK["shoulder"], PICK["wrist"], GRIP_CLOSED, self.grip_delay)  # 잡기
 
     def release(self):
-        """놓기: 잡은 채 place 자세로 이동 → 도달+딜레이 → 그리퍼 열기 → 딜레이."""
-        self._move(PLACE["shoulder"], PLACE["wrist"], self._pose[2], self.move_delay)  # 놓기 위치로(잡은 채)
-        self._move(PLACE["shoulder"], PLACE["wrist"], GRIP_OPEN, self.grip_delay)      # 놓기
+        """놓기: 그리퍼를 닫은 채 PLACE까지 이동한 뒤, 도착해서 그리퍼를 연다."""
+        self._move(PLACE["shoulder"], PLACE["wrist"], GRIP_CLOSED, self.move_delay)
+        self._move(PLACE["shoulder"], PLACE["wrist"], GRIP_OPEN, self.grip_delay)
 
 
 # ── CLI 테스트 ──
@@ -128,7 +127,7 @@ def main():
     ap.add_argument("--move-delay", type=float, default=0.8, help="팔 도달 후 그리퍼 전 추가 대기(초)")
     ap.add_argument("--grip-delay", type=float, default=0.6, help="그리퍼 개폐 후 추가 대기(초)")
     ap.add_argument("--cycle-pause", type=float, default=0.5, help="집기↔놓기 사이 대기(초)")
-    ap.add_argument("--init-delay", type=float, default=3.0, help="놓기 후 초기자세 복귀 전 대기(초)")
+    ap.add_argument("--init-delay", type=float, default=0.0, help="호환용 옵션(현재 자동 초기복귀 없음)")
     args = ap.parse_args()
 
     try:
@@ -139,7 +138,7 @@ def main():
 
     try:
         arm = Arm2R(args.port, args.baud, args.move_delay, args.grip_delay)
-        print("⚠️ 첫 <ARM>에 INIT(88,10,140)으로 스냅합니다. 그리퍼 밑에 손/물건 없는지 확인.")
+        print("⚠️ 첫 <ARM>에 INIT(110,10,100)으로 스냅합니다. 그리퍼 밑에 손/물건 없는지 확인.")
         arm.open()
     except Exception as e:
         print(f"[err] 포트 {args.port} 열기 실패: {e}")
@@ -156,16 +155,13 @@ def main():
         else:
             for i in range(args.loop):
                 print(f"=== cycle {i + 1}/{args.loop} ===")
-                print("  [집기] 어깨10/손목170 → 그리퍼150")
+                print("  [집기] 어깨25/손목150 → 그리퍼40")
                 arm.grip()
                 time.sleep(args.cycle_pause)
-                print("  [놓기] 어깨110/손목30 → 그리퍼80")
+                print("  [놓기] 어깨110/손목10 → 그리퍼95")
                 arm.release()
                 if i < args.loop - 1:
                     time.sleep(args.cycle_pause)
-            print(f"  [{args.init_delay:.0f}초 대기 후 초기자세 복귀]")
-            time.sleep(args.init_delay)
-            arm.go_init()
     except KeyboardInterrupt:
         print("\n중단됨 — 서보 현재 위치 유지")
     finally:

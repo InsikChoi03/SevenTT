@@ -24,6 +24,7 @@ import numpy as np
 import rclpy
 from cv_bridge import CvBridge
 from rclpy.node import Node
+from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import Image
 
 from robot_interfaces.msg import Classification, Detection, DetectionArray
@@ -65,6 +66,13 @@ class SiglipGateNode(Node):
         self.declare_parameter("target_label", "fruit_photo_cube")
         self.declare_parameter("aspect_ratio_min", 0.6)   # w/h lower bound
         self.declare_parameter("aspect_ratio_max", 1.7)   # w/h upper bound
+        # SigLIP runs on a TIMER at this rate over the latest body frame's fruit-cube crops — NOT
+        # synchronously per detection message. Firing on every body detection (up to ~16 Hz) stole
+        # the single GPU from YOLO right during the approach; the world model only needs a fruit
+        # vote a couple times/sec. All croppable fruit cubes in the frame go in ONE batched forward
+        # pass. 0 -> fall back to the old per-detection synchronous path.
+        self.declare_parameter("classify_rate_hz", 1.5)
+        self.declare_parameter("max_batch", 4)            # cap crops per forward pass (VRAM)
 
         self.model_id = str(self.get_parameter("model_id").value)
         self.set2_label = str(self.get_parameter("set2_label").value)
@@ -75,9 +83,13 @@ class SiglipGateNode(Node):
         self.target_label = str(self.get_parameter("target_label").value)
         self.aspect_ratio_min = float(self.get_parameter("aspect_ratio_min").value)
         self.aspect_ratio_max = float(self.get_parameter("aspect_ratio_max").value)
+        self.classify_rate_hz = float(self.get_parameter("classify_rate_hz").value)
+        self.max_batch = int(self.get_parameter("max_batch").value)
 
         self.bridge = CvBridge()
         self.latest_frame: Optional[np.ndarray] = None
+        # Latest fruit-cube candidates awaiting a (throttled, batched) SigLIP pass: (frame, dets, stamp).
+        self._pending: Optional[tuple] = None
 
         # Text prompts: fruit prompts first, then the two discriminator prompts.
         self.fruit_prompts = [f"a photo of a {fruit}" for fruit in self.fruit_labels]
@@ -88,9 +100,14 @@ class SiglipGateNode(Node):
         self.processor = None
         self._load_model()
 
-        self.create_subscription(Image, "/camera_body/image_raw", self.on_image, 10)
+        self.create_subscription(Image, "/camera_body/image_raw", self.on_image,
+                                 qos_profile_sensor_data)  # match camera BEST_EFFORT
         self.create_subscription(DetectionArray, "/camera_body/detections", self.on_detections, 10)
         self.pub = self.create_publisher(Classification, "/classification/siglip", 10)
+
+        # Throttle: SigLIP fires on a timer over the freshest pending crops, not per detection msg.
+        if self.classify_rate_hz > 0:
+            self.create_timer(1.0 / self.classify_rate_hz, self._tick_classify)
 
         self.get_logger().info(
             f"model_id='{self.model_id}' device={self.device} "
@@ -144,39 +161,31 @@ class SiglipGateNode(Node):
         if self.latest_frame is None:
             self.get_logger().warn("no body-cam frame yet; skipping", throttle_duration_sec=5.0)
             return
-        if not msg.detections:
+        targets = [d for d in msg.detections if str(d.label) == self.target_label]
+        if not targets:
             return
+        # Store only — the timer runs the throttled, batched inference. This keeps the high-rate
+        # detection stream off the GPU (it was stealing it from YOLO on every message).
+        self._pending = (self.latest_frame, targets, msg.header.stamp)
+        if self.classify_rate_hz <= 0:                    # throttle disabled -> classify inline
+            self._tick_classify()
 
-        frame = self.latest_frame
+    def _tick_classify(self) -> None:
+        """Timer: crop every pending fruit cube and score them in one batched SigLIP pass."""
+        pending, self._pending = self._pending, None
+        if pending is None or self.model is None or self.processor is None:
+            return
+        frame, dets, stamp = pending
         h, w = frame.shape[:2]
-
-        primary = self._primary_detection(msg.detections, w, h)
-        if primary is None:
-            return
-
-        crop = self._crop(frame, primary, w, h)
-        if crop is None:
-            return
-
-        self._classify_and_publish(crop, msg.header.stamp)
-
-    def _primary_detection(self, detections, w: int, h: int) -> Optional[Detection]:
-        """Highest-confidence fruit_photo_cube box; tie-break = closest to image center.
-        Only the target label (fruit_photo_cube) is classified — SigLIP reads the fruit face."""
-        cx_img, cy_img = w / 2.0, h / 2.0
-        best: Optional[Detection] = None
-        best_conf = -1.0
-        best_dist = float("inf")
-        for det in detections:
-            if str(det.label) != self.target_label:
-                continue
-            conf = float(det.confidence)
-            dist = (float(det.x_center) - cx_img) ** 2 + (float(det.y_center) - cy_img) ** 2
-            if conf > best_conf or (conf == best_conf and dist < best_dist):
-                best = det
-                best_conf = conf
-                best_dist = dist
-        return best
+        crops = []
+        for det in dets:
+            c = self._crop(frame, det, w, h)
+            if c is not None:
+                crops.append(c)
+            if len(crops) >= self.max_batch:
+                break
+        if crops:
+            self._classify_and_publish(crops, stamp)
 
     def _crop(self, frame: np.ndarray, det: Detection, w: int, h: int) -> Optional[np.ndarray]:
         x1 = int(round(det.x_center - det.width / 2.0))
@@ -210,55 +219,54 @@ class SiglipGateNode(Node):
             return None
         return frame[y1:y2, x1:x2]
 
-    def _classify_and_publish(self, crop_bgr: np.ndarray, stamp) -> None:
+    def _classify_and_publish(self, crops: list[np.ndarray], stamp) -> None:
+        """One batched SigLIP forward pass over every fruit-cube crop; publish the best read."""
         try:
-            crop_rgb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB)
-            pil_img = PILImage.fromarray(crop_rgb)
+            pil_imgs = [PILImage.fromarray(cv2.cvtColor(c, cv2.COLOR_BGR2RGB)) for c in crops]
             inputs = self.processor(
-                text=self.prompts, images=pil_img, padding="max_length", return_tensors="pt"
+                text=self.prompts, images=pil_imgs, padding="max_length", return_tensors="pt"
             )
             inputs = {k: v.to(self.device) for k, v in inputs.items()}
             with torch.no_grad():
                 outputs = self.model(**inputs)
-            # SigLIP is trained with a pairwise SIGMOID loss, so each prompt's match
-            # probability is independent — use sigmoid(logit) per prompt, NOT softmax over
-            # prompts. This keeps confidence_threshold meaningful ("P(this fruit) >= 0.7")
-            # instead of being diluted across the prompt set, and keeps the cube
-            # image-vs-plain discriminator independent of the fruit scores.
-            logits = outputs.logits_per_image[0].detach().cpu().numpy()
+            # logits_per_image: [n_crops, n_prompts]. SigLIP uses a pairwise SIGMOID loss, so each
+            # prompt's match probability is independent (sigmoid per prompt, NOT softmax over prompts)
+            # for the face-vs-plain discriminator; the fruit TYPE is a softmax over the fruit prompts.
+            logits_all = outputs.logits_per_image.detach().cpu().numpy()
         except Exception as exc:
             self.get_logger().warn(f"SigLIP inference failed: {exc}", throttle_duration_sec=5.0)
             return
 
         n_fruits = len(self.fruit_labels)
-        sig = 1.0 / (1.0 + np.exp(-logits))              # sigmoid for the face discriminator
-        prob_image_face = float(sig[n_fruits])
-        prob_plain_cube = float(sig[n_fruits + 1])
-        image_face_visible = prob_image_face > prob_plain_cube
+        best = None          # (rank_key, label, margin, best_soft, image_face_visible, is_target)
+        for logits in logits_all:
+            sig = 1.0 / (1.0 + np.exp(-logits))          # sigmoid for the face discriminator
+            image_face_visible = float(sig[n_fruits]) > float(sig[n_fruits + 1])
+            # Fruit TYPE = SOFTMAX over fruit prompts; reliability = MARGIN over the runner-up
+            # (bigger gap -> more trust), published as `confidence` for the world model's vote weight.
+            fl = logits[:n_fruits]
+            e = np.exp(fl - fl.max())
+            soft = e / e.sum()
+            order = np.argsort(soft)[::-1]
+            best_idx = int(order[0])
+            label = self.fruit_labels[best_idx]
+            best_soft = float(soft[best_idx])
+            margin = best_soft - float(soft[order[1]]) if n_fruits > 1 else best_soft
+            is_target = (
+                label == self.set2_label
+                and margin >= self.confidence_threshold
+                and image_face_visible
+            )
+            # Rank crops: prefer a visible fruit face, then the largest margin (clearest read).
+            rank_key = (1 if image_face_visible else 0, margin)
+            if best is None or rank_key > best[0]:
+                best = (rank_key, label, margin, best_soft, image_face_visible, is_target)
 
-        # Fruit TYPE = SOFTMAX over the fruit prompts (relative: WHICH fruit among the options).
-        # The raw sigmoid is tiny (~0.005) for every fruit so an absolute gate never fires. The
-        # reliability is the MARGIN over the runner-up (user: the bigger the gap, the more we trust
-        # it) — published as `confidence` so the world model vote-weights the fruit by that margin.
-        fl = logits[:n_fruits]
-        e = np.exp(fl - fl.max())
-        soft = e / e.sum()
-        order = np.argsort(soft)[::-1]
-        best_idx = int(order[0])
-        best_label = self.fruit_labels[best_idx]
-        best_soft = float(soft[best_idx])
-        margin = best_soft - float(soft[order[1]]) if n_fruits > 1 else best_soft
-        # Confident target IF a fruit face is visible AND this fruit clearly beats the others.
-        is_target = (
-            best_label == self.set2_label
-            and margin >= self.confidence_threshold
-            and image_face_visible
-        )
-
+        _, label, margin, best_soft, image_face_visible, is_target = best
         out = Classification()
         out.header.stamp = self.get_clock().now().to_msg()
         out.header.frame_id = "camera_body"
-        out.label = best_label
+        out.label = label
         out.set_type = 2
         out.confidence = float(margin)          # reliability = margin over the runner-up fruit
         out.is_target = is_target
@@ -267,8 +275,8 @@ class SiglipGateNode(Node):
         self.pub.publish(out)
 
         self.get_logger().info(
-            f"siglip: {best_label} soft={best_soft:.2f} margin={margin:.2f} "
-            f"face={image_face_visible} target={is_target}",
+            f"siglip: {label} soft={best_soft:.2f} margin={margin:.2f} "
+            f"face={image_face_visible} target={is_target} (batch={len(crops)})",
             throttle_duration_sec=1.0,
         )
 

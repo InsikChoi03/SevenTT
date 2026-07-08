@@ -1,0 +1,7 @@
+timestamp,trial,direction,kind,target,unit,used_duration_ms,speed,boost_ms,boost_speed,brake_ms,brake_scale,scale_fl,scale_fr,scale_rl,scale_rr,cmd_fl,cmd_fr,cmd_rl,cmd_rr,boost_fl,boost_fr,boost_rl,boost_rr,elapsed_s,all_wheels_spun,actual,error,error_pct,within_tolerance,forward_drift_cm,right_drift_cm,yaw_deg,suggested_next_duration_ms,suggest_scale_fl,suggest_scale_fr,suggest_scale_rl,suggest_scale_rr,stalled_notes,notes
+2026-07-07T17:05:28,1,forward,distance,10.0,cm,196,0.5,100,0.65,150,0.5,1.0,1.0,1.0,1.0,0.500,0.500,0.500,0.500,0.650,0.650,0.650,0.650,0.364,True,10.0,0.000,0.00,True,0.0,0.0,0.0,196,,,,,,
+2026-07-07T17:08:52,1,forward,distance,10.0,cm,196,0.3,100,0.65,150,0.5,1.0,1.0,1.0,1.0,0.300,0.300,0.300,0.300,0.650,0.650,0.650,0.650,0.363,True,12.0,2.000,20.00,False,0.0,0.0,0.0,163,,,,,,
+2026-07-07T17:09:34,2,forward,distance,5.0,cm,98,0.3,100,0.65,150,0.5,1.0,1.0,1.0,1.0,0.300,0.300,0.300,0.300,0.650,0.650,0.650,0.650,0.263,True,6.5,1.500,30.00,False,0.0,0.0,0.0,75,,,,,,
+2026-07-07T17:10:11,3,forward,distance,5.0,cm,75,0.3,100,0.65,150,0.5,1.0,1.0,1.0,1.0,0.300,0.300,0.300,0.300,0.650,0.650,0.650,0.650,0.242,True,5.0,0.000,0.00,True,0.0,0.0,0.0,75,,,,,,
+2026-07-07T17:11:43,1,right,distance,5.0,cm,207,0.5,0,0.65,150,0.5,0.7,0.7,0.8,0.7,0.350,-0.350,-0.400,0.350,0.455,-0.455,-0.520,0.455,0.384,True,4.0,-1.000,-20.00,False,0.0,0.0,0.0,259,,,,,,
+2026-07-07T17:12:43,2,left,distance,5.0,cm,200,0.5,0,0.65,150,0.5,0.65,0.75,0.75,0.65,-0.325,0.375,0.375,-0.325,-0.423,0.488,0.488,-0.423,0.364,True,3.0,-2.000,-40.00,False,0.0,0.0,0.0,333,,,,,,

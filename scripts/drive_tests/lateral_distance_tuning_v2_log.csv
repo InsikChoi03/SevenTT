@@ -1,0 +1,2 @@
+timestamp,trial,direction,target_cm,speed,duration_ms,brake_ms,brake_scale,scale_fl,scale_fr,scale_rl,scale_rr,elapsed_s,actual_lateral_cm,error_cm,error_pct,within_5pct,forward_drift_cm,yaw_deg,suggested_next_duration_ms,notes
+2026-07-07T15:02:22,1,right,100.0,0.5,2950,0,0.35,0.7,0.7,0.8,0.7,2.966,97.0,-3.000,-3.00,True,-4.4,0.0,3041,

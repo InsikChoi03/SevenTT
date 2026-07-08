@@ -35,7 +35,8 @@ import rclpy
 from cv_bridge import CvBridge
 from geometry_msgs.msg import PoseStamped, Vector3
 from rclpy.node import Node
-from sensor_msgs.msg import Image
+from rclpy.qos import qos_profile_sensor_data
+from sensor_msgs.msg import Image, Imu
 from std_msgs.msg import Float32MultiArray
 
 # tf2 broadcasting is optional: guard the import so the node runs without tf2_ros.
@@ -138,6 +139,18 @@ class LocalizerNode(Node):
         self.declare_parameter("object_flow_trans", True)      # also apply flow translation (else yaw only)
         self.object_flow_trans = bool(self.get_parameter("object_flow_trans").value)
         self.last_objflow_time = None
+        # IMU (MPU6050 gyro) is the TOP-PRIORITY heading source: the Z gyro rate is low-noise and only
+        # drifts slowly (bias, removed at startup + corrected absolutely by landmarks), so integrating
+        # it gives a far steadier heading than object-flow/LK-VO. When IMU is fresh EVERYTHING else is
+        # suppressed for yaw (object-flow keeps only translation). Landmark correction still trims the
+        # slow residual bias absolutely.
+        self.declare_parameter("use_imu_heading", True)
+        self.use_imu = bool(self.get_parameter("use_imu_heading").value)
+        self.declare_parameter("imu_stale_sec", 0.3)
+        self.imu_stale_sec = float(self.get_parameter("imu_stale_sec").value)
+        self.declare_parameter("imu_gyro_deadband_rad", 0.01)   # ~0.6 deg/s: below = 0 (kill bias walk)
+        self.imu_gyro_deadband = float(self.get_parameter("imu_gyro_deadband_rad").value)
+        self.last_imu_time = None
 
         self.fx = float(self.get_parameter("top_fx").value)
         self.fy = float(self.get_parameter("top_fy").value)
@@ -180,7 +193,10 @@ class LocalizerNode(Node):
             self.get_logger().error("broadcast_tf requested but tf2_ros unavailable; tf disabled")
 
         self.create_subscription(Float32MultiArray, "/base/wheel_odom", self.on_wheel_odom, 10)
-        self.create_subscription(Image, "/camera_top/image_raw", self.on_top_image, 10)
+        if self.use_imu:
+            self.create_subscription(Imu, "/imu/data", self.on_imu, qos_profile_sensor_data)
+        self.create_subscription(Image, "/camera_top/image_raw", self.on_top_image,
+                                 qos_profile_sensor_data)  # match camera BEST_EFFORT
         self.create_subscription(
             Float32MultiArray, "/localization/landmark_correction", self.on_landmark_correction, 10
         )
@@ -250,10 +266,28 @@ class LocalizerNode(Node):
         if not flow_trans_fresh:
             self.x += vxw * dt
             self.y += vyw * dt
-        # Rotation: VO owns it. Only integrate the (open-loop, drift-prone) wheel yaw when VO is
-        # stale/absent — so driving never double-counts rotation (VO adds the full delta elsewhere).
-        if self.last_vo_time is None or (now - self.last_vo_time) > self.vo_stale_sec:
+        # Rotation: IMU > VO > wheel. Only integrate the (open-loop, drift-prone) wheel yaw when BOTH
+        # the IMU and VO are stale/absent — so driving never double-counts rotation.
+        if not self._imu_fresh(now) and (self.last_vo_time is None
+                                         or (now - self.last_vo_time) > self.vo_stale_sec):
             self.theta = wrap_angle(self.theta + w * dt)
+
+    # --------------------------------------------------------------------- IMU heading
+    def _imu_fresh(self, now: float) -> bool:
+        return (self.use_imu and self.last_imu_time is not None
+                and (now - self.last_imu_time) <= self.imu_stale_sec)
+
+    def on_imu(self, msg: Imu) -> None:
+        """TOP-PRIORITY heading: integrate the bias-removed yaw-rate gyro. Low noise + slow bias, so
+        heading stays steady (no object-flow churn / LK-VO hallucination). When this is fresh the
+        object-flow / LK-VO / wheel yaw are all suppressed so nothing double-counts the rotation."""
+        now = self.get_clock().now().nanoseconds * 1e-9
+        wz = float(msg.angular_velocity.z)
+        if self.last_imu_time is not None:
+            dt = now - self.last_imu_time
+            if 0.0 < dt < 0.2 and abs(wz) >= self.imu_gyro_deadband:   # deadband kills stationary walk
+                self.theta = wrap_angle(self.theta + wz * dt)
+        self.last_imu_time = now
 
     # ------------------------------------------------------------- object-flow odometry
     def on_object_odom(self, msg: Float32MultiArray) -> None:
@@ -272,7 +306,8 @@ class LocalizerNode(Node):
         now = self.get_clock().now().nanoseconds * 1e-9
         self.last_objflow_time = now
         self.last_vo_time = now      # object-flow owns rotation -> keep wheel-yaw AND LK-VO suppressed
-        self.theta = wrap_angle(self.theta + dtheta)
+        if not self._imu_fresh(now):  # IMU gyro outranks object-flow for yaw (steadier)
+            self.theta = wrap_angle(self.theta + dtheta)
         if self.object_flow_trans:
             ct, st = math.cos(self.theta), math.sin(self.theta)
             self.x += dfwd * ct - dleft * st
@@ -280,14 +315,13 @@ class LocalizerNode(Node):
 
     # ------------------------------------------------------------- object landmarks
     def on_landmark_correction(self, msg: Float32MultiArray) -> None:
-        """Apply the world model's rigid drift estimate [dx, dy, dtheta, confidence].
+        """Apply an absolute landmark drift estimate [dx, dy, dtheta, confidence].
 
+        Producers include the world model's locked object anchors and the arena wall/floor localizer.
         Translation is nudged gently. HEADING is treated as an ABSOLUTE reference scaled by the
-        fit's confidence (well-spread, low-residual, many re-observed anchors -> apply most of it):
-        YOLO object bearings pin heading with NO drift, so a confident fix should correct promptly
-        rather than crawl. The per-update clamp still caps any single step for stability.
+        fit's confidence, with per-update clamps for stability.
         """
-        if not self.use_object_landmarks:
+        if not (self.use_object_landmarks or self.use_landmark_correction):
             return
         d = msg.data
         if len(d) < 3:
@@ -348,7 +382,9 @@ class LocalizerNode(Node):
         theta_visual = self._visual_yaw_delta(gray)
         if theta_visual is not None and not flow_fresh:
             self.last_vo_time = now                          # LK-VO alive -> wheel yaw stays suppressed
-            if abs(theta_visual) >= self.vo_deadband:        # deadband out stationary jitter (drift)
+            # IMU gyro outranks LK-VO for yaw (LK hallucinates rotation from vibration); apply LK yaw
+            # only when the IMU is stale/absent.
+            if abs(theta_visual) >= self.vo_deadband and not self._imu_fresh(now):
                 self.theta = wrap_angle(self.theta + theta_visual)
 
         # Absolute-correction hook (approximate; see _detect_landmarks docstring). Skipped
