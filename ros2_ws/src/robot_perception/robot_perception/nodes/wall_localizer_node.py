@@ -9,13 +9,19 @@ y=+/-H; the offset is the position error and the segment's tilt is the heading e
 heading gives a good prior, so we only accept segments that already fall near an expected wall
 (wall_gate_m) and are near axis-aligned — random edges are rejected.
 
-Publishes: /localization/landmark_correction  Float32MultiArray [dx, dy, dtheta, confidence]
-(localizer already consumes this and blends a small, clamped fraction — gentle, non-jumpy).
+Publishes:
+  /localization/landmark_correction  Float32MultiArray [dx, dy, dtheta, confidence]
+  /localization/wall_segments        Float32MultiArray [x0,y0,x1,y1, ...] accepted wall segments
+  /localization/wall_segments_image  Float32MultiArray [x0,y0,x1,y1, ...] same accepted segments in top-image pixels
+  /localization/wall_segmentation_mask Image mono8 debug mask from the learned model
+(localizer already consumes correction and blends a small, clamped fraction — gentle, non-jumpy).
 """
 from __future__ import annotations
 
 import math
 import os
+import time
+from typing import Any
 
 import numpy as np
 import rclpy
@@ -31,6 +37,13 @@ try:
     _CV = True
 except Exception:  # noqa: BLE001
     _CV = False
+
+try:
+    from ultralytics import YOLO
+    _YOLO = True
+except Exception:  # noqa: BLE001
+    YOLO = None  # type: ignore[assignment, misc]
+    _YOLO = False
 
 
 def wrap(a: float) -> float:
@@ -75,6 +88,21 @@ class WallLocalizerNode(Node):
         self.declare_parameter("correction_conf", 0.5)       # published confidence (localizer scales it)
         self.declare_parameter("max_pos_resid_m", 0.6)       # reject a match with a huge offset (spurious)
         self.declare_parameter("resid_mad_gate_m", 0.08)     # robust residual trimming floor
+        self.declare_parameter("min_wall_matches", 2)        # require agreement, not one lucky table edge
+        # Optional learned front-end. Segmentation only proposes wall/floor boundary candidates;
+        # final accept/reject remains the 4x4 arena geometry gate below.
+        self.declare_parameter("use_segmentation_mask", False)
+        self.declare_parameter("segmentation_model_path", "")
+        self.declare_parameter("segmentation_input_size", 640)
+        self.declare_parameter("segmentation_min_confidence", 0.35)
+        self.declare_parameter("segmentation_run_rate_hz", 1.0)
+        self.declare_parameter("segmentation_hough_thresh", 25)
+        self.declare_parameter("segmentation_morph_kernel", 5)
+        self.declare_parameter("segmentation_fallback_to_edges", True)
+        self.declare_parameter("publish_segmentation_mask", True)
+        self.declare_parameter("segmentation_use_mask_fit", True)
+        self.declare_parameter("segmentation_min_component_area", 120)
+        self.declare_parameter("segmentation_max_components", 6)
 
         self.fx = float(self.get_parameter("top_fx").value)
         self.fy = float(self.get_parameter("top_fy").value)
@@ -105,6 +133,25 @@ class WallLocalizerNode(Node):
         self.corr_conf = float(self.get_parameter("correction_conf").value)
         self.max_resid = float(self.get_parameter("max_pos_resid_m").value)
         self.resid_mad_gate = float(self.get_parameter("resid_mad_gate_m").value)
+        self.min_wall_matches = int(self.get_parameter("min_wall_matches").value)
+        self.use_segmentation_mask = bool(self.get_parameter("use_segmentation_mask").value)
+        self.segmentation_model_path = str(self.get_parameter("segmentation_model_path").value)
+        self.segmentation_input_size = int(self.get_parameter("segmentation_input_size").value)
+        self.segmentation_min_conf = float(self.get_parameter("segmentation_min_confidence").value)
+        self.segmentation_run_interval = 1.0 / max(
+            0.1, float(self.get_parameter("segmentation_run_rate_hz").value)
+        )
+        self.segmentation_hough_thresh = int(self.get_parameter("segmentation_hough_thresh").value)
+        self.segmentation_morph_kernel = int(self.get_parameter("segmentation_morph_kernel").value)
+        self.segmentation_fallback_to_edges = bool(
+            self.get_parameter("segmentation_fallback_to_edges").value
+        )
+        self.publish_segmentation_mask = bool(self.get_parameter("publish_segmentation_mask").value)
+        self.segmentation_use_mask_fit = bool(self.get_parameter("segmentation_use_mask_fit").value)
+        self.segmentation_min_component_area = int(
+            self.get_parameter("segmentation_min_component_area").value
+        )
+        self.segmentation_max_components = int(self.get_parameter("segmentation_max_components").value)
 
         self._K = np.array([[self.fx, 0, self.cx], [0, self.fy, self.cy], [0, 0, 1]], np.float64)
         self._D = np.array(d[:4], np.float64).reshape(4, 1)
@@ -118,15 +165,26 @@ class WallLocalizerNode(Node):
         self._bridge = CvBridge() if _CV else None
         self._pose = None       # (x, y, theta) from /localization/pose
         self._img = None
+        self._seg_model: Any | None = None
+        self._last_seg_time = 0.0
+        self._load_segmentation_model()
 
         self.create_subscription(PoseStamped, "/localization/pose", self.on_pose, 10)
         self.create_subscription(Image, "/camera_top/image_raw", self.on_img, qos_profile_sensor_data)
         self.pub = self.create_publisher(Float32MultiArray, "/localization/landmark_correction", 10)
+        self.pub_segments = self.create_publisher(Float32MultiArray, "/localization/wall_segments", 10)
+        self.pub_segments_image = self.create_publisher(
+            Float32MultiArray, "/localization/wall_segments_image", 10
+        )
+        self.pub_segmentation_mask = self.create_publisher(
+            Image, "/localization/wall_segmentation_mask", 10
+        )
 
         ok = _CV and self._Hmat is not None
         self.get_logger().info(
             f"wall_localizer {'ready' if ok else 'IDLE (cv2/homography missing)'} "
-            f"field=+/-{self.H}m gate={self.gate}m rate={self.get_parameter('rate_hz').value}Hz"
+            f"field=+/-{self.H}m gate={self.gate}m rate={self.get_parameter('rate_hz').value}Hz "
+            f"seg={'on' if self._seg_model is not None else 'off'}"
         )
         if ok:
             self.timer = self.create_timer(1.0 / max(0.5, float(self.get_parameter("rate_hz").value)),
@@ -162,6 +220,154 @@ class WallLocalizerNode(Node):
         x1, y1, x2, y2 = self._robot_rect_px(out.shape)
         fill = int(np.median(out))
         out[max(0, y1):min(h, y2), max(0, x1):min(w, x2)] = fill
+        return out
+
+    def _load_segmentation_model(self) -> None:
+        if not self.use_segmentation_mask:
+            return
+        if not _YOLO or YOLO is None:
+            self.get_logger().warn(
+                "segmentation requested but ultralytics is unavailable; using edge fallback"
+            )
+            return
+        if not self.segmentation_model_path or not os.path.exists(self.segmentation_model_path):
+            self.get_logger().warn(
+                f"segmentation model missing: '{self.segmentation_model_path}'; using edge fallback"
+            )
+            return
+        try:
+            self._seg_model = YOLO(self.segmentation_model_path)
+            names = getattr(self._seg_model, "names", None)
+            self.get_logger().info(
+                f"wall segmentation loaded from '{self.segmentation_model_path}' classes={names}"
+            )
+        except Exception as exc:  # noqa: BLE001
+            self._seg_model = None
+            self.get_logger().warn(
+                f"failed to load wall segmentation model '{self.segmentation_model_path}': {exc}; "
+                "using edge fallback"
+            )
+
+    def _segmentation_candidates(self, frame: np.ndarray) -> list[tuple[int, int, int, int]]:
+        """Run wall/floor-boundary segmentation and extract image-space line candidates."""
+        if self._seg_model is None:
+            return []
+        now = time.monotonic()
+        if now - self._last_seg_time < self.segmentation_run_interval:
+            return []
+        self._last_seg_time = now
+
+        try:
+            results = self._seg_model.predict(
+                frame,
+                conf=self.segmentation_min_conf,
+                imgsz=self.segmentation_input_size,
+                verbose=False,
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.get_logger().warn(f"wall segmentation inference failed: {exc}", throttle_duration_sec=5.0)
+            return []
+
+        if not results:
+            return []
+        masks = getattr(results[0], "masks", None)
+        if masks is None or getattr(masks, "data", None) is None:
+            return []
+
+        h, w = frame.shape[:2]
+        try:
+            arr = masks.data.detach().cpu().numpy()
+        except Exception:  # noqa: BLE001
+            arr = masks.data.cpu().numpy()
+        if arr.size == 0:
+            return []
+
+        mask = (np.max(arr, axis=0) > 0.5).astype(np.uint8) * 255
+        if mask.shape[:2] != (h, w):
+            mask = cv2.resize(mask, (w, h), interpolation=cv2.INTER_NEAREST)
+
+        x1, y1, x2, y2 = self._robot_rect_px((h, w))
+        mask[max(0, y1):min(h, y2), max(0, x1):min(w, x2)] = 0
+
+        k = max(3, self.segmentation_morph_kernel | 1)
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+        if self.publish_segmentation_mask and self._bridge is not None:
+            try:
+                self.pub_segmentation_mask.publish(self._bridge.cv2_to_imgmsg(mask, encoding="mono8"))
+            except Exception:  # noqa: BLE001 - debug overlay must never affect localization
+                pass
+        candidates: list[tuple[int, int, int, int]] = []
+        if self.segmentation_use_mask_fit:
+            candidates.extend(self._mask_centerline_candidates(mask))
+        if not candidates:
+            # Fallback inside the segmentation path: vote on the filled mask itself, not on the
+            # mask gradient. Gradient Hough tends to lock onto the stripe edge, away from the
+            # learned boundary; filled-mask Hough stays closer to the labelled band.
+            lines = cv2.HoughLinesP(
+                mask,
+                1,
+                np.pi / 180.0,
+                threshold=self.segmentation_hough_thresh,
+                minLineLength=self.h_len,
+                maxLineGap=self.h_gap,
+            )
+            if lines is not None:
+                candidates.extend(tuple(int(v) for v in ln) for ln in lines[:, 0, :])
+        self.get_logger().debug(
+            f"wall segmentation candidates={len(candidates)} mask_px={int(np.count_nonzero(mask))}",
+            throttle_duration_sec=1.0,
+        )
+        return candidates
+
+    def _mask_centerline_candidates(self, mask: np.ndarray) -> list[tuple[int, int, int, int]]:
+        """Fit centerline segments through connected mask blobs.
+
+        The model is trained to output a thin wall/floor-boundary band. Using the mask gradient
+        finds the band edges; fitting the foreground pixels instead gives a segment through the
+        middle of the learned boundary, which is what the ground projection should use.
+        """
+        num, labels, stats, _ = cv2.connectedComponentsWithStats((mask > 0).astype(np.uint8), 8)
+        comps = []
+        for idx in range(1, num):
+            area = int(stats[idx, cv2.CC_STAT_AREA])
+            if area >= self.segmentation_min_component_area:
+                comps.append((area, idx))
+        comps.sort(reverse=True)
+
+        h, w = mask.shape[:2]
+        out: list[tuple[int, int, int, int]] = []
+        for _, idx in comps[:max(1, self.segmentation_max_components)]:
+            ys, xs = np.nonzero(labels == idx)
+            if xs.size < 8:
+                continue
+            pts = np.column_stack([xs.astype(np.float64), ys.astype(np.float64)])
+            mean = pts.mean(axis=0)
+            centered = pts - mean
+            cov = np.cov(centered, rowvar=False)
+            try:
+                vals, vecs = np.linalg.eigh(cov)
+            except np.linalg.LinAlgError:
+                continue
+            axis = vecs[:, int(np.argmax(vals))]
+            axis_norm = float(np.linalg.norm(axis))
+            if axis_norm < 1e-9:
+                continue
+            axis = axis / axis_norm
+            proj = centered @ axis
+            # Trim ragged ends and isolated pixels from the fit.
+            t0, t1 = np.percentile(proj, [4.0, 96.0])
+            p0 = mean + axis * t0
+            p1 = mean + axis * t1
+            length = float(np.linalg.norm(p1 - p0))
+            if length < self.h_len:
+                continue
+            x0 = int(round(min(max(p0[0], 0.0), w - 1.0)))
+            y0 = int(round(min(max(p0[1], 0.0), h - 1.0)))
+            x1 = int(round(min(max(p1[0], 0.0), w - 1.0)))
+            y1 = int(round(min(max(p1[1], 0.0), h - 1.0)))
+            out.append((x0, y0, x1, y1))
         return out
 
     def _arena_color_mask(self, frame: np.ndarray) -> np.ndarray | None:
@@ -206,6 +412,10 @@ class WallLocalizerNode(Node):
         The real arena has wood-tone walls and floor. We combine texture edges with an adaptive
         Lab-color arena mask, then let metric wall gating reject clutter after ground projection.
         """
+        seg_candidates = self._segmentation_candidates(frame)
+        if seg_candidates and not self.segmentation_fallback_to_edges:
+            return seg_candidates
+
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         gray = self._mask_robot_body(gray)
         if self.clahe_clip > 0.0:
@@ -213,7 +423,7 @@ class WallLocalizerNode(Node):
             gray = clahe.apply(gray)
         gray = cv2.GaussianBlur(gray, (5, 5), 0)
 
-        candidates: list[tuple[int, int, int, int]] = []
+        candidates: list[tuple[int, int, int, int]] = list(seg_candidates)
         edges = cv2.Canny(gray, self.canny[0], self.canny[1], apertureSize=3)
         lines = cv2.HoughLinesP(edges, 1, np.pi / 180.0, threshold=self.h_thresh,
                                 minLineLength=self.h_len, maxLineGap=self.h_gap)
@@ -276,6 +486,7 @@ class WallLocalizerNode(Node):
         dx_list: list[float] = []
         dy_list: list[float] = []
         dth_list: list[float] = []
+        matched_segments: list[tuple[str, float, float, float, float, float, float, float, float, float]] = []
         for ln in lines:
             base = self._to_base(np.array([[ln[0], ln[1]], [ln[2], ln[3]]], np.float64))
             if base is None:
@@ -302,6 +513,9 @@ class WallLocalizerNode(Node):
                     resid = sgn * self.H - mx           # push robot so wall sits at sgn*H
                     if abs(resid) <= self.max_resid:
                         dx_list.append(resid)
+                        matched_segments.append(
+                            ("x", resid, fx0, fy0, fx1, fy1, float(ln[0]), float(ln[1]), float(ln[2]), float(ln[3]))
+                        )
                         # heading: wall should be exactly vertical; tilt = -heading error
                         dth_list.append(-wrap(seg_ang - math.copysign(math.pi / 2.0, seg_ang)))
                 # y = sgn*H (horizontal wall): segment ~horizontal, midpoint y near sgn*H
@@ -311,6 +525,9 @@ class WallLocalizerNode(Node):
                     resid = sgn * self.H - my
                     if abs(resid) <= self.max_resid:
                         dy_list.append(resid)
+                        matched_segments.append(
+                            ("y", resid, fx0, fy0, fx1, fy1, float(ln[0]), float(ln[1]), float(ln[2]), float(ln[3]))
+                        )
                         dth_list.append(-wrap(seg_ang - (0.0 if abs(wrap(seg_ang)) < math.pi / 2 else math.pi)))
 
         if not dx_list and not dy_list:
@@ -318,8 +535,27 @@ class WallLocalizerNode(Node):
         dx, nx, mad_x = self._robust_median(dx_list, self.resid_mad_gate)
         dy, ny, mad_y = self._robust_median(dy_list, self.resid_mad_gate)
         dth, nth, mad_th = self._robust_median(dth_list, math.radians(3.0))
-        # confidence scales with agreement count and drops when residuals are scattered.
         n = nx + ny
+        if n < max(1, self.min_wall_matches):
+            return
+
+        seg_msg = Float32MultiArray()
+        seg_img_msg = Float32MultiArray()
+        x_gate = max(self.resid_mad_gate, 2.5 * mad_x)
+        y_gate = max(self.resid_mad_gate, 2.5 * mad_y)
+        for axis, resid, x0, y0, x1, y1, px0, py0, px1, py1 in matched_segments:
+            if axis == "x" and nx > 0 and abs(resid - dx) <= x_gate:
+                seg_msg.data.extend([float(x0), float(y0), float(x1), float(y1)])
+                seg_img_msg.data.extend([float(px0), float(py0), float(px1), float(py1)])
+            elif axis == "y" and ny > 0 and abs(resid - dy) <= y_gate:
+                seg_msg.data.extend([float(x0), float(y0), float(x1), float(y1)])
+                seg_img_msg.data.extend([float(px0), float(py0), float(px1), float(py1)])
+            if len(seg_msg.data) >= 96:
+                break
+        self.pub_segments.publish(seg_msg)
+        self.pub_segments_image.publish(seg_img_msg)
+
+        # confidence scales with agreement count and drops when residuals are scattered.
         scatter = max(mad_x, mad_y)
         scatter_penalty = max(0.35, 1.0 - scatter / max(0.01, self.gate))
         conf = min(1.0, self.corr_conf * (0.5 + 0.1 * n) * scatter_penalty)

@@ -1,0 +1,4 @@
+time,mode,direction,speed,duration_ms,odom_wheels,odom_value,actual_value,scale_actual_over_odom,unit
+2026-07-09 20:45:24,open-loop-calib,forward,0.26,900,"1,2,3",0.09225156418242932,,,m
+2026-07-09 20:45:36,open-loop-calib,forward,0.26,900,"1,2,3",0.09304836824581073,,,m
+2026-07-09 20:45:47,open-loop-calib,forward,0.26,900,"1,2,3",0.09515901194497055,,,m

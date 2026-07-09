@@ -37,6 +37,15 @@ localizer_node:
     object_flow_stale_sec: 0.5            # flow가 이보다 오래되면 LK VO 폴백 기동
     object_flow_trans: false             # flow 병진 OFF: 정지 중 프레임당 5~8cm 스퓨리어스로 위치 진동시킴.
                                           # 회전(dtheta)은 계속 씀. 병진은 랜드마크 절대보정(정확한 지도)에 맡김
+    # 엔코더 odom: 현재 FL(앞왼쪽) 엔코더가 불량/초음파 핀과 충돌하므로 FR/RL/RR 3개만 사용한다.
+    # FL 엔코더 복구 후 [true, true, true, true]로 되돌려 4륜 평균을 쓴다.
+    wheel_odom_enabled_wheels: [false, true, true, true]
+    wheel_odom_deadband_mps: 0.005
+    stationary_wheel_eps_mps: 0.008
+    stationary_cmd_eps: 0.03
+    stationary_required_sec: 0.8
+    suppress_object_flow_when_stationary: true
+    use_imu_heading: true                 # IMU heading 보정 ON: 벽 보정 OFF 조건 비교 테스트
     fisheye_model: true
     # Intrinsics SCALED for the 1280x960 GPU-downscaled wide stream (was 1640x1232). fx,cx x0.780488
     # (1280/1640); fy,cy x0.779221 (960/1232). dist_coeffs are ray-normalized -> resolution-invariant.
@@ -75,14 +84,26 @@ wall_localizer_node:
     color_val_max: 235
     color_morph_kernel: 9
     color_hough_thresh: 35
-    min_ground_len_m: 0.35
-    wall_gate_m: 0.45
-    endpoint_gate_scale: 1.15
-    axis_tol_deg: 18.0
-    max_range_m: 2.8
-    correction_conf: 0.45
+    min_ground_len_m: 0.55
+    wall_gate_m: 0.22
+    endpoint_gate_scale: 0.85
+    axis_tol_deg: 10.0
+    max_range_m: 2.3
+    correction_conf: 0.35
     max_pos_resid_m: 0.55
-    resid_mad_gate_m: 0.08
+    resid_mad_gate_m: 0.05
+    min_wall_matches: 2
+    use_segmentation_mask: true
+    segmentation_model_path: "/home/seventt/seventt/workspace/models/wall_floor_boundary_seg_v1.pt"
+    segmentation_input_size: 640
+    segmentation_min_confidence: 0.30
+    segmentation_run_rate_hz: 1.0
+    segmentation_hough_thresh: 22
+    segmentation_morph_kernel: 5
+    segmentation_fallback_to_edges: false
+    segmentation_use_mask_fit: true
+    segmentation_min_component_area: 120
+    segmentation_max_components: 6
 
 yolo_detector_node:
   ros__parameters:
@@ -353,6 +374,11 @@ mcu_bridge_base_node:
   ros__parameters:
     port: "/dev/ttyUSB0"                  # base = CH340 (arm ACM is NOT launched)
     baud: 115200
+    publish_encoder_odom: true            # <ODOM,...> 실제 엔코더 기반 휠속도만 odom으로 사용
+    publish_heartbeat_as_odom: false      # <HB,...>는 명령 echo라 pose drift 원인이므로 기본 차단
+    odom_deadband_mps: 0.005
+    odom_scale: 10.544542                       # 실제거리/엔코더거리. open-loop-calib 결과로 갱신
+    odom_wheel_scales: [1.0, 1.0, 1.0, 1.0]
 
 recognition_viz_node:
   ros__parameters:
@@ -361,6 +387,7 @@ recognition_viz_node:
     auto_extent: false                    # 매 프레임 자동 리사이즈 끔(맵 크기 계속 바뀌어 어지러움 방지)
     map_rotate_180: true                  # 맵을 180° 돌려 광각 피드와 같은 방향으로(보기 편하게)
     canvas_px: 800
+    map_margin_px: 48                     # 4×4m 경기장 테두리가 화면 가장자리에 붙지 않도록 안쪽 여백 확보
     snapshot_interval_sec: 0.0            # 0=스냅샷/최종PNG 저장 안 함(live.png만 유지, 누적방지)
     show_window: false                    # 헤드리스/SSH: cv2 창 대신 live.png 만 기록 (창 열면 Qt xcb 크래시)
     show_camera_panels: true              # YOLO-annotated wide + body feeds beside the map

@@ -37,7 +37,7 @@ from geometry_msgs.msg import PoseStamped, Vector3
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import Image, Imu
-from std_msgs.msg import Float32MultiArray
+from std_msgs.msg import Bool, Float32MultiArray
 
 # tf2 broadcasting is optional: guard the import so the node runs without tf2_ros.
 try:
@@ -103,6 +103,43 @@ class LocalizerNode(Node):
         self.lx = float(self.get_parameter("lx").value)
         self.ly = float(self.get_parameter("ly").value)
         self.k = self.lx + self.ly
+
+        # Wheel odometry can run from any 3+ valid mecanum wheel encoders. This keeps localization
+        # usable while one encoder is known-bad (currently FL on the base).
+        self.declare_parameter("wheel_odom_enabled_wheels", [True, True, True, True])
+        self.declare_parameter("wheel_odom_deadband_mps", 0.005)
+        self.declare_parameter("wheel_odom_max_dt_sec", 0.4)
+        self.declare_parameter("stationary_wheel_eps_mps", 0.008)
+        self.declare_parameter("stationary_cmd_eps", 0.03)
+        self.declare_parameter("stationary_cmd_stale_sec", 0.7)
+        self.declare_parameter("stationary_required_sec", 0.8)
+        self.declare_parameter("suppress_object_flow_when_stationary", True)
+        enabled = [bool(v) for v in self.get_parameter("wheel_odom_enabled_wheels").value]
+        self.wheel_odom_enabled = enabled if len(enabled) == 4 else [True, True, True, True]
+        self.wheel_odom_deadband = float(self.get_parameter("wheel_odom_deadband_mps").value)
+        self.wheel_odom_max_dt = float(self.get_parameter("wheel_odom_max_dt_sec").value)
+        self.stationary_wheel_eps = float(self.get_parameter("stationary_wheel_eps_mps").value)
+        self.stationary_cmd_eps = float(self.get_parameter("stationary_cmd_eps").value)
+        self.stationary_cmd_stale_sec = float(self.get_parameter("stationary_cmd_stale_sec").value)
+        self.stationary_required_sec = float(self.get_parameter("stationary_required_sec").value)
+        self.suppress_object_flow_when_stationary = bool(
+            self.get_parameter("suppress_object_flow_when_stationary").value
+        )
+        self._wheel_rows_all = np.array(
+            [
+                [1.0, -1.0, -self.k],  # FL
+                [1.0, 1.0, self.k],    # FR
+                [1.0, 1.0, -self.k],   # RL
+                [1.0, -1.0, self.k],   # RR
+            ],
+            dtype=np.float64,
+        )
+        self._wheel_mask = np.array(self.wheel_odom_enabled, dtype=bool)
+        self._wheel_rows = self._wheel_rows_all[self._wheel_mask]
+        if int(self._wheel_mask.sum()) < 3:
+            self.get_logger().error(
+                "wheel_odom_enabled_wheels needs at least 3 true values for mecanum odometry"
+            )
 
         self.x = float(self.get_parameter("initial_x").value)
         self.y = float(self.get_parameter("initial_y").value)
@@ -179,6 +216,10 @@ class LocalizerNode(Node):
 
         # Wheel-odometry integration state.
         self.last_odom_time: Optional[float] = None  # wall-clock seconds of last wheel msg
+        self.last_wheel_cmd_time: Optional[float] = None
+        self.last_wheel_cmd = [0.0, 0.0, 0.0, 0.0]
+        self.stationary_since: Optional[float] = None
+        self.is_stationary = False
 
         # Visual-odometry state.
         self.bridge = CvBridge()
@@ -193,6 +234,7 @@ class LocalizerNode(Node):
             self.get_logger().error("broadcast_tf requested but tf2_ros unavailable; tf disabled")
 
         self.create_subscription(Float32MultiArray, "/base/wheel_odom", self.on_wheel_odom, 10)
+        self.create_subscription(Float32MultiArray, "/base/wheel_speeds", self.on_wheel_cmd, 10)
         if self.use_imu:
             self.create_subscription(Imu, "/imu/data", self.on_imu, qos_profile_sensor_data)
         self.create_subscription(Image, "/camera_top/image_raw", self.on_top_image,
@@ -204,17 +246,31 @@ class LocalizerNode(Node):
             Float32MultiArray, "/localization/object_odom", self.on_object_odom, 10
         )
         self.pub = self.create_publisher(PoseStamped, "/localization/pose", 10)
+        self.pub_stationary = self.create_publisher(Bool, "/localization/is_stationary", 10)
         self.timer = self.create_timer(1.0 / rate, self.publish_pose)
 
         self.get_logger().info(
             f"localizer start=({self.x:.2f},{self.y:.2f},{self.theta:.2f}) "
             f"lx={self.lx} ly={self.ly} vo={self.use_vo} landmark={self.use_landmark_correction} "
             f"obj_landmarks={self.use_object_landmarks} tf={self.tf_broadcaster is not None} "
+            f"wheel_odom_enabled={self.wheel_odom_enabled} "
             f"intrinsics={'set' if self.have_intrinsics else 'unset'} "
             f"fisheye={self.use_fisheye} rate={rate}Hz"
         )
 
     # ------------------------------------------------------------------ wheel odom
+    def on_wheel_cmd(self, msg: Float32MultiArray) -> None:
+        if len(msg.data) >= 4:
+            now = self.get_clock().now().nanoseconds * 1e-9
+            self.last_wheel_cmd = [float(v) for v in msg.data[:4]]
+            self.last_wheel_cmd_time = now
+            odom_stale = (
+                self.last_odom_time is None
+                or (now - self.last_odom_time) > self.stationary_cmd_stale_sec
+            )
+            if odom_stale:
+                self._update_stationary(now, np.zeros(4, dtype=np.float64))
+
     def on_wheel_odom(self, msg: Float32MultiArray) -> None:
         """Integrate mecanum dead reckoning in the field frame."""
         if len(msg.data) < 4:
@@ -224,27 +280,28 @@ class LocalizerNode(Node):
             return
 
         now = self.get_clock().now().nanoseconds * 1e-9
+        wheels = np.array([float(msg.data[i]) for i in range(4)], dtype=np.float64)
+        if self.wheel_odom_deadband > 0.0:
+            wheels[np.abs(wheels) < self.wheel_odom_deadband] = 0.0
+        self._update_stationary(now, wheels)
+
         if self.last_odom_time is None:
             # First sample only establishes a timestamp; no integration yet.
             self.last_odom_time = now
             return
         dt = now - self.last_odom_time
         self.last_odom_time = now
-        # Clamp dt to a sane window so a stale/jumpy clock cannot teleport the pose. Upper bound is
-        # 2x the 5 Hz HB nominal period (0.4 s), NOT 0.2 s: the base echoes HB at ~0.2 s, so a 0.2 s
-        # clamp equal to the period systematically discards the above-nominal half of normal serial
-        # jitter (a 0.25 s gap -> only 0.2 s integrated), under-counting distance. 0.4 s still blocks
-        # a real stall/clock jump while passing ordinary jitter.
-        dt = max(0.0, min(0.4, dt))
+        # Clamp dt to a sane window so a stale/jumpy clock cannot teleport the pose.
+        dt = max(0.0, min(self.wheel_odom_max_dt, dt))
         if dt <= 0.0:
             return
 
-        fl, fr, rl, rr = (float(msg.data[i]) for i in range(4))
+        if int(self._wheel_mask.sum()) < 3:
+            return
 
-        # Mecanum forward kinematics (inverse of base_controller IK, k = lx + ly).
-        vx = (fl + fr + rl + rr) / 4.0
-        vy = (-fl + fr + rl - rr) / 4.0
-        w = (-fl + fr - rl + rr) / (4.0 * self.k)
+        # Mecanum forward kinematics. With all 4 wheels this is the exact inverse of
+        # base_controller IK; with one disabled encoder it becomes a 3-equation least-squares solve.
+        vx, vy, w = np.linalg.lstsq(self._wheel_rows, wheels[self._wheel_mask], rcond=None)[0]
 
         # Body velocity -> field velocity using the current heading.
         ct, st = math.cos(self.theta), math.sin(self.theta)
@@ -271,6 +328,29 @@ class LocalizerNode(Node):
         if not self._imu_fresh(now) and (self.last_vo_time is None
                                          or (now - self.last_vo_time) > self.vo_stale_sec):
             self.theta = wrap_angle(self.theta + w * dt)
+
+    def _update_stationary(self, now: float, wheels: np.ndarray) -> None:
+        enabled_wheels = wheels[self._wheel_mask] if int(self._wheel_mask.sum()) else wheels
+        wheel_still = bool(
+            enabled_wheels.size == 0
+            or np.max(np.abs(enabled_wheels)) <= self.stationary_wheel_eps
+        )
+        if self.last_wheel_cmd_time is None:
+            cmd_still = True
+        else:
+            cmd_stale = (now - self.last_wheel_cmd_time) > self.stationary_cmd_stale_sec
+            cmd_still = (
+                cmd_stale
+                or max(abs(v) for v in self.last_wheel_cmd) <= self.stationary_cmd_eps
+            )
+        currently_still = wheel_still and cmd_still
+        if currently_still:
+            if self.stationary_since is None:
+                self.stationary_since = now
+            self.is_stationary = (now - self.stationary_since) >= self.stationary_required_sec
+        else:
+            self.stationary_since = None
+            self.is_stationary = False
 
     # --------------------------------------------------------------------- IMU heading
     def _imu_fresh(self, now: float) -> bool:
@@ -304,6 +384,10 @@ class LocalizerNode(Node):
         if conf < self.object_flow_min_conf:
             return
         now = self.get_clock().now().nanoseconds * 1e-9
+        if self.suppress_object_flow_when_stationary and self.is_stationary:
+            self.last_objflow_time = now
+            self.last_vo_time = now
+            return
         self.last_objflow_time = now
         self.last_vo_time = now      # object-flow owns rotation -> keep wheel-yaw AND LK-VO suppressed
         if not self._imu_fresh(now):  # IMU gyro outranks object-flow for yaw (steadier)
@@ -523,6 +607,9 @@ class LocalizerNode(Node):
         msg.pose.orientation.z = qz
         msg.pose.orientation.w = qw
         self.pub.publish(msg)
+        stationary = Bool()
+        stationary.data = bool(self.is_stationary)
+        self.pub_stationary.publish(stationary)
 
         if self.tf_broadcaster is not None:
             tf = TransformStamped()

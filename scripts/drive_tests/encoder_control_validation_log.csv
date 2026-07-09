@@ -1,0 +1,5 @@
+time,stage,trial,direction,speed,duration_ms,target,timeout_sec,odom_wheels,stop_reason,odom_value,actual_value,scale_actual_over_odom,unit
+2026-07-09 21:44:26,repeat-open-loop,1,forward,0.3,1000,0.3,5.0,"1,2,3",duration,0.11563994111375009,0.35,3.0266359237914164,m
+2026-07-09 21:44:46,repeat-open-loop,2,forward,0.3,1000,0.3,5.0,"1,2,3",duration,0.08719378194277494,0.348,3.991110286148518,m
+2026-07-09 21:45:00,repeat-open-loop,3,forward,0.3,1000,0.3,5.0,"1,2,3",duration,0.09892496771898496,0.378,3.8210778200482243,m
+2026-07-09 21:46:17,closed-loop-distance,1,forward,0.3,,0.3,5.0,"1,2,3",target,0.3405916047794323,1.05,3.082871055145302,m

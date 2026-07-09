@@ -47,11 +47,14 @@ def make_handler(root: Path, fps: float):
             self.end_headers()
 
         def do_GET(self) -> None:
-            path = urlparse(self.path).path
+            parsed = urlparse(self.path)
+            path = parsed.path
             if path in ("/", "/index.html"):
                 self._index()
             elif path == "/stream.mjpg":
                 self._stream()
+            elif path == "/frame.png":
+                self._frame()
             elif path == "/latest":
                 self._latest()
             else:
@@ -73,13 +76,39 @@ def make_handler(root: Path, fps: float):
     strong { white-space: nowrap; }
     #latest { color: #9fe7ff; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     main { width: 100%; height: calc(100% - 44px); display: grid; place-items: center; }
-    img { max-width: 100%; max-height: 100%; object-fit: contain; }
+    main { background: #080808; }
+    canvas { max-width: 100%; max-height: 100%; width: auto; height: auto; }
   </style>
 </head>
 <body>
   <header><strong>Field Live Stream</strong><span id="latest">connecting...</span></header>
-  <main><img src="/stream.mjpg" alt="field live stream"></main>
+  <main><canvas id="frame" width="1332" height="800"></canvas></main>
   <script>
+    const canvas = document.getElementById('frame');
+    const ctx = canvas.getContext('2d');
+    let busy = false;
+
+    async function refreshFrame() {
+      if (busy) return;
+      busy = true;
+      try {
+        const r = await fetch('/frame.png?t=' + Date.now(), {cache: 'no-store'});
+        if (!r.ok) return;
+        const blob = await r.blob();
+        const bmp = await createImageBitmap(blob);
+        if (canvas.width !== bmp.width || canvas.height !== bmp.height) {
+          canvas.width = bmp.width;
+          canvas.height = bmp.height;
+        }
+        ctx.drawImage(bmp, 0, 0);
+        bmp.close();
+      } catch (e) {
+        // Keep the previous frame visible.
+      } finally {
+        busy = false;
+      }
+    }
+
     async function tick() {
       try {
         const r = await fetch('/latest?t=' + Date.now(), {cache: 'no-store'});
@@ -89,7 +118,9 @@ def make_handler(root: Path, fps: float):
       }
     }
     tick();
+    refreshFrame();
     setInterval(tick, 1000);
+    setInterval(refreshFrame, 200);
   </script>
 </body>
 </html>
@@ -116,6 +147,27 @@ def make_handler(root: Path, fps: float):
             self.end_headers()
             self.wfile.write(data)
 
+        def _frame(self) -> None:
+            live = newest_live(root)
+            if live is None:
+                self.send_response(404)
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                return
+            try:
+                data = live.read_bytes()
+            except OSError:
+                self.send_response(503)
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "image/png")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
         def _stream(self) -> None:
             self.send_response(200)
             self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
@@ -123,17 +175,19 @@ def make_handler(root: Path, fps: float):
             self.end_headers()
 
             last_data = None
+            last_content_type = "image/png"
             while True:
                 live = newest_live(root)
                 if live is not None:
                     try:
                         last_data = live.read_bytes()
+                        last_content_type = "image/png"
                     except OSError:
                         pass
                 if last_data:
                     try:
                         self.wfile.write(b"--frame\r\n")
-                        self.wfile.write(b"Content-Type: image/png\r\n")
+                        self.wfile.write(f"Content-Type: {last_content_type}\r\n".encode("ascii"))
                         self.wfile.write(f"Content-Length: {len(last_data)}\r\n\r\n".encode("ascii"))
                         self.wfile.write(last_data)
                         self.wfile.write(b"\r\n")

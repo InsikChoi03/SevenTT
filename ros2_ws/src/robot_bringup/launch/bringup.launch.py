@@ -24,6 +24,7 @@ from launch_ros.actions import Node
 def generate_launch_description() -> LaunchDescription:
     bringup_share = get_package_share_directory("robot_bringup")
     launch_dir = os.path.join(bringup_share, "launch")
+    params = os.path.join(bringup_share, "config", "perception.yaml")
 
     with_control = LaunchConfiguration("with_control")
 
@@ -41,17 +42,17 @@ def generate_launch_description() -> LaunchDescription:
         condition=IfCondition(with_control),
         actions=[
             Node(package="robot_control", executable="go_to_goal_node",
-                 name="go_to_goal_node", output="screen"),
+                 name="go_to_goal_node", parameters=[params], output="screen"),
             Node(package="robot_control", executable="base_controller_node",
-                 name="base_controller_node", output="screen"),
+                 name="base_controller_node", parameters=[params], output="screen"),
             Node(package="robot_control", executable="pick_sequencer_node",
-                 name="pick_sequencer_node", output="screen"),
+                 name="pick_sequencer_node", parameters=[params], output="screen"),
             Node(package="robot_control", executable="arm_controller_node",
-                 name="arm_controller_node", output="screen"),
+                 name="arm_controller_node", parameters=[params], output="screen"),
             Node(package="robot_hardware", executable="mcu_bridge_base_node",
-                 name="mcu_bridge_base_node", output="screen"),
+                 name="mcu_bridge_base_node", parameters=[params], output="screen"),
             Node(package="robot_hardware", executable="mcu_bridge_arm_node",
-                 name="mcu_bridge_arm_node", output="screen"),
+                 name="mcu_bridge_arm_node", parameters=[params], output="screen"),
         ],
     )
 

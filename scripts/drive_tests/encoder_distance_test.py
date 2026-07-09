@@ -20,7 +20,9 @@ Current firmware note:
 from __future__ import annotations
 
 import argparse
+import csv
 import math
+from pathlib import Path
 import statistics
 import sys
 import time
@@ -147,6 +149,100 @@ def run_open_loop(ser: serial.Serial, wheel_speeds: list[float], ms: int, hz: fl
         time.sleep(period)
 
 
+def append_csv(path: Path, row: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    exists = path.exists()
+    with path.open("a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=list(row.keys()))
+        if not exists:
+            writer.writeheader()
+        writer.writerow(row)
+
+
+def run_open_loop_calibration(
+    ser: serial.Serial,
+    *,
+    direction: str,
+    speed: float,
+    duration_ms: int,
+    hz: float,
+    k: float,
+    trusted_wheels: list[int],
+    brake_ms: int,
+    brake_wheels: list[float],
+) -> tuple[float, float, bool]:
+    """Run a fixed-duration move and integrate encoder odom without stopping from odom."""
+    cmd_wheels, _, odom_signs = motion_profile(direction, speed)
+    rotational = direction in {"cw", "ccw"}
+    cmd_period = 1.0 / max(hz, 1e-6)
+    duration_s = max(0.001, duration_ms / 1000.0)
+    start = time.monotonic()
+    end_at = start + duration_s
+    last_cmd = 0.0
+    last_odom_t = None
+    progress = 0.0
+    saw_hb = False
+    saw_odom = False
+    rx_buf = b""
+
+    print(
+        f"open-loop-calib: direction={direction} wheel_cmd={cmd_wheels} "
+        f"duration={duration_ms} ms odom_wheels={trusted_wheels}"
+    )
+    while time.monotonic() < end_at:
+        now = time.monotonic()
+        if now - last_cmd >= cmd_period:
+            send_base(ser, *cmd_wheels)
+            last_cmd = now
+
+        data = ser.read(128)
+        if data:
+            rx_buf += data
+        while b"\n" in rx_buf:
+            raw, rx_buf = rx_buf.split(b"\n", 1)
+            line = raw.strip().decode("ascii", errors="ignore")
+            pkt = parse_packet(line)
+            if pkt is None:
+                continue
+            tag, vals = pkt
+            if tag == "HB":
+                saw_hb = True
+                continue
+            if tag == "ENC" and len(vals) >= 4:
+                print(
+                    f"raw enc e1={int(vals[0])} e2={int(vals[1])} "
+                    f"e3={int(vals[2])} e4={int(vals[3])}"
+                )
+                continue
+            if tag != "ODOM":
+                continue
+            saw_odom = True
+            t_now = time.monotonic()
+            signed_speed = selected_motion_speed(vals, trusted_wheels, odom_signs)
+            if last_odom_t is not None:
+                dt = max(0.0, min(0.5, t_now - last_odom_t))
+                if rotational:
+                    progress += (signed_speed / max(float(k), 1e-6)) * dt
+                else:
+                    progress += signed_speed * dt
+            last_odom_t = t_now
+            if rotational:
+                print(f"odom spin={signed_speed:+.3f} angle={math.degrees(progress):+.1f} deg")
+            else:
+                print(f"odom speed={signed_speed:+.3f} distance={progress:+.3f} m")
+
+    stop_base(ser)
+    if brake_ms > 0:
+        print(f"applying reverse brake pulse: {brake_wheels} for {brake_ms} ms")
+        brake_base(ser, brake_wheels, brake_ms, hz)
+    stop_base(ser)
+
+    if saw_hb and not saw_odom:
+        print("MCU is only sending <HB,...> command echo.")
+        print("Add real encoder output <ODOM,fl,fr,rl,rr,t_ms> in firmware first.")
+    return progress, duration_s, saw_odom
+
+
 def run_closed_loop_segment(
     ser: serial.Serial,
     *,
@@ -236,7 +332,7 @@ def run_closed_loop_segment(
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Closed-loop distance test using MCU encoder packets")
+    ap = argparse.ArgumentParser(description="Encoder distance / open-loop calibration test using MCU packets")
     ap.add_argument("--port", default="/dev/ttyUSB0")
     ap.add_argument("--baud", type=int, default=115200)
     ap.add_argument(
@@ -246,12 +342,20 @@ def main() -> None:
     )
     ap.add_argument(
         "--mode",
-        choices=["single", "lateral-kick", "forward-then-lateral", "start-boost", "pulse"],
+        choices=[
+            "single",
+            "lateral-kick",
+            "forward-then-lateral",
+            "start-boost",
+            "pulse",
+            "open-loop-calib",
+        ],
         default="single",
         help=(
             "single keeps the original behavior; lateral-kick adds a timed diagonal start; "
             "forward-then-lateral drives forward by --pre-m before left/right; "
-            "start-boost briefly uses --boost-speed before --speed; pulse alternates strong lateral bursts and stops"
+            "start-boost briefly uses --boost-speed before --speed; pulse alternates strong lateral bursts and stops; "
+            "open-loop-calib sends the normal wheel command for --duration-ms and compares encoder vs measured travel"
         ),
     )
     ap.add_argument("--speed", type=float, default=0.10, help="wheel speed command magnitude in m/s")
@@ -331,6 +435,29 @@ def main() -> None:
         default=50,
         help="pulse mode stop duration between bursts in ms",
     )
+    ap.add_argument(
+        "--duration-ms",
+        type=int,
+        default=1000,
+        help="open-loop-calib fixed drive duration in ms",
+    )
+    ap.add_argument(
+        "--actual-m",
+        type=float,
+        default=None,
+        help="measured linear travel in meters for open-loop-calib; prints encoder scale actual/odom",
+    )
+    ap.add_argument(
+        "--actual-deg",
+        type=float,
+        default=None,
+        help="measured rotation in degrees for open-loop-calib; prints encoder/yaw scale actual/odom",
+    )
+    ap.add_argument(
+        "--log-csv",
+        default="",
+        help="optional CSV path for open-loop-calib results",
+    )
     args = ap.parse_args()
     trusted_wheels = parse_index_list(args.odom_wheels)
 
@@ -382,6 +509,63 @@ def main() -> None:
         )
 
     try:
+        if args.mode == "open-loop-calib":
+            progress, ran_s, saw_odom = run_open_loop_calibration(
+                ser,
+                direction=args.direction,
+                speed=args.speed,
+                duration_ms=args.duration_ms,
+                hz=args.hz,
+                k=args.k,
+                trusted_wheels=trusted_wheels,
+                brake_ms=args.brake_ms,
+                brake_wheels=brake_wheels,
+            )
+            if not saw_odom:
+                return
+            if rotational:
+                odom_value = math.degrees(progress)
+                actual_value = args.actual_deg
+                unit = "deg"
+            else:
+                odom_value = progress
+                actual_value = args.actual_m
+                unit = "m"
+            print(f"RESULT odom_{unit}={odom_value:+.4f} duration_s={ran_s:.3f}")
+            scale = None
+            if actual_value is None:
+                prompt = f"Measured actual travel ({unit}); blank to skip"
+                text = input(f"{prompt}: ").strip()
+                if text:
+                    actual_value = float(text)
+            if actual_value is not None:
+                if abs(odom_value) <= 1e-9:
+                    print("Cannot compute scale: odom value is ~0")
+                else:
+                    scale = float(actual_value) / float(odom_value)
+                    print(f"RESULT actual_{unit}={actual_value:+.4f}")
+                    print(f"RESULT encoder_scale_actual_over_odom={scale:.6f}")
+                    print(
+                        "Apply concept: calibrated_distance = raw_encoder_distance "
+                        f"* {scale:.6f}"
+                    )
+            if args.log_csv:
+                row = {
+                    "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "mode": args.mode,
+                    "direction": args.direction,
+                    "speed": args.speed,
+                    "duration_ms": args.duration_ms,
+                    "odom_wheels": args.odom_wheels,
+                    "odom_value": odom_value,
+                    "actual_value": "" if actual_value is None else actual_value,
+                    "scale_actual_over_odom": "" if scale is None else scale,
+                    "unit": unit,
+                }
+                append_csv(Path(args.log_csv), row)
+                print(f"logged: {args.log_csv}")
+            return
+
         if args.mode == "lateral-kick":
             kick_wheels = diagonal_kick_profile(
                 args.direction,

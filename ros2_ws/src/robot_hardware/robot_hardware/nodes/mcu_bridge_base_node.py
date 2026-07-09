@@ -8,12 +8,11 @@ where each value is wheel linear speed in m/s, signed, 3 decimals.
 
 Inbound (Arduino → host, line per packet):
     <ODOM,fl,fr,rl,rr,t_ms>   encoder wheel speeds + timestamp ms (when encoders exist)
-    <HB,fl,fr,rl,rr>          heartbeat = the COMMANDED wheel speeds echoed at 5 Hz. The current
-                              base (PCA9685+MX1508) has NO encoders, so this is all we get.
-Both are republished on /base/wheel_odom (m/s). With only <HB>, the localizer dead-reckons
-OPEN-LOOP from commands (directions correct; magnitude approximate until an encoder or the
-object-landmark correction tightens it). Without this the localizer never moves -> the robot
-cannot track its own heading/position and drives the wrong way ("상하좌우 모름").
+    <HB,fl,fr,rl,rr>          heartbeat = the COMMANDED wheel speeds echoed at 5 Hz.
+
+Only <ODOM> is published on /base/wheel_odom by default. <HB> is a command echo, not a
+measurement, so using it as odometry can make the pose drift while the robot is physically still.
+Set publish_heartbeat_as_odom=true only for deliberate open-loop fallback tests.
 """
 from __future__ import annotations
 
@@ -21,6 +20,7 @@ import threading
 
 import rclpy
 import serial
+from rcl_interfaces.msg import SetParametersResult
 from rclpy.node import Node
 from sensor_msgs.msg import Range
 from std_msgs.msg import Float32MultiArray
@@ -33,10 +33,21 @@ class McuBridgeBaseNode(Node):
         self.declare_parameter("port", "/dev/ttyUSB0")
         self.declare_parameter("baud", 115200)
         self.declare_parameter("reconnect_sec", 2.0)
+        self.declare_parameter("publish_encoder_odom", True)
+        self.declare_parameter("publish_heartbeat_as_odom", False)
+        self.declare_parameter("odom_deadband_mps", 0.005)
+        self.declare_parameter("odom_scale", 1.0)
+        self.declare_parameter("odom_wheel_scales", [1.0, 1.0, 1.0, 1.0])
 
         self.port = str(self.get_parameter("port").value)
         self.baud = int(self.get_parameter("baud").value)
         self.reconnect_sec = float(self.get_parameter("reconnect_sec").value)
+        self.publish_encoder_odom = bool(self.get_parameter("publish_encoder_odom").value)
+        self.publish_heartbeat_as_odom = bool(self.get_parameter("publish_heartbeat_as_odom").value)
+        self.odom_deadband = float(self.get_parameter("odom_deadband_mps").value)
+        self.odom_scale = float(self.get_parameter("odom_scale").value)
+        wheel_scales = [float(v) for v in self.get_parameter("odom_wheel_scales").value]
+        self.odom_wheel_scales = wheel_scales if len(wheel_scales) == 4 else [1.0, 1.0, 1.0, 1.0]
 
         self.ser: serial.Serial | None = None
         self.ser_lock = threading.Lock()
@@ -56,8 +67,33 @@ class McuBridgeBaseNode(Node):
         self._open_serial()
         self.read_thread = threading.Thread(target=self._read_loop, daemon=True)
         self.read_thread.start()
+        self.add_on_set_parameters_callback(self._on_params)
 
-        self.get_logger().info(f"port={self.port} baud={self.baud}")
+        self.get_logger().info(
+            f"port={self.port} baud={self.baud} encoder_odom={self.publish_encoder_odom} "
+            f"hb_as_odom={self.publish_heartbeat_as_odom} deadband={self.odom_deadband:.4f}m/s "
+            f"odom_scale={self.odom_scale:.4f} wheel_scales={self.odom_wheel_scales}"
+        )
+
+    def _on_params(self, params) -> SetParametersResult:
+        for p in params:
+            if p.name == "odom_scale":
+                self.odom_scale = float(p.value)
+            elif p.name == "odom_wheel_scales":
+                vals = [float(v) for v in p.value]
+                if len(vals) != 4:
+                    return SetParametersResult(
+                        successful=False,
+                        reason="odom_wheel_scales must have 4 values",
+                    )
+                self.odom_wheel_scales = vals
+            elif p.name == "odom_deadband_mps":
+                self.odom_deadband = float(p.value)
+            elif p.name == "publish_encoder_odom":
+                self.publish_encoder_odom = bool(p.value)
+            elif p.name == "publish_heartbeat_as_odom":
+                self.publish_heartbeat_as_odom = bool(p.value)
+        return SetParametersResult(successful=True)
 
     def _open_serial(self) -> None:
         try:
@@ -147,10 +183,14 @@ class McuBridgeBaseNode(Node):
             r.range = float("inf") if cm < 0 else cm / 100.0
             self.pub_range.publish(r)
             return
-        # <ODOM,fl,fr,rl,rr,t_ms> (encoders) OR <HB,fl,fr,rl,rr> (commanded-speed echo, no encoders).
+        # <ODOM,fl,fr,rl,rr,t_ms> is encoder measurement. <HB,...> is command echo.
         if line.startswith("<ODOM,"):
+            if not self.publish_encoder_odom:
+                return
             payload = line[6:-1]
         elif line.startswith("<HB,"):
+            if not self.publish_heartbeat_as_odom:
+                return
             payload = line[4:-1]
         else:
             return
@@ -159,8 +199,16 @@ class McuBridgeBaseNode(Node):
             fl, fr, rl, rr = (float(p) for p in parts[:4])
         except (ValueError, IndexError):
             return
+        vals = [
+            fl * self.odom_scale * self.odom_wheel_scales[0],
+            fr * self.odom_scale * self.odom_wheel_scales[1],
+            rl * self.odom_scale * self.odom_wheel_scales[2],
+            rr * self.odom_scale * self.odom_wheel_scales[3],
+        ]
+        if self.odom_deadband > 0.0:
+            vals = [0.0 if abs(v) < self.odom_deadband else v for v in vals]
         out = Float32MultiArray()
-        out.data = [fl, fr, rl, rr]
+        out.data = vals
         self.pub_odom.publish(out)
 
 

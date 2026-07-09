@@ -24,6 +24,14 @@ localizer_node:
     publish_rate_hz: 20.0
     use_visual_odometry: true
     broadcast_tf: true
+    # 엔코더 odom: 현재 FL(앞왼쪽) 엔코더가 불량이므로 FR/RL/RR 3개만 localizer가 사용한다.
+    # FL 엔코더 복구 후 [true, true, true, true]로 되돌린다.
+    wheel_odom_enabled_wheels: [false, true, true, true]
+    wheel_odom_deadband_mps: 0.005
+    stationary_wheel_eps_mps: 0.008
+    stationary_cmd_eps: 0.03
+    stationary_required_sec: 0.8
+    suppress_object_flow_when_stationary: true
     fisheye_model: true
     # rotated-frame (180-deg) fisheye intrinsics — see header
     top_fx: 857.316
@@ -138,3 +146,13 @@ mission_fsm_node:
     shape_target_total: 4
     fruit_target_total: 3
     publish_rate_hz: 5.0
+
+mcu_bridge_base_node:
+  ros__parameters:
+    port: "/dev/ttyUSB0"
+    baud: 115200
+    publish_encoder_odom: true
+    publish_heartbeat_as_odom: false
+    odom_deadband_mps: 0.005
+    odom_scale: 1.0
+    odom_wheel_scales: [1.0, 1.0, 1.0, 1.0]

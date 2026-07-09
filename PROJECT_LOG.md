@@ -26,10 +26,10 @@
 
 ## 2. 현재 상태 (Snapshot — 이 섹션만 최신값으로 덮어쓰기)
 
-- **현재 버전:** `v0.7.12`
-- **최종 업데이트:** 2026-07-08 22:43 (KST)
+- **현재 버전:** `v0.11.0`
+- **최종 업데이트:** 2026-07-09 22:40 (KST)
 - **최종 작업자:** `@AI`
-- **한 줄 요약:** 오늘 작업된 경기장 인식·위치보정·주행·팔 동작 변경분을 git push 준비 상태로 정리했다.
+- **한 줄 요약:** 벽 segmentation 기반 위치보정 디버깅과 엔코더 odom 검증 작업을 하루 마무리 기준으로 정리하고 GitHub 업로드 준비를 완료했다.
 
 ---
 
@@ -72,16 +72,216 @@
 - [ ] 60cm 정사각형 시계방향 둘레 주행 후 시작점 오차 기록 — `@insik`
 - [x] 직진/회전 보정값을 프리셋 또는 별도 실행 스크립트로 정리 — `@AI` (2026-07-07 통합 튜닝 스크립트로 1차 정리)
 - [ ] IMU 결합 시 회전 제어 로직 및 보정 절차 재설계 — `@AI`
+- [ ] 실제 주행에서 `<HB>`가 `/base/wheel_odom`으로 들어오지 않고 `<ODOM>`만 pose에 반영되는지 확인 — `@insik`
+- [ ] `/localization/is_stationary`를 정지/주행 상태에서 echo해 정지 판정 지연과 오검출 여부 확인 — `@insik`
+- [ ] FL 엔코더 배선/핀 충돌을 복구한 뒤 `wheel_odom_enabled_wheels`를 `[true, true, true, true]`로 되돌리고 4륜 odom 재튜닝 — `@insik`
+- [x] ROS 경로(`/base_command`→`base_controller_node`→`mcu_bridge_base_node`)에서 open-loop 엔코더 거리 비교 테스트 파일 작성 — `@AI` (2026-07-09 완료)
+- [x] 상위 엔코더 제어 검증용 반복성/목표거리 정지 테스트 파일 작성 — `@AI` (2026-07-09 완료)
+- [ ] `encoder_control_validation.py`의 `repeat-open-loop`로 같은 조건 3~5회 반복해 엔코더거리/실제거리/드리프트 기록 — `@insik`
+- [ ] 반복성 보정비가 ±15% 안에 들어오는 조건을 찾은 뒤 `odom_scale` 확정 — `@insik`
+- [ ] `encoder_control_validation.py`의 `closed-loop-distance`로 엔코더 목표거리 30cm 정지 테스트 수행 — `@insik`
+- [ ] 엔코더 목표거리 정지 테스트가 안정화되면 `mission_fsm_node` opening 이동을 시간 기반에서 거리 기반으로 전환 검토 — `@AI`
 - [ ] `motion_tune.py`로 전진/후진/횡이동/회전 최종 튜닝값 확정 — `@insik`
 - [ ] 최종 튜닝값 확정 후 실제 경기 주행용 함수/모듈 작성 — `@AI`
 - [x] 오늘 경기장 run 광각 사진 기준 벽/바닥 접선 기반 위치 보정 노드 실행 연결 — `@AI` (2026-07-08 완료)
 - [ ] 실제 경기장 주행 중 `wall_localizer_node` 로그의 `wall fix dx/dy/dth`를 확인하고 `wall_gate_m`, `axis_tol_deg`, `correction_conf` 최종 튜닝 — `@insik`
+- [ ] X-AnyLabeling으로 `data/wallseg_export/images` wide 이미지의 `wall_floor_boundary` polygon 라벨링 완료 — `@insik`
+- [x] 라벨링 완료 후 `scripts/colab_train_wallseg_v1.ipynb`로 `wall_floor_boundary_seg_v1.pt` 학습 — `@AI` (2026-07-09 1차 완료)
+- [x] 학습된 `wall_floor_boundary_seg_v1.pt`를 `models/`에 복사하고 기존 `wide.pt`/`cube.pt`와 분리 보관 — `@insik` (2026-07-09 로봇 로컬 복사 완료, 모델 파일은 git 제외)
+- [x] `wall_localizer_node.py`에 segmentation mask 후보 생성 hook과 edge fallback 연결 — `@AI` (2026-07-09 완료)
+- [ ] 추가 촬영한 벽 데이터 61장을 라벨링해 v2 dataset으로 합치고 재학습 여부 판단 — `@insik`
+- [ ] segmentation mask 내부 중심선/최종 벽 선분 선택 로직을 실제 화면에서 더 튜닝 — `@AI`
+- [ ] 팔 제어 보드 연결 후 `/dev/ttyUSB*` 또는 `/dev/ttyACM*` 포트 인식 확인하고 집기-보관 1회 재실행 — `@insik`
+- [ ] CH340 장치에 대해 `udev`/`devtmpfs` 상태를 점검해 `/dev/ttyUSB0` 노드가 생성되지 않는 원인을 해결 — `@insik`
+- [ ] `arm_controller_node`가 참조하는 `arm_ik.WRIST_ROLL_HOME` 누락을 정리해 메인 경기 런치 크래시를 제거 — `@AI`
 
 ---
 
 ## 5. 변경 이력 (Changelog) — ⛔ 삭제 금지 / 최신 항목이 맨 위
 
 <!-- 새 엔트리는 바로 이 줄 아래에 추가하세요. 기존 엔트리는 건드리지 마세요. -->
+
+### `v0.11.0` — 2026-07-09 22:40 (KST) · 작업자: `@AI` · ID: `2026-07-09-11`
+- **변경 요약:** 벽 segmentation 기반 위치보정 디버깅과 엔코더 odom 검증 작업을 하루 마무리 기준으로 정리하고 GitHub 업로드 준비를 완료했다.
+- **상세:**
+  - LabelMe/X-AnyLabeling JSON과 이미지를 YOLO segmentation dataset으로 변환하는 스크립트와 Colab 학습 노트북을 준비하고, 사용자가 만든 `wall_floor_boundary_seg_v1.pt`를 로봇 로컬 `models/`에 복사해 테스트했다.
+  - `wall_localizer_node.py`에 YOLO segmentation mask 입력을 연결하고, mask component 기반 후보 생성, edge fallback, 최종 field/image segment 발행을 추가했다.
+  - `recognition_viz_node.py`에서 오른쪽 WIDE 카메라 화면에 segmentation mask와 최종 벽 선분을 표시해, mask는 잘 잡히지만 최종 선분이 mask와 떨어지는 현상을 직접 확인할 수 있게 했다.
+  - 디버깅 결과를 반영해 최종 벽 선분 선택에서 mask 내부 후보를 더 중점적으로 쓰는 방향으로 수정했고, `test_field.yaml`은 현재 실험 기준으로 segmentation fallback을 잠시 끈 상태로 남겼다.
+  - 오늘 수행한 엔코더 odom ROS 경로 검증, open-loop calibration, closed-loop 검증 스크립트와 로그를 함께 커밋 대상으로 정리했다.
+  - 로컬 빌드 산출물(`build/`, `install/`, `log/`, package `build/egg-info`)과 개인 설정(`.claude/settings.local.json`), 학습 데이터/모델 바이너리는 커밋 대상에서 제외한다.
+- **변경 파일:**
+  - `ros2_ws/src/robot_perception/robot_perception/nodes/wall_localizer_node.py` / 수정
+  - `ros2_ws/src/robot_perception/robot_perception/nodes/recognition_viz_node.py` / 수정
+  - `ros2_ws/src/robot_perception/robot_perception/nodes/localizer_node.py` / 수정
+  - `ros2_ws/src/robot_hardware/robot_hardware/nodes/mcu_bridge_base_node.py` / 수정
+  - `ros2_ws/src/robot_bringup/config/test_field.yaml` / 수정
+  - `ros2_ws/src/robot_bringup/config/perception.yaml` / 수정
+  - `ros2_ws/src/robot_bringup/launch/bringup.launch.py` / 수정
+  - `docs/wall_segmentation_training.md` / 신규
+  - `scripts/colab_train_wallseg_v1.ipynb` / 신규
+  - `scripts/labelme_seg_to_yolo.py` / 신규
+  - `scripts/live_field_view.py` / 수정
+  - `scripts/drive_tests/encoder_distance_test.py` / 수정
+  - `scripts/drive_tests/ros_open_loop_calib.py` / 신규
+  - `scripts/drive_tests/encoder_control_validation.py` / 신규
+  - `scripts/drive_tests/encoder_open_loop_calib_log.csv` / 신규
+  - `scripts/drive_tests/ros_open_loop_calib_log.csv` / 신규
+  - `scripts/drive_tests/encoder_control_validation_log.csv` / 신규
+  - `PROJECT_LOG.md` / 수정
+- **다음 할 일 반영:** v1 segmentation 학습, 모델 로봇 복사, `wall_localizer_node.py` segmentation hook 연결을 완료 처리하고, 추가 촬영 61장 라벨링/v2 재학습 판단과 mask 기반 최종 선분 튜닝 TODO를 추가했다.
+- **버전 근거:** segmentation 위치보정 연결, 시각화, 변환/학습 스크립트, 엔코더 검증 스크립트까지 하루 단위 기능 추가가 포함되어 `MINOR` 버전 증가로 `v0.11.0`으로 올렸다.
+
+### `v0.10.0` — 2026-07-09 22:35 (KST) · 작업자: `@AI` · ID: `2026-07-09-10`
+- **변경 요약:** 엔코더 odom을 실제 상위 주행 제어에 쓰기 위한 ROS/시리얼 검증 스크립트와 보정 절차를 추가했다.
+- **상세:**
+  - `encoder_distance_test.py`에 `open-loop-calib` 모드를 추가해, 엔코더 목표거리로 멈추는 방식이 아니라 정해진 시간 동안 MCU에 직접 `<BASE,...>`를 보내고 엔코더 적분거리와 실제 측정거리를 비교할 수 있게 했다.
+  - `ros_open_loop_calib.py`를 추가해 실제 경기 주행 경로와 같은 `/base_command`→`base_controller_node`→`/base/wheel_speeds`→`mcu_bridge_base_node` 경로로 open-loop 테스트를 수행하고, 엔코더 odom과 실제 측정거리를 비교할 수 있게 했다.
+  - `ros_open_loop_calib.py`는 방향/이동시간/속도를 실행 후 터미널에서 입력받도록 했고, 실제 측정값 입력 시 `test_field.yaml`의 `odom_scale`과 실행 중인 `/mcu_bridge_base_node` 파라미터를 갱신할 수 있게 했다.
+  - ROS Humble 환경에서 `rclpy.parameter_client`가 없는 문제를 피하기 위해 `/mcu_bridge_base_node/set_parameters` 서비스를 직접 호출하는 방식으로 수정했다.
+  - `mcu_bridge_base_node.py`에 `odom_scale`, `odom_wheel_scales`, 동적 파라미터 갱신 콜백을 추가해 엔코더 odom 스케일을 실행 중에도 바꿀 수 있게 했다.
+  - `encoder_control_validation.py`를 추가해 상위 제어 적용 전 필요한 두 단계, 즉 같은 명령 반복성 테스트(`repeat-open-loop`)와 엔코더 목표거리 정지 테스트(`closed-loop-distance`)를 ROS 경로에서 수행할 수 있게 했다.
+  - 실측 중 400ms/900ms 테스트의 실제거리 대비 엔코더거리 보정비가 크게 달라져, 짧은 시간/짧은 거리 데이터로 `odom_scale`을 바로 적용하면 위험하다는 판단을 남겼다.
+- **변경 파일:**
+  - `scripts/drive_tests/encoder_distance_test.py` / 수정
+  - `scripts/drive_tests/ros_open_loop_calib.py` / 신규
+  - `scripts/drive_tests/encoder_control_validation.py` / 신규
+  - `scripts/drive_tests/encoder_open_loop_calib_log.csv` / 신규
+  - `scripts/drive_tests/ros_open_loop_calib_log.csv` / 신규
+  - `scripts/drive_tests/encoder_control_validation_log.csv` / 신규
+  - `ros2_ws/src/robot_hardware/robot_hardware/nodes/mcu_bridge_base_node.py` / 수정
+  - `ros2_ws/src/robot_bringup/config/test_field.yaml` / 수정
+  - `ros2_ws/src/robot_bringup/config/perception.yaml` / 수정
+  - `PROJECT_LOG.md` / 수정
+- **다음 할 일 반영:** ROS open-loop/상위 제어 검증 스크립트 작성 TODO를 완료 처리하고, 반복성 데이터 수집, `odom_scale` 확정, 엔코더 목표거리 정지 테스트, opening 이동 거리 기반 전환 검토 TODO를 추가했다.
+- **버전 근거:** 새 검증 스크립트 2개와 엔코더 odom 동적 보정 기능을 추가해 상위 제어 적용 준비 범위가 넓어진 기능 추가이므로 `MINOR` 버전 증가로 `v0.10.0`으로 올렸다.
+
+### `v0.9.0` — 2026-07-09 19:51 (KST) · 작업자: `@AI` · ID: `2026-07-09-09`
+- **변경 요약:** FL 엔코더 불량 상태에서도 3륜 엔코더 odom 기반 위치 보정을 사용할 수 있게 했다.
+- **상세:**
+  - `mcu_bridge_base_node.py`에서 `<ODOM,...>`만 `/base/wheel_odom`으로 발행하도록 기본값을 바꾸고, `<HB,...>` 명령 echo는 `publish_heartbeat_as_odom` 옵션을 켤 때만 odom으로 쓰게 했다.
+  - bridge와 localizer 양쪽에 작은 wheel odom deadband를 넣어 정지 중 잔진동/노이즈가 pose 적분으로 누적되는 것을 줄였다.
+  - `localizer_node.py`에 `wheel_odom_enabled_wheels` 파라미터를 추가해 고장난 FL 엔코더를 제외하고 FR/RL/RR 3개 바퀴만으로 mecanum forward kinematics를 least-squares로 풀도록 했다.
+  - `/base/wheel_speeds`와 encoder odom을 함께 보고 `/localization/is_stationary`를 발행하며, 정지 중에는 object-flow odom의 작은 흔들림을 pose에 반영하지 않도록 했다.
+  - `test_field.yaml`과 `perception.yaml`에 현재 하드웨어 상태 기준으로 `wheel_odom_enabled_wheels: [false, true, true, true]`를 설정했다.
+  - `bringup.launch.py`의 control/hardware 노드도 `perception.yaml`을 읽게 해 실전 bringup에서 bridge 파라미터가 적용되도록 했다.
+- **변경 파일:**
+  - `ros2_ws/src/robot_hardware/robot_hardware/nodes/mcu_bridge_base_node.py` / 수정
+  - `ros2_ws/src/robot_perception/robot_perception/nodes/localizer_node.py` / 수정
+  - `ros2_ws/src/robot_bringup/config/test_field.yaml` / 수정
+  - `ros2_ws/src/robot_bringup/config/perception.yaml` / 수정
+  - `ros2_ws/src/robot_bringup/launch/bringup.launch.py` / 수정
+  - `PROJECT_LOG.md` / 수정
+- **다음 할 일 반영:** `<HB>` 차단 확인, `/localization/is_stationary` 정지 판정 확인, FL 엔코더 복구 후 4륜 odom 재튜닝 TODO를 추가했다.
+- **버전 근거:** 엔코더 odom 처리 정책, 고장 휠 제외 기구학, 정지 상태 발행/억제 기능을 추가한 위치추정 기능 개선이므로 `MINOR` 버전 증가로 `v0.9.0`으로 올렸다.
+
+### `v0.8.0` — 2026-07-09 19:27 (KST) · 작업자: `@AI` · ID: `2026-07-09-08`
+- **변경 요약:** 벽-바닥 경계 segmentation 라벨링/Colab 학습 준비 파일을 추가했다.
+- **상세:**
+  - 이전 대화 내용을 바탕으로 `wall_floor_boundary` 1-class segmentation 학습 흐름을 정리했다.
+  - `data/wallseg_export`를 X-AnyLabeling 작업 폴더로 문서화하고 `classes.txt`, `labels/.gitkeep`, README를 추가했다.
+  - Colab에서 zip 업로드, dataset root 자동 탐색, 라벨 누락/빈 라벨 검사, train/val 분할, `yolov8n-seg.pt` 학습, `wall_floor_boundary_seg_v1.pt` 다운로드까지 실행하는 노트북을 추가했다.
+  - `docs/wall_segmentation_training.md`에 라벨링 규칙, zip 생성, Colab 실행, 로봇 복사, 이후 `wall_localizer_node.py` hook 방향을 정리했다.
+  - 현재 `data/wallseg_export/images`에는 wide 이미지 184장이 있고, segmentation label `.txt`는 아직 0개임을 확인했다.
+- **변경 파일:**
+  - `docs/wall_segmentation_training.md` / 신규
+  - `scripts/colab_train_wallseg_v1.ipynb` / 신규
+  - `data/wallseg_export/classes.txt` / 신규
+  - `data/wallseg_export/README.md` / 신규
+  - `data/wallseg_export/labels/.gitkeep` / 신규
+  - `PROJECT_LOG.md` / 수정
+- **다음 할 일 반영:** `wall_floor_boundary` polygon 라벨링, Colab segmentation 학습, 모델 복사, `wall_localizer_node.py` segmentation hook 구현 TODO를 추가했다.
+- **버전 근거:** 새 학습 노트북과 문서/데이터셋 작업 폴더를 추가한 기능성 준비 작업이므로 `MINOR` 버전 증가로 `v0.8.0`으로 올렸다.
+
+### `v0.7.19` — 2026-07-09 14:47 (KST) · 작업자: `@AI` · ID: `2026-07-09-07`
+- **변경 요약:** 라이브 송출 기본 페이지를 canvas 렌더링 방식으로 바꿔 브라우저 탭 로딩중 표시를 줄였다.
+- **상세:**
+  - 기존 `/frame.png`를 `<img>`에서 0.2초마다 재요청하는 방식도 브라우저 탭 로딩 표시를 계속 유발할 수 있어, 기본 페이지를 `<canvas>` 기반으로 변경했다.
+  - JavaScript가 `/frame.png`를 `fetch()`로 가져와 `createImageBitmap()` 후 canvas에 그리도록 했다. 페이지 문서는 한 번 로드되고, 이후 내부 bitmap만 갱신된다.
+  - 8766 포트를 잡고 있던 이전 `python3` 송출 서버 프로세스(pid 16615)를 종료하고 새 서버를 재시작했다.
+  - `/latest`, `/frame.png`, `/` 응답을 확인했고, 캐시를 피하기 위해 `http://127.0.0.1:8766/?v=canvas`를 열었다.
+- **변경 파일:**
+  - `scripts/live_field_view.py` / 수정
+  - `PROJECT_LOG.md` / 수정
+- **다음 할 일 반영:** 기존 TODO는 유지했다. 화면 상단 latest age가 증가하면 메인 런/`recognition_viz_node`가 새 프레임을 쓰지 않는 상태로 판단한다.
+- **버전 근거:** 라이브 뷰어 브라우저 표시 방식만 조정한 소규모 수정이므로 `PATCH` 버전 증가로 `v0.7.19`로 올렸다.
+
+### `v0.7.18` — 2026-07-09 14:44 (KST) · 작업자: `@AI` · ID: `2026-07-09-06`
+- **변경 요약:** 라이브 송출 기본 페이지를 MJPEG 직접 표시에서 PNG 프레임 주기 갱신 방식으로 바꿔 로딩중 고착을 줄였다.
+- **상세:**
+  - `http://127.0.0.1:8766/`가 계속 로딩중처럼 보이는 원인을 확인했다: 기존 서버가 8766 포트를 잡고 있었고, 기본 화면이 끝나지 않는 MJPEG 스트림을 직접 `<img>`로 열어 브라우저 로딩 표시가 지속될 수 있었다.
+  - `scripts/live_field_view.py`에 `/frame.png` 엔드포인트를 추가해 최신 `live.png` 한 장을 일반 PNG 응답으로 제공하도록 했다.
+  - 기본 HTML은 즉시 로드되고, JavaScript가 `/frame.png?t=...`를 0.2초마다 갱신하도록 변경했다. 기존 `/stream.mjpg` 엔드포인트는 보조 스트림으로 유지했다.
+  - 이전 8766 점유 프로세스(`python3`, pid 12935)를 종료하고 새 서버를 띄운 뒤 `/latest`, `/frame.png`, `/` 응답을 확인했다.
+- **변경 파일:**
+  - `scripts/live_field_view.py` / 수정
+  - `PROJECT_LOG.md` / 수정
+- **다음 할 일 반영:** 기존 TODO는 유지했다. 라이브 페이지가 안 보이면 먼저 `/latest`와 `/frame.png` 응답을 확인한다.
+- **버전 근거:** 라이브 뷰어 표시/갱신 방식만 조정한 소규모 수정이므로 `PATCH` 버전 증가로 `v0.7.18`로 올렸다.
+
+### `v0.7.17` — 2026-07-09 14:35 (KST) · 작업자: `@AI` · ID: `2026-07-09-05`
+- **변경 요약:** 라이브 송출 화면을 별도 맵 탭 없이 전체 합성 화면 축소 표시 방식으로 되돌렸다.
+- **상세:**
+  - 사용자가 앞으로 직접 실행 대신 터미널 명령으로 안내해 달라고 요청했으므로, 이후 로봇/ROS/브라우저 실행은 명령만 제공하는 방식으로 전환한다.
+  - `scripts/live_field_view.py`에서 `Map`/`Full` 링크와 `?view=...` 분기, 왼쪽 맵 crop 송출 로직을 제거했다.
+  - 브라우저 화면은 `recognition_viz_node`가 생성한 원본 합성 이미지(왼쪽 맵 + 오른쪽 카메라 패널)를 그대로 송출하고, CSS `object-fit: contain`과 `max-width/max-height`로 창 안에 전체가 축소 표시되도록 했다.
+  - 4x4 경기장 전체 표시는 `test_field.yaml`의 `field_extent_m: [-2.0, 2.0, -2.0, 2.0]`, `auto_extent: false` 설정을 그대로 사용한다.
+- **변경 파일:**
+  - `scripts/live_field_view.py` / 수정
+  - `PROJECT_LOG.md` / 수정
+- **다음 할 일 반영:** 기존 TODO는 유지했다. 라이브 확인 시에는 먼저 송출 서버와 메인 런을 사용자가 직접 터미널에서 실행한다.
+- **버전 근거:** 라이브 뷰어 표시 방식만 조정한 소규모 수정이므로 `PATCH` 버전 증가로 `v0.7.17`로 올렸다.
+
+### `v0.7.16` — 2026-07-09 14:28 (KST) · 작업자: `@AI` · ID: `2026-07-09-04`
+- **변경 요약:** 브라우저 라이브 송출 서버를 재기동하고 기본 화면을 맵 전체 보기로 변경했다.
+- **상세:**
+  - 라이브 화면이 보이지 않는 원인을 확인했다: `scripts/live_field_view.py` 서버 프로세스가 떠 있지 않았고, 최신 `live.png`도 `run_20260709_142340/20260709_142345/live.png`에서 갱신이 멈춘 상태였다.
+  - 외부 라이브 뷰어의 기본 `/` 화면을 합성 패널 전체가 아니라 왼쪽 정사각형 맵 영역만 crop해 크게 송출하도록 변경했다.
+  - 원본 합성 화면(맵 + 카메라 패널)은 `http://127.0.0.1:8766/?view=full`에서 계속 볼 수 있게 유지했다.
+  - `python3 -m py_compile scripts/live_field_view.py`로 문법을 확인하고, `python3 scripts/live_field_view.py --port 8766 --fps 5`로 서버를 재기동한 뒤 `http://127.0.0.1:8766/` 브라우저를 열었다.
+- **변경 파일:**
+  - `scripts/live_field_view.py` / 수정
+  - `PROJECT_LOG.md` / 수정
+- **다음 할 일 반영:** 기존 TODO는 유지했다. 상단 latest age가 계속 증가하면 송출 서버 문제가 아니라 `recognition_viz_node` 또는 메인 런이 새 `live.png`를 쓰지 않는 문제로 본다.
+- **버전 근거:** 라이브 뷰어 표시 방식과 실행 상태 점검을 보완한 소규모 수정이므로 `PATCH` 버전 증가로 `v0.7.16`으로 올렸다.
+
+### `v0.7.15` — 2026-07-09 14:20 (KST) · 작업자: `@AI` · ID: `2026-07-09-03`
+- **변경 요약:** 메인 경기 런치 `bringup.launch.py`를 실행해 현재 실전 기동 불가 원인을 확인했다.
+- **상세:**
+  - `source /opt/ros/humble/setup.bash && source ros2_ws/install/setup.bash && ros2 launch robot_bringup bringup.launch.py`로 메인 경기 런치를 실행했다.
+  - 카메라, TF, localizer, world_model, mission_fsm, base controller, pick sequencer, MCU bridge 등 다수 노드는 기동됐다.
+  - `arm_controller_node`는 `robot_control.arm_ik`에 없는 `WRIST_ROLL_HOME`를 참조하다 `AttributeError`로 즉시 종료됐다.
+  - `mcu_bridge_base_node`는 `/dev/ttyUSB0`, `mcu_bridge_arm_node`는 `/dev/ttyUSB1` 포트를 열지 못해 계속 재시도했다.
+  - 두 CSI 카메라는 `nvargus-daemon`/EGL/NvRm 접근 제한으로 프레임을 받지 못했고, `siglip_gate_node`는 네트워크 제한 때문에 Hugging Face 모델 파일 HEAD 요청을 재시도했다.
+  - 따라서 메인 경기 런치는 “프로세스 다수 기동” 수준까지는 확인됐지만, 실제 경기 수행 가능한 정상 런으로 보기는 어렵다.
+- **변경 파일:**
+  - `PROJECT_LOG.md` / 수정
+- **다음 할 일 반영:** `arm_controller_node`의 `WRIST_ROLL_HOME` 참조 누락을 고치는 TODO를 추가했다. 기존 포트/udev TODO는 유지했다.
+- **버전 근거:** 코드 변경 없이 메인 경기 런 실행 결과와 주요 장애 원인을 문서화한 작업 기록 보완이므로 `PATCH` 버전 증가로 `v0.7.15`로 올렸다.
+
+### `v0.7.14` — 2026-07-09 14:17 (KST) · 작업자: `@AI` · ID: `2026-07-09-02`
+- **변경 요약:** 포트 미인식 원인을 CH340 인식 후 `/dev/ttyUSB0` 미생성 상태로 진단했다.
+- **상세:**
+  - 권한 확장 `lsusb` 결과에서 `1a86:7523 QinHeng Electronics CH340 serial converter`가 보여 USB 장치 자체는 연결된 것을 확인했다.
+  - `lsmod`에서 `ch341`, `usbserial` 모듈이 로드되어 있고, `/sys/class/tty/ttyUSB0`와 major/minor `188:0`도 존재해 커널 내부 TTY 등록까지는 완료된 상태를 확인했다.
+  - 반면 `/dev/ttyUSB0`는 존재하지 않아, 이번 실패는 그리퍼 코드나 시리얼 권한 문제가 아니라 사용자 공간 장치 노드가 생성되지 않은 문제로 판단했다.
+  - 현재 세션에서 `dmesg`는 계속 권한 제한으로 읽지 못해, 최종 원인이 `udev`, `devtmpfs`, 컨테이너/네임스페이스 노출 문제 중 무엇인지는 추가 점검이 필요하다.
+- **변경 파일:**
+  - `PROJECT_LOG.md` / 수정
+- **다음 할 일 반영:** CH340 장치에 대해 `udev`/`devtmpfs` 상태를 점검해 `/dev/ttyUSB0` 노드가 생성되지 않는 원인을 해결하는 TODO를 추가했다.
+- **버전 근거:** 코드 변경 없이 포트 미인식 원인 분석과 후속 점검 항목을 문서화한 작업 기록 보완이므로 `PATCH` 버전 증가로 `v0.7.14`로 올렸다.
+
+### `v0.7.13` — 2026-07-09 14:13 (KST) · 작업자: `@AI` · ID: `2026-07-09-01`
+- **변경 요약:** 2R 팔 집기-보관 한 사이클 실행을 시도했으나 시리얼 포트가 없어 중단됐다.
+- **상세:**
+  - `scripts/arm_pick2r.py`의 현재 포즈 상수를 확인했다: `INIT [110,10,100]`, `PICK [25,150]`, `GRIP_OPEN=95`, `GRIP_CLOSED=40`, `PLACE [110,30]`.
+  - `/dev/ttyUSB0`, `/dev/ttyACM0` 존재 여부와 `/dev/ttyUSB*`, `/dev/ttyACM*`, `/dev/ttyAMA*`, `/dev/ttyS*` 후보 포트를 확인했으나 사용 가능한 포트가 없었다.
+  - `python3 scripts/arm_pick2r.py --port /dev/ttyUSB0 --loop 1 --move-delay 1.2 --grip-delay 0.8 --cycle-pause 0.5`를 실행했지만, `/dev/ttyUSB0`을 열 수 없어 실제 서보 명령은 전송되지 않았다.
+  - 따라서 이번에는 그리퍼 각도 또는 보관함 투입 동작을 실제 하드웨어로 확인하지 못했다.
+- **변경 파일:**
+  - `PROJECT_LOG.md` / 수정
+- **다음 할 일 반영:** 팔 제어 보드 연결 후 `/dev/ttyUSB*` 또는 `/dev/ttyACM*` 포트 인식 확인하고 집기-보관 1회 재실행 항목을 추가했다.
+- **버전 근거:** 코드 변경 없이 하드웨어 실행 시도 결과와 후속 확인 항목을 문서화한 작업 기록 보완이므로 `PATCH` 버전 증가로 `v0.7.13`으로 올렸다.
 
 ### `v0.7.12` — 2026-07-08 22:43 (KST) · 작업자: `@AI` · ID: `2026-07-08-13`
 - **변경 요약:** 오늘 작업된 경기장 인식·위치보정·주행·팔 동작 변경분을 git push 준비 상태로 정리했다.
