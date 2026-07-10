@@ -30,21 +30,31 @@ localizer_node:
     landmark_max_step_m: 0.2               # 한 번에 허용하는 위치 보정폭↑(드리프트 즉시 회수)
     landmark_max_step_rad: 0.5             # allow a confident heading fix to correct promptly (still clamped)
     broadcast_tf: true
+    use_wheel_odom: false             # 엔코더 기반 위치/회전 보정 사용 안 함
     # OBJECT-FLOW = 주(主) 회전 소스: 광각 물체점 프레임간 매칭(world_model). LK 옵티컬플로는 진동을
     # 회전으로 착각하지만 물체점은 실제 세계 근거라 정지 시 0을 낸다. 물체 부족 시에만 LK로 폴백.
     use_object_flow: true
     object_flow_min_conf: 0.25            # 이 신뢰도 미만 flow 추정은 무시
     object_flow_stale_sec: 0.5            # flow가 이보다 오래되면 LK VO 폴백 기동
-    object_flow_trans: false             # flow 병진 OFF: 정지 중 프레임당 5~8cm 스퓨리어스로 위치 진동시킴.
-                                          # 회전(dtheta)은 계속 씀. 병진은 랜드마크 절대보정(정확한 지도)에 맡김
+    object_flow_trans: true              # 물체 흐름 병진도 사용. localizer가 wheel과 중복되지 않게 조정함.
     # 엔코더 odom: 현재 FL(앞왼쪽) 엔코더가 불량/초음파 핀과 충돌하므로 FR/RL/RR 3개만 사용한다.
     # FL 엔코더 복구 후 [true, true, true, true]로 되돌려 4륜 평균을 쓴다.
     wheel_odom_enabled_wheels: [false, true, true, true]
     wheel_odom_deadband_mps: 0.005
-    stationary_wheel_eps_mps: 0.008
+    stationary_wheel_eps_mps: 0.02
     stationary_cmd_eps: 0.03
     stationary_required_sec: 0.8
-    suppress_object_flow_when_stationary: true
+    suppress_object_flow_when_stationary: false  # 벽 유무와 무관하게 object-flow 병진 사용
+    freeze_pose_when_stationary: true
+    wall_anchor_gain: 0.50
+    wall_anchor_max_step_m: 0.03
+    wall_anchor_max_step_rad: 0.03
+    wall_anchor_deadband_m: 0.005
+    wall_field_gain: 0.35
+    wall_field_max_step_m: 0.05
+    wall_field_max_step_rad: 0.04
+    wall_field_deadband_m: 0.005
+    wall_correction_stale_sec: 1.5
     use_imu_heading: true                 # IMU heading 보정 ON: 벽 보정 OFF 조건 비교 테스트
     fisheye_model: true
     # Intrinsics SCALED for the 1280x960 GPU-downscaled wide stream (was 1640x1232). fx,cx x0.780488
@@ -58,8 +68,8 @@ localizer_node:
 
 wall_localizer_node:
   ros__parameters:
-    # 경기장 벽/바닥 접선 기반 절대 위치 보정. 오늘 run(20260708_*) 광각 프레임 기준:
-    # 나무톤 벽/바닥이라 색 단독이 아니라 선분+지면투영+4m 경기장 경계 게이트를 사용한다.
+    # 학습 mask의 median 중심과 주 방향으로 만든 선분을 경기장 벽 관측으로 바로 사용한다.
+    # 기존 Canny/Hough 후보와 경기장 축/예상 벽 위치 기반 빨간 선분 승인·위치보정은 사용하지 않는다.
     top_fx: 669.125
     top_fy: 670.185
     top_cx: 616.474
@@ -67,43 +77,24 @@ wall_localizer_node:
     dist_coeffs: [-0.085721, 0.053910, -0.034649, 0.007943]
     image_rotated_180: true
     wide_homography_path: "/home/seventt/seventt/workspace/data/calib/wide_ground.npz"
-    field_half_m: 2.0
     rate_hz: 3.0
-    canny_lo: 35
-    canny_hi: 120
-    hough_thresh: 45
-    hough_min_len: 55
-    hough_max_gap: 22
-    use_lsd: true
-    clahe_clip: 2.0
     ignore_robot_rect: [0.34, 0.25, 0.66, 0.88]
-    use_color_mask: true
-    color_lab_radius: 24.0
-    color_sat_min: 45
-    color_val_min: 45
-    color_val_max: 235
-    color_morph_kernel: 9
-    color_hough_thresh: 35
-    min_ground_len_m: 0.55
-    wall_gate_m: 0.22
-    endpoint_gate_scale: 0.85
-    axis_tol_deg: 10.0
     max_range_m: 2.3
-    correction_conf: 0.35
-    max_pos_resid_m: 0.55
-    resid_mad_gate_m: 0.05
-    min_wall_matches: 2
     use_segmentation_mask: true
-    segmentation_model_path: "/home/seventt/seventt/workspace/models/wall_floor_boundary_seg_v1.pt"
+    segmentation_model_path: "/home/seventt/seventt/workspace/models/wall_floor_boundary_seg_v2.pt"
     segmentation_input_size: 640
     segmentation_min_confidence: 0.30
     segmentation_run_rate_hz: 1.0
-    segmentation_hough_thresh: 22
     segmentation_morph_kernel: 5
-    segmentation_fallback_to_edges: false
-    segmentation_use_mask_fit: true
     segmentation_min_component_area: 120
     segmentation_max_components: 6
+    segmentation_min_line_length_px: 55
+    wall_anchor_enabled: false
+    wall_anchor_min_lines: 2
+    wall_anchor_smoothing: 0.20
+    field_half_extent_m: 2.0
+    wall_field_max_residual_m: 0.80
+    wall_field_smoothing: 0.25
 
 yolo_detector_node:
   ros__parameters:
@@ -246,15 +237,16 @@ mission_fsm_node:
     # Upscale each body detection pixel to that domain before perspectiveTransform (npz untouched).
     body_px_scale_x: 2.5625               # 1640/640
     body_px_scale_y: 2.566667             # 1232/480
-    # 경기 시작 하드코딩 개막 이동(로봇 body 기준): 전진 → 정지 → 우측 횡이동 → 정지 → SCAN.
-    # base_controller boost/brake가 각 leg에 적용됨. 실제 바닥서 정확히 30cm 되게 _sec 튜닝.
+    # 경기 시작 하드코딩 개막 이동(로봇 body 기준): 전진 1초 → 제자리 45도 회전 → 1초 정지 → SCAN.
+    # 이후 phase 1에서 Set1 정이십면체를 탐색/접근한다.
     opening_enabled: true
     startup_warmup_sec: 15.0              # YOLO 로드+world_model 뜰 때까지 정지 대기 후 개막(방향 잃음 방지)
-    opening_speed: 0.26                   # 개막 이동 속도 더 낮춤
-    opening_forward_sec: 0.9              # ~30cm 전진 시간(튜닝)
-    opening_strafe_sec: 1.5               # ~30cm 우측 횡이동 시간(메카넘 횡이동 느려서 더 길게, 튜닝)
-    opening_settle_sec: 0.6               # leg 사이 정지(brake 발동 + 관성 소멸)
-    scan_search_omega: -0.5               # 탐색 회전 방향(CW=음수). 속도는 base wheel_min_rot이 결정
+    opening_speed: 0.09                   # 맵 안정화를 위해 기존 대비 약 1/3 속도
+    opening_forward_sec: 1.0
+    opening_turn_deg: 45.0
+    opening_turn_omega: -0.17             # CW 회전. 반대로 돌려야 하면 +0.17로 바꾼다.
+    opening_wait_after_turn_sec: 1.0
+    scan_search_omega: -0.17              # 탐색 회전 방향(CW=음수). 맵 안정화를 위해 저속 회전
     # ★레인-그래프 waypoint 플래너★ (50cm 물체격자, 40cm 로봇). 이동목표(SCAN 스윕·APPROACH standoff·
     # 보관함)를 충돌없는 레인 중심선으로 라우팅. go_to_goal은 각 via를 car-like+반응형으로 주행.
     planner_enabled: true                 # false면 예전 직접-goal 동작(안전 롤백)
@@ -280,9 +272,9 @@ mission_fsm_node:
     search_look_sec: 2.5                  # 한번 돌고 2~3초 대기하며 식별(자주 안 돌아도 됨)
     # 접근 = 타겟쪽으로 천천히 돌려 마주본 뒤 전진(수렴하면 멈춤, 빙글빙글 안 함)
     approach_face_tol: 0.25               # 이 heading오차(rad) 안이면 전진, 밖이면 제자리 회전으로 마주봄
-    approach_speed: 0.32                  # 마주본 뒤 전진 속도
+    approach_speed: 0.11                  # 마주본 뒤 전진 속도(기존 대비 약 1/3)
     approach_kp_ang: 1.0
-    approach_omega_max: 0.7               # 접근 중 회전 상한(빠른 회전 방지)
+    approach_omega_max: 0.23              # 접근 중 회전 상한(기존 대비 약 1/3)
     approach_look_sec: 1.0                # 접근도 스텝: 멈춰서 인식 1.0s → 짧게 이동 → 반복 (움직이며 인식 X)
     approach_move_sec: 0.5                # 한 스텝 이동(회전 또는 전진) 시간
     approach_lost_grace_sec: 2.5          # 타겟 순간 사라져도 이 시간은 유지(튀는 재선택 방지)
@@ -318,11 +310,11 @@ go_to_goal_node:
   ros__parameters:
     control_rate_hz: 20.0
     # ★하이브리드 주행★ (duty, m/s 아님). 실측: 전진 duty 0.10→~0.2m/s, 0.20→~0.67m/s (taper 있음).
-    # cruise 0.18(~0.5m/s), floor 0.12(움직이는 최소). travel은 car-like(목표 바라보고 전진, 횡X).
+    # 맵 안정화를 위해 cruise/floor/turn을 기존 대비 약 1/3로 낮춤.
     kp_lin: 0.8                           # 오차 m당 cruise. 0.22m 넘으면 cruise 포화
-    max_lin_speed: 0.18                   # cruise duty. 너무 빠르면↓, 굼뜨면↑
-    min_lin_speed: 0.12                   # 움직이는 최소 duty(스톨 방지 하한)
-    max_ang_speed: 0.80                   # 목표 바라보는 회전속도(car-like). 오버슈트 심하면↓
+    max_lin_speed: 0.06                   # cruise duty. 너무 빠르면↓, 굼뜨면↑
+    min_lin_speed: 0.04                   # 움직이는 최소 duty(스톨하면 0.06~0.08로 올림)
+    max_ang_speed: 0.27                   # 목표 바라보는 회전속도(car-like)
     fine_radius_m: 0.15                   # 이 안=홀로노믹 미세, 밖=car-like cruise
     face_tol_rad: 0.35                    # travel: 목표를 이 각(±20°) 안으로 바라봐야 전진 시작
     # 벽 충돌 방지: 로봇 40×40(반경 0.2m), 4×4 경기장(±2). 목표를 이 범위로 클램프해 벽에 안 붙게.
@@ -349,11 +341,9 @@ base_controller_node:
     # 이러면 속도밴드가 전진/횡이동에 동일 의미 → 횡이동이 약해 스톨하지 않음. 여전히 휘면 이 비율 재튜닝.
     strafe_right_scales: [0.875, 0.875, 1.0, 0.875]
     strafe_left_scales: [0.867, 1.0, 1.0, 0.867]
-    wheel_min: 0.12                        # 정지마찰 floor. 실측 전진 floor(~0.10) 살짝 위. go_to_goal이
-                                           # min_lin(0.12)로 이미 이 위를 주니 주행 중엔 비례 안 뭉갬.
-                                           # 모터만 부웅 하고 안 움직이면 0.14~0.16으로 올림.
-    wheel_min_rot: 0.20                    # 제자리 회전 floor. 회전 오버슈트 심하면↓, 안 돌면↑
-    wheel_boost: 0.40                      # 정지→출발 정지마찰 킥. 0.65는 급발진·미끄러짐 → 0.4로 완화
+    wheel_min: 0.04                        # 저속 맵핑용 floor. 스톨하면 0.06~0.08로 올림.
+    wheel_min_rot: 0.07                    # 제자리 회전 floor. 회전 안 돌면 0.10~0.14로 올림.
+    wheel_boost: 0.13                      # 정지→출발 정지마찰 킥도 기존 대비 약 1/3
     wheel_boost_ms: 100                    # boost_ms
     wheel_slew_per_tick: 0.02             # 가감속 더더 완만(아주 부드럽게)
     align_wheel_boost: 0.42               # ALIGN 미세정렬 킥(더 부드럽게)
@@ -393,6 +383,7 @@ recognition_viz_node:
     show_camera_panels: true              # YOLO-annotated wide + body feeds beside the map
     write_live_png: true                  # overwrite <run>/live.png each redraw (open it in the IDE)
     save_training_data: true              # 실전 run: raw 프레임+YOLO검출을 <run>/training/{wide,body}/{images,labels}에 저장(학습데이터)
+    trail_min_step_m: 0.01                # 정지 중 pose 미세진동은 파란 경로에 추가하지 않음
     training_interval_sec: 1.5            # 저장 주기(초). 검출 있는 프레임만 저장
     trail_max_points: 2000
     redraw_rate_hz: 5.0

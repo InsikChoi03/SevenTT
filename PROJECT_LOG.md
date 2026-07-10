@@ -26,10 +26,10 @@
 
 ## 2. 현재 상태 (Snapshot — 이 섹션만 최신값으로 덮어쓰기)
 
-- **현재 버전:** `v0.11.0`
-- **최종 업데이트:** 2026-07-09 22:40 (KST)
+- **현재 버전:** `v0.12.0`
+- **최종 업데이트:** 2026-07-10 22:32 (KST)
 - **최종 작업자:** `@AI`
-- **한 줄 요약:** 벽 segmentation 기반 위치보정 디버깅과 엔코더 odom 검증 작업을 하루 마무리 기준으로 정리하고 GitHub 업로드 준비를 완료했다.
+- **한 줄 요약:** YOLO 벽 segmentation mask 기반 벽 보정/맵 생성 로직을 메인 경기 실행에 연결하고 저속 주행 설정으로 안정화했다.
 
 ---
 
@@ -89,8 +89,10 @@
 - [x] 라벨링 완료 후 `scripts/colab_train_wallseg_v1.ipynb`로 `wall_floor_boundary_seg_v1.pt` 학습 — `@AI` (2026-07-09 1차 완료)
 - [x] 학습된 `wall_floor_boundary_seg_v1.pt`를 `models/`에 복사하고 기존 `wide.pt`/`cube.pt`와 분리 보관 — `@insik` (2026-07-09 로봇 로컬 복사 완료, 모델 파일은 git 제외)
 - [x] `wall_localizer_node.py`에 segmentation mask 후보 생성 hook과 edge fallback 연결 — `@AI` (2026-07-09 완료)
-- [ ] 추가 촬영한 벽 데이터 61장을 라벨링해 v2 dataset으로 합치고 재학습 여부 판단 — `@insik`
-- [ ] segmentation mask 내부 중심선/최종 벽 선분 선택 로직을 실제 화면에서 더 튜닝 — `@AI`
+- [x] 추가 촬영한 벽 데이터 61장을 라벨링해 v2 dataset으로 합치고 재학습 여부 판단 — `@insik` (2026-07-10 v2 학습·로봇 복사 완료)
+- [x] segmentation mask 내부 중심선/최종 벽 선분 선택 로직을 실제 화면에서 더 튜닝 — `@AI` (2026-07-10 mask median/PCA 선분 기준으로 전환)
+- [ ] 저속 메인 경기 실행에서 벽 보정이 들어갈 때 파란 로봇 pose, 주황 raw 선분, 노란 snapped 선분이 함께 안정적으로 움직이는지 확인 — `@insik`
+- [ ] 1/3 주행속도 설정에서 로봇이 스톨하면 `wheel_min`, `wheel_min_rot`, `wheel_boost`를 최소한으로 재상향 튜닝 — `@AI`
 - [ ] 팔 제어 보드 연결 후 `/dev/ttyUSB*` 또는 `/dev/ttyACM*` 포트 인식 확인하고 집기-보관 1회 재실행 — `@insik`
 - [ ] CH340 장치에 대해 `udev`/`devtmpfs` 상태를 점검해 `/dev/ttyUSB0` 노드가 생성되지 않는 원인을 해결 — `@insik`
 - [ ] `arm_controller_node`가 참조하는 `arm_ik.WRIST_ROLL_HOME` 누락을 정리해 메인 경기 런치 크래시를 제거 — `@AI`
@@ -100,6 +102,33 @@
 ## 5. 변경 이력 (Changelog) — ⛔ 삭제 금지 / 최신 항목이 맨 위
 
 <!-- 새 엔트리는 바로 이 줄 아래에 추가하세요. 기존 엔트리는 건드리지 마세요. -->
+
+### `v0.12.0` — 2026-07-10 22:32 (KST) · 작업자: `@AI` · ID: `2026-07-10-01`
+- **변경 요약:** YOLO 벽 segmentation mask 기반 벽 보정/맵 생성 로직을 메인 경기 실행에 연결하고 저속 주행 설정으로 안정화했다.
+- **상세:**
+  - `wall_localizer_node.py`에서 기존 Canny/Hough/기하 게이트 중심 벽 후보 대신, 학습된 wall-floor-boundary segmentation mask의 connected component 중심과 주 방향(PCA/median line)을 최종 벽 관측으로 사용하도록 바꿨다.
+  - L자형 mask가 대각선 한 줄로 이어지는 문제를 줄이기 위해 mask component 기반 선분 생성과 분할 로직을 정리하고, 보정용 field 선분(`/localization/wall_segments`), 원본 투영 선분(`/localization/wall_raw_segments`), 카메라 overlay용 mask 선분(`/localization/wall_mask_segments_image`)을 분리했다.
+  - `localizer_node.py`에 wall anchor/field correction 입력과 `/localization/wall_map_transform` 발행을 추가해, 벽 보정이 들어갈 때 로봇 pose만 따로 움직이는 것이 아니라 전체 맵 좌표계 변환을 전달하도록 했다.
+  - `world_model_node.py`와 `recognition_viz_node.py`가 `/localization/wall_map_transform`을 받아 로봇 pose, 물체 track/anchor/candidate, 경로, raw wall projection을 같은 강체 변환으로 이동하도록 연결했다.
+  - `recognition_viz_node.py`에서 WIDE 카메라에는 mask 기반 노란 선분을, 맵에는 보정용 노란 선분과 raw 주황 선분을 표시해 실제 측정과 snapped wall의 차이를 확인할 수 있게 했다.
+  - `perception.yaml`을 live mapping/test-field 설정과 동기화해 메인 `bringup.launch.py`에서도 wall segmentation v2, object-flow, object landmark, recognition visualization이 같은 방식으로 작동하도록 했다.
+  - `perception.launch.py`에 `recognition_viz_node`를 추가하고, `bringup.launch.py`에는 IMU 노드를 추가해 메인 경기 실행에서도 현재 맵 생성 과정이 함께 뜨도록 했다.
+  - `mission_fsm_node.py`의 opening 동작을 기존 전진+우측 횡이동에서 `1초 전진 → 45도 회전 → 1초 대기 → SCAN`으로 변경하고, 회전은 world heading 도달 기준과 timeout을 함께 쓰도록 했다.
+  - 맵 생성 중 흔들림을 줄이기 위해 메인/테스트 config의 주행 속도와 회전 속도, base wheel floor/boost를 기존 대비 약 1/3 수준으로 낮췄다.
+  - `py_compile`, YAML 파싱, 설치본 config 값 확인, `ros2 launch robot_bringup bringup.launch.py --show-args`로 launch 해석을 확인했다.
+- **변경 파일:**
+  - `ros2_ws/src/robot_perception/robot_perception/nodes/wall_localizer_node.py` / 수정
+  - `ros2_ws/src/robot_perception/robot_perception/nodes/localizer_node.py` / 수정
+  - `ros2_ws/src/robot_perception/robot_perception/nodes/world_model_node.py` / 수정
+  - `ros2_ws/src/robot_perception/robot_perception/nodes/recognition_viz_node.py` / 수정
+  - `ros2_ws/src/robot_planning/robot_planning/nodes/mission_fsm_node.py` / 수정
+  - `ros2_ws/src/robot_bringup/config/perception.yaml` / 수정
+  - `ros2_ws/src/robot_bringup/config/test_field.yaml` / 수정
+  - `ros2_ws/src/robot_bringup/launch/bringup.launch.py` / 수정
+  - `ros2_ws/src/robot_bringup/launch/perception.launch.py` / 수정
+  - `PROJECT_LOG.md` / 수정
+- **다음 할 일 반영:** v2 벽 segmentation 학습/로봇 복사와 mask 중심선 튜닝 TODO를 완료 처리하고, 저속 메인 경기 실행 검증 및 스톨 시 최소 구동값 재상향 튜닝 TODO를 추가했다.
+- **버전 근거:** 벽 mask 기반 위치보정 파이프라인을 재구성하고 메인 경기 launch/config/FSM 동작까지 연결한 기능 추가이므로 `MINOR` 버전 증가로 `v0.12.0`으로 올렸다.
 
 ### `v0.11.0` — 2026-07-09 22:40 (KST) · 작업자: `@AI` · ID: `2026-07-09-11`
 - **변경 요약:** 벽 segmentation 기반 위치보정 디버깅과 엔코더 odom 검증 작업을 하루 마무리 기준으로 정리하고 GitHub 업로드 준비를 완료했다.

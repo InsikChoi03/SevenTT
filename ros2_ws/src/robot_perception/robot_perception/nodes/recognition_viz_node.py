@@ -12,7 +12,7 @@ Subscribes:
   /localization/pose        geometry_msgs/PoseStamped       — higher-rate pose for a smooth trail
   /camera_top/detections    robot_interfaces/DetectionArray — wide-cam raw detections (HUD counts)
   /camera_body/detections   robot_interfaces/DetectionArray — body-cam raw detections (HUD counts)
-  /localization/wall_segments_image Float32MultiArray       — accepted wall segments in wide image pixels
+  /localization/wall_mask_segments_image Float32MultiArray  — authoritative mask-median wall lines
   /localization/wall_segmentation_mask Image                 — learned wall/floor mask overlay for debugging
   /classification/siglip    robot_interfaces/Classification — body fruit type (logged with picks)
   /classification/shape     robot_interfaces/Classification — body shape class (logged with picks)
@@ -167,6 +167,7 @@ class RecognitionVizNode(Node):
         self.declare_parameter("snapshot_interval_sec", 5.0)
         self.declare_parameter("show_window", False)
         self.declare_parameter("trail_max_points", 2000)
+        self.declare_parameter("trail_min_step_m", 0.01)
         self.declare_parameter("redraw_rate_hz", 5.0)
         # Show the two YOLO-annotated camera feeds beside the map, and keep overwriting a single
         # live.png every redraw (open it in the IDE for a near-real-time headless view).
@@ -205,6 +206,7 @@ class RecognitionVizNode(Node):
         self.show_window = bool(self.get_parameter("show_window").value)
         self.redraw_rate = float(self.get_parameter("redraw_rate_hz").value)
         trail_max = int(self.get_parameter("trail_max_points").value)
+        self.trail_min_step = float(self.get_parameter("trail_min_step_m").value)
         self.show_cams = bool(self.get_parameter("show_camera_panels").value) and _BRIDGE_AVAILABLE
         self.write_live = bool(self.get_parameter("write_live_png").value)
         self.save_training = bool(self.get_parameter("save_training_data").value) and _BRIDGE_AVAILABLE
@@ -275,8 +277,13 @@ class RecognitionVizNode(Node):
         self.proj_dets: list = []   # per-camera raw projections (x, y, src) from /world_model/projected_dets
         self.wall_segments: list[tuple[float, float, float, float]] = []
         self.wall_segments_time = 0.0
-        self.wall_image_segments: list[tuple[float, float, float, float]] = []
-        self.wall_image_segments_time = 0.0
+        self.wall_raw_segments = []
+        self.wall_raw_segments_time = 0.0
+        self._wall_tf_tx = 0.0
+        self._wall_tf_ty = 0.0
+        self._wall_tf_th = 0.0
+        self.wall_mask_segments: list[tuple[float, float, float, float]] = []
+        self.wall_mask_segments_time = 0.0
         self.wall_mask_img: Image | None = None
         self.wall_mask_time = 0.0
 
@@ -304,6 +311,9 @@ class RecognitionVizNode(Node):
 
         self.create_subscription(WorldModel, "/world_model", self.on_world, 10)
         self.create_subscription(PoseStamped, "/localization/pose", self.on_pose, 10)
+        self.create_subscription(
+            Float32MultiArray, "/localization/wall_map_transform", self.on_wall_map_transform, 10
+        )
         self.create_subscription(DetectionArray, "/camera_top/detections", self.on_top_det, 10)
         self.create_subscription(DetectionArray, "/camera_body/detections", self.on_body_det, 10)
         if self.show_cams or self.save_training:
@@ -320,8 +330,10 @@ class RecognitionVizNode(Node):
         self.create_subscription(Float32MultiArray, "/world_model/projected_dets", self.on_proj, 10)
         self.create_subscription(Float32MultiArray, "/localization/wall_segments",
                                  self.on_wall_segments, 10)
-        self.create_subscription(Float32MultiArray, "/localization/wall_segments_image",
-                                 self.on_wall_image_segments, 10)
+        self.create_subscription(Float32MultiArray, "/localization/wall_raw_segments",
+                                 self.on_wall_raw_segments, 10)
+        self.create_subscription(Float32MultiArray, "/localization/wall_mask_segments_image",
+                                 self.on_wall_mask_segments, 10)
         self.create_subscription(Image, "/localization/wall_segmentation_mask",
                                  self.on_wall_mask, qos_profile_sensor_data)
 
@@ -345,7 +357,31 @@ class RecognitionVizNode(Node):
                 self._log_event("first_seen", obj=obj)
 
     def on_pose(self, msg: PoseStamped) -> None:
-        self.trail.append((float(msg.pose.position.x), float(msg.pose.position.y)))
+        point = (float(msg.pose.position.x), float(msg.pose.position.y))
+        if not self.trail or math.hypot(point[0] - self.trail[-1][0], point[1] - self.trail[-1][1]) >= self.trail_min_step:
+            self.trail.append(point)
+
+    def on_wall_map_transform(self, msg: Float32MultiArray) -> None:
+        """Keep debug overlays and the trail rigid with a global wall alignment."""
+        if len(msg.data) < 3:
+            return
+        tx, ty, dth = (float(msg.data[i]) for i in range(3))
+        ct, st = math.cos(dth), math.sin(dth)
+
+        def transform(x: float, y: float) -> tuple[float, float]:
+            return ct * x - st * y + tx, st * x + ct * y + ty
+
+        old_tx, old_ty, old_th = self._wall_tf_tx, self._wall_tf_ty, self._wall_tf_th
+        self._wall_tf_tx = ct * old_tx - st * old_ty + tx
+        self._wall_tf_ty = st * old_tx + ct * old_ty + ty
+        self._wall_tf_th = math.atan2(math.sin(old_th + dth), math.cos(old_th + dth))
+
+        self.trail = deque((transform(x, y) for x, y in self.trail), maxlen=self.trail.maxlen)
+        self.wall_raw_segments = [
+            (*transform(x0, y0), *transform(x1, y1))
+            for x0, y0, x1, y1 in self.wall_raw_segments
+        ]
+        self.proj_dets = [(*transform(x, y), src) for x, y, src in self.proj_dets]
 
     def on_top_det(self, msg: DetectionArray) -> None:
         self.top_dets = list(msg.detections)
@@ -361,13 +397,23 @@ class RecognitionVizNode(Node):
         self.wall_segments = segs
         self.wall_segments_time = time.time()
 
-    def on_wall_image_segments(self, msg: Float32MultiArray) -> None:
+    def on_wall_raw_segments(self, msg: Float32MultiArray) -> None:
+        vals = [float(v) for v in msg.data]
+        segs = []
+        for i in range(0, len(vals) - 3, 4):
+            x0, y0 = self._apply_wall_map_transform(vals[i], vals[i + 1])
+            x1, y1 = self._apply_wall_map_transform(vals[i + 2], vals[i + 3])
+            segs.append((x0, y0, x1, y1))
+        self.wall_raw_segments = segs
+        self.wall_raw_segments_time = time.time()
+
+    def on_wall_mask_segments(self, msg: Float32MultiArray) -> None:
         vals = [float(v) for v in msg.data]
         segs = []
         for i in range(0, len(vals) - 3, 4):
             segs.append((vals[i], vals[i + 1], vals[i + 2], vals[i + 3]))
-        self.wall_image_segments = segs
-        self.wall_image_segments_time = time.time()
+        self.wall_mask_segments = segs
+        self.wall_mask_segments_time = time.time()
 
     def on_wall_mask(self, msg: Image) -> None:
         self.wall_mask_img = msg
@@ -409,9 +455,16 @@ class RecognitionVizNode(Node):
 
     def on_proj(self, msg: Float32MultiArray) -> None:
         d = list(msg.data)
-        self.proj_dets = [(d[i], d[i + 1], int(d[i + 2])) for i in range(0, len(d) - 2, 3)]
+        self.proj_dets = [
+            (*self._apply_wall_map_transform(d[i], d[i + 1]), int(d[i + 2]))
+            for i in range(0, len(d) - 2, 3)
+        ]
 
     # ------------------------------------------------------------------ helpers
+    def _apply_wall_map_transform(self, x: float, y: float) -> tuple[float, float]:
+        ct, st = math.cos(self._wall_tf_th), math.sin(self._wall_tf_th)
+        return ct * x - st * y + self._wall_tf_tx, st * x + ct * y + self._wall_tf_ty
+
     def _lookup(self, obj_id: int) -> Object | None:
         if self.world is None or obj_id == 0:
             return None
@@ -589,7 +642,7 @@ class RecognitionVizNode(Node):
                         cv2.FONT_HERSHEY_SIMPLEX, 0.45, col, 1, cv2.LINE_AA)
         if title.startswith("WIDE"):
             self._draw_wall_mask(out)
-            self._draw_wall_image_segments(out, sx, sy)
+            self._draw_wall_mask_segments(out, sx, sy)
         cv2.rectangle(out, (0, 0), (w, 18), (0, 0, 0), -1)
         cv2.putText(out, f"{title}  dets={len(dets)}", (6, 13),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.45, _COL_TEXT, 1, cv2.LINE_AA)
@@ -620,12 +673,12 @@ class RecognitionVizNode(Node):
         if contours:
             cv2.drawContours(frame, contours, -1, (0, 0, 255), 1, cv2.LINE_AA)
 
-    def _draw_wall_image_segments(self, frame, sx: float, sy: float) -> None:
-        """Overlay accepted wall-localizer segments on the wide camera panel."""
-        if not self.wall_image_segments or time.time() - self.wall_image_segments_time > 1.5:
+    def _draw_wall_mask_segments(self, frame, sx: float, sy: float) -> None:
+        """Overlay authoritative mask-median wall lines in yellow."""
+        if not self.wall_mask_segments or time.time() - self.wall_mask_segments_time > 1.5:
             return
         h, w = frame.shape[:2]
-        for x0, y0, x1, y1 in self.wall_image_segments:
+        for x0, y0, x1, y1 in self.wall_mask_segments:
             p0 = (int(round(x0 * sx)), int(round(y0 * sy)))
             p1 = (int(round(x1 * sx)), int(round(y1 * sy)))
             if (
@@ -633,15 +686,16 @@ class RecognitionVizNode(Node):
                 or max(p0[1], p1[1]) < 0 or min(p0[1], p1[1]) >= h
             ):
                 continue
-            cv2.line(frame, p0, p1, (0, 0, 255), 3, cv2.LINE_AA)
-            cv2.circle(frame, p0, 4, (0, 0, 255), -1, cv2.LINE_AA)
-            cv2.circle(frame, p1, 4, (0, 0, 255), -1, cv2.LINE_AA)
+            cv2.line(frame, p0, p1, (0, 255, 255), 2, cv2.LINE_AA)
+            cv2.circle(frame, p0, 3, (0, 255, 255), -1, cv2.LINE_AA)
+            cv2.circle(frame, p1, 3, (0, 255, 255), -1, cv2.LINE_AA)
 
     def _render(self):
         W = H = self.canvas_px
         canvas = np.full((H, W, 3), 24, np.uint8)
         self._extent_now = self._current_extent()   # auto-fit (or fixed) for this frame
         self._draw_grid(canvas)
+        self._draw_wall_raw_segments(canvas)
         self._draw_wall_segments(canvas)
         self._draw_fov(canvas)                       # camera coverage under the objects
         self._draw_trail(canvas)
@@ -655,16 +709,27 @@ class RecognitionVizNode(Node):
         self._draw_legend(canvas)
         return canvas
 
+    def _draw_wall_raw_segments(self, canvas) -> None:
+        """Draw unsnapped wall projections in orange for calibration debugging."""
+        if not self.wall_raw_segments or time.time() - self.wall_raw_segments_time > 1.5:
+            return
+        for x0, y0, x1, y1 in self.wall_raw_segments:
+            p0 = self._w2p(x0, y0)
+            p1 = self._w2p(x1, y1)
+            cv2.line(canvas, p0, p1, (0, 165, 255), 2, cv2.LINE_AA)
+            cv2.circle(canvas, p0, 3, (0, 165, 255), -1, cv2.LINE_AA)
+            cv2.circle(canvas, p1, 3, (0, 165, 255), -1, cv2.LINE_AA)
+
     def _draw_wall_segments(self, canvas) -> None:
-        """Accepted arena-wall detections from wall_localizer, in field coordinates."""
+        """Mask-authoritative wall observations projected into field coordinates."""
         if not self.wall_segments or time.time() - self.wall_segments_time > 1.5:
             return
         for x0, y0, x1, y1 in self.wall_segments:
             p0 = self._w2p(x0, y0)
             p1 = self._w2p(x1, y1)
-            cv2.line(canvas, p0, p1, (0, 0, 255), 3, cv2.LINE_AA)
-            cv2.circle(canvas, p0, 4, (0, 0, 255), -1, cv2.LINE_AA)
-            cv2.circle(canvas, p1, 4, (0, 0, 255), -1, cv2.LINE_AA)
+            cv2.line(canvas, p0, p1, (0, 255, 255), 3, cv2.LINE_AA)
+            cv2.circle(canvas, p0, 4, (0, 255, 255), -1, cv2.LINE_AA)
+            cv2.circle(canvas, p1, 4, (0, 255, 255), -1, cv2.LINE_AA)
 
     def _draw_proj(self, canvas) -> None:
         """Raw per-camera homography projections of the CURRENT detections: wide = orange x,

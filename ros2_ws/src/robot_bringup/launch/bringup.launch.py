@@ -34,6 +34,8 @@ def generate_launch_description() -> LaunchDescription:
     static_tf = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(os.path.join(launch_dir, "static_transforms.launch.py"))
     )
+    imu = Node(package="robot_hardware", executable="imu_mpu6050_node",
+               name="imu_mpu6050_node", parameters=[params], output="screen")
     perception = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(os.path.join(launch_dir, "perception.launch.py"))
     )
@@ -61,6 +63,7 @@ def generate_launch_description() -> LaunchDescription:
                               description="also start base/arm controllers + MCU serial bridges"),
         cameras,
         static_tf,
+        imu,
         perception,
         control_layer,
     ])

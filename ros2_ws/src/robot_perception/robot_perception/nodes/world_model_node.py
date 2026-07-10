@@ -401,6 +401,9 @@ class WorldModelNode(Node):
         self.create_subscription(DetectionArray, "/camera_body/detections", self.on_body_detections, 10)
         self.create_subscription(Classification, "/classification/siglip", self.on_siglip, 10)
         self.create_subscription(PoseStamped, "/localization/pose", self.on_pose, 10)
+        self.create_subscription(
+            Float32MultiArray, "/localization/wall_map_transform", self.on_wall_map_transform, 10
+        )
         self.create_subscription(UInt64, "/world_model/blacklist_add", self.on_blacklist_add, 10)
 
         self.pub = self.create_publisher(WorldModel, "/world_model", 10)
@@ -625,6 +628,36 @@ class WorldModelNode(Node):
         t = self._stamp_to_sec(msg.header.stamp)
         self._pose_hist.append((t if t > 0.0 else self._now_sec(),
                                 self.robot_x, self.robot_y, self.robot_theta))
+
+    def on_wall_map_transform(self, msg: Float32MultiArray) -> None:
+        """Move robot history, tracks and anchors by the same wall-alignment transform."""
+        if len(msg.data) < 3:
+            return
+        tx, ty, dth = (float(msg.data[i]) for i in range(3))
+        ct, st = math.cos(dth), math.sin(dth)
+
+        def transform(x: float, y: float) -> tuple[float, float]:
+            return ct * x - st * y + tx, st * x + ct * y + ty
+
+        self.robot_x, self.robot_y = transform(self.robot_x, self.robot_y)
+        self.robot_theta = math.atan2(
+            math.sin(self.robot_theta + dth), math.cos(self.robot_theta + dth)
+        )
+        for tr in self.tracks.values():
+            tr.x, tr.y = transform(tr.x, tr.y)
+            tr.anchor_x, tr.anchor_y = transform(tr.anchor_x, tr.anchor_y)
+        for candidate in self._candidates:
+            candidate["x"], candidate["y"] = transform(candidate["x"], candidate["y"])
+        self._pose_hist = deque(
+            [
+                (t, *transform(x, y), math.atan2(math.sin(th + dth), math.cos(th + dth)))
+                for t, x, y, th in self._pose_hist
+            ],
+            maxlen=64,
+        )
+        self._proj_wide = [transform(x, y) for x, y in self._proj_wide]
+        self._proj_body = [transform(x, y) for x, y in self._proj_body]
+        self._corr_pairs.clear()
 
     def on_blacklist_add(self, msg: UInt64) -> None:
         track = self.tracks.get(int(msg.data))

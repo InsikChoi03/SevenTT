@@ -110,19 +110,18 @@ class MissionFsmNode(Node):
         self.declare_parameter("end_after_quota", False)
         self.declare_parameter("select_timeout_sec", 0.0)
         # --- hardcoded opening move (very first thing at match start), BODY frame ---
-        # Drive forward opening_forward_dist, settle, then strafe to the robot's RIGHT (-y)
-        # opening_strafe_dist, settle, then hand over to SCAN. Timed at opening_speed via /base_command
-        # so the base_controller's start-boost + stop-brake apply to each leg. TUNE the two _sec
-        # values on the real floor for exactly 30 cm (strafe is slower on mecanum -> longer).
+        # Drive forward, rotate in place by opening_turn_deg, wait, then hand over to SCAN.
+        # Timed through /base_command so the base_controller's start-boost + stop-brake apply.
         self.declare_parameter("opening_enabled", True)
         # Hold STATIONARY at startup until perception is warm: YOLO (wide.pt@1280) takes ~10-15 s to
         # load, and moving before detections flow makes the localizer's object-flow/VO drift and lose
         # heading. Wait this long AND until the first /world_model arrives before the opening move.
         self.declare_parameter("startup_warmup_sec", 15.0)
         self.declare_parameter("opening_speed", 0.35)        # >= wheel_min so it's the actual speed
-        self.declare_parameter("opening_forward_sec", 0.9)   # duration for ~30 cm forward (tune)
-        self.declare_parameter("opening_strafe_sec", 1.5)    # duration for ~30 cm right strafe (tune)
-        self.declare_parameter("opening_settle_sec", 0.6)    # stop between legs so brake fires + inertia dies
+        self.declare_parameter("opening_forward_sec", 1.0)
+        self.declare_parameter("opening_turn_deg", 45.0)
+        self.declare_parameter("opening_turn_omega", -0.5)   # negative = CW, positive = CCW
+        self.declare_parameter("opening_wait_after_turn_sec", 1.0)
         # SCAN search: the start pose likely sees nothing, so after the opening the robot turns slowly
         # CLOCKWISE in place to sweep for objects. Negative omega = CW (REP-103 +z is up). The actual
         # turn speed is set by base_controller wheel_min_rot (this just needs to be non-zero CW).
@@ -226,8 +225,9 @@ class MissionFsmNode(Node):
         self.startup_warmup_sec = float(self.get_parameter("startup_warmup_sec").value)
         self.opening_speed = float(self.get_parameter("opening_speed").value)
         self.opening_forward_sec = float(self.get_parameter("opening_forward_sec").value)
-        self.opening_strafe_sec = float(self.get_parameter("opening_strafe_sec").value)
-        self.opening_settle_sec = float(self.get_parameter("opening_settle_sec").value)
+        self.opening_turn_deg = float(self.get_parameter("opening_turn_deg").value)
+        self.opening_turn_omega = float(self.get_parameter("opening_turn_omega").value)
+        self.opening_wait_after_turn_sec = float(self.get_parameter("opening_wait_after_turn_sec").value)
         self.scan_search_omega = float(self.get_parameter("scan_search_omega").value)
         self.map_center_x = float(self.get_parameter("map_center_x").value)
         self.map_center_y = float(self.get_parameter("map_center_y").value)
@@ -306,9 +306,10 @@ class MissionFsmNode(Node):
         rate = float(self.get_parameter("publish_rate_hz").value)
 
         # --- runtime state ---
-        # Start with the hardcoded opening move (forward + right), then fall into SCAN. Disable via param.
+        # Start with the hardcoded opening move, then fall into SCAN. Disable via param.
         self.state = "OPENING" if self.opening_enabled else "SCAN"
-        self._opening_leg = "wait"      # wait(ready) -> forward -> settle1 -> strafe -> settle2 -> SCAN
+        self._opening_leg = "wait"      # wait(ready) -> forward -> turn -> settle -> SCAN
+        self._opening_turn_start_theta: float | None = None
         self._got_world = False         # set on first /world_model (perception up)
         self._node_start_s = self._now_s()
         self.phase = 1          # 1 = pursue Set1, 2 = pursue Set2 (pick ordering; mapping is continuous)
@@ -547,6 +548,10 @@ class MissionFsmNode(Node):
         c.header.stamp = self.get_clock().now().to_msg()
         c.vx, c.vy, c.omega = float(vx), float(vy), float(omega)
         self.pub_cmd.publish(c)
+
+    @staticmethod
+    def _wrap_pi(a: float) -> float:
+        return math.atan2(math.sin(a), math.cos(a))
 
     def _robot_xy(self) -> tuple[float, float] | None:
         if self.world is None:
@@ -846,9 +851,11 @@ class MissionFsmNode(Node):
         self._enter("SELECT_TARGET")
 
     def _step_opening(self) -> None:
-        """Hardcoded match opening: forward -> settle -> right-strafe -> settle -> SCAN. BODY frame,
-        driven through /base_command so the base_controller start-boost + stop-brake apply per leg.
-        Legs are timed; state_enter_s is reset at each leg so _time_in_state() measures the leg."""
+        """Hardcoded match opening: forward -> 45deg turn -> wait -> SCAN.
+
+        BODY-frame commands are timed; state_enter_s is reset at each leg so _time_in_state()
+        measures that leg only. The turn duration is derived from opening_turn_deg/omega.
+        """
         t = self._time_in_state()
         leg = self._opening_leg
         if leg == "wait":
@@ -857,7 +864,7 @@ class MissionFsmNode(Node):
             self._drive(0.0, 0.0)
             warm = (self._now_s() - self._node_start_s) >= self.startup_warmup_sec
             if warm and self._got_world:
-                self.get_logger().info("perception warm -> opening move (forward + right strafe)")
+                self.get_logger().info("perception warm -> opening move (forward + 45deg turn)")
                 self._opening_leg = "forward"
                 self.state_enter_s = self._now_s()
         elif leg == "forward":
@@ -865,24 +872,33 @@ class MissionFsmNode(Node):
                 self._drive(self.opening_speed, 0.0)          # +vx = robot forward
             else:
                 self._drive(0.0, 0.0)
-                self._opening_leg = "settle1"
+                self._opening_leg = "turn"
+                self._opening_turn_start_theta = (
+                    float(self.world.robot_theta) if self.world is not None else None
+                )
                 self.state_enter_s = self._now_s()
-        elif leg == "settle1":
-            self._drive(0.0, 0.0)                              # brake pulse + let inertia die
-            if t >= self.opening_settle_sec:
-                self._opening_leg = "strafe"
-                self.state_enter_s = self._now_s()
-        elif leg == "strafe":
-            if t < self.opening_strafe_sec:
-                self._drive(0.0, -self.opening_speed)         # -vy = robot RIGHT (REP-103 y is left)
+        elif leg == "turn":
+            omega = self.opening_turn_omega
+            target = abs(math.radians(self.opening_turn_deg))
+            timed_sec = 0.0
+            if abs(omega) > 1e-6:
+                timed_sec = target / abs(omega)
+            done_by_heading = False
+            if self._opening_turn_start_theta is not None and self.world is not None:
+                direction = 1.0 if omega >= 0.0 else -1.0
+                delta = self._wrap_pi(float(self.world.robot_theta) - self._opening_turn_start_theta)
+                done_by_heading = direction * delta >= target
+            timeout_sec = max(timed_sec + 0.5, timed_sec * 1.5)
+            if not done_by_heading and t < timeout_sec:
+                self._drive(0.0, 0.0, omega)
             else:
                 self._drive(0.0, 0.0)
-                self._opening_leg = "settle2"
+                self._opening_leg = "settle"
                 self.state_enter_s = self._now_s()
-        else:  # settle2
+        else:  # settle
             self._drive(0.0, 0.0)
-            if t >= self.opening_settle_sec:
-                self.get_logger().info("opening done (forward + right strafe) -> SCAN")
+            if t >= self.opening_wait_after_turn_sec:
+                self.get_logger().info("opening done (forward + 45deg turn + wait) -> SCAN")
                 self._enter("SCAN")
 
     def _search_step(self) -> None:

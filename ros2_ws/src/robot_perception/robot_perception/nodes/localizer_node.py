@@ -106,6 +106,7 @@ class LocalizerNode(Node):
 
         # Wheel odometry can run from any 3+ valid mecanum wheel encoders. This keeps localization
         # usable while one encoder is known-bad (currently FL on the base).
+        self.declare_parameter("use_wheel_odom", True)
         self.declare_parameter("wheel_odom_enabled_wheels", [True, True, True, True])
         self.declare_parameter("wheel_odom_deadband_mps", 0.005)
         self.declare_parameter("wheel_odom_max_dt_sec", 0.4)
@@ -114,6 +115,16 @@ class LocalizerNode(Node):
         self.declare_parameter("stationary_cmd_stale_sec", 0.7)
         self.declare_parameter("stationary_required_sec", 0.8)
         self.declare_parameter("suppress_object_flow_when_stationary", True)
+        self.declare_parameter("freeze_pose_when_stationary", True)
+        self.declare_parameter("wall_anchor_gain", 0.50)
+        self.declare_parameter("wall_anchor_max_step_m", 0.03)
+        self.declare_parameter("wall_anchor_max_step_rad", 0.03)
+        self.declare_parameter("wall_anchor_deadband_m", 0.005)
+        self.declare_parameter("wall_field_gain", 0.35)
+        self.declare_parameter("wall_field_max_step_m", 0.05)
+        self.declare_parameter("wall_field_max_step_rad", 0.04)
+        self.declare_parameter("wall_field_deadband_m", 0.005)
+        self.declare_parameter("wall_correction_stale_sec", 1.5)
         enabled = [bool(v) for v in self.get_parameter("wheel_odom_enabled_wheels").value]
         self.wheel_odom_enabled = enabled if len(enabled) == 4 else [True, True, True, True]
         self.wheel_odom_deadband = float(self.get_parameter("wheel_odom_deadband_mps").value)
@@ -124,6 +135,21 @@ class LocalizerNode(Node):
         self.stationary_required_sec = float(self.get_parameter("stationary_required_sec").value)
         self.suppress_object_flow_when_stationary = bool(
             self.get_parameter("suppress_object_flow_when_stationary").value
+        )
+        self.freeze_pose_when_stationary = bool(
+            self.get_parameter("freeze_pose_when_stationary").value
+        )
+        self.use_wheel_odom = bool(self.get_parameter("use_wheel_odom").value)
+        self.wall_anchor_gain = float(self.get_parameter("wall_anchor_gain").value)
+        self.wall_anchor_max_step_m = float(self.get_parameter("wall_anchor_max_step_m").value)
+        self.wall_anchor_max_step_rad = float(self.get_parameter("wall_anchor_max_step_rad").value)
+        self.wall_anchor_deadband_m = float(self.get_parameter("wall_anchor_deadband_m").value)
+        self.wall_field_gain = float(self.get_parameter("wall_field_gain").value)
+        self.wall_field_max_step_m = float(self.get_parameter("wall_field_max_step_m").value)
+        self.wall_field_max_step_rad = float(self.get_parameter("wall_field_max_step_rad").value)
+        self.wall_field_deadband_m = float(self.get_parameter("wall_field_deadband_m").value)
+        self.wall_correction_stale_sec = float(
+            self.get_parameter("wall_correction_stale_sec").value
         )
         self._wheel_rows_all = np.array(
             [
@@ -188,6 +214,7 @@ class LocalizerNode(Node):
         self.declare_parameter("imu_gyro_deadband_rad", 0.01)   # ~0.6 deg/s: below = 0 (kill bias walk)
         self.imu_gyro_deadband = float(self.get_parameter("imu_gyro_deadband_rad").value)
         self.last_imu_time = None
+        self.last_wall_correction_time = None
 
         self.fx = float(self.get_parameter("top_fx").value)
         self.fy = float(self.get_parameter("top_fy").value)
@@ -233,7 +260,8 @@ class LocalizerNode(Node):
         elif self.broadcast_tf and not TF2_AVAILABLE:
             self.get_logger().error("broadcast_tf requested but tf2_ros unavailable; tf disabled")
 
-        self.create_subscription(Float32MultiArray, "/base/wheel_odom", self.on_wheel_odom, 10)
+        if self.use_wheel_odom:
+            self.create_subscription(Float32MultiArray, "/base/wheel_odom", self.on_wheel_odom, 10)
         self.create_subscription(Float32MultiArray, "/base/wheel_speeds", self.on_wheel_cmd, 10)
         if self.use_imu:
             self.create_subscription(Imu, "/imu/data", self.on_imu, qos_profile_sensor_data)
@@ -243,10 +271,19 @@ class LocalizerNode(Node):
             Float32MultiArray, "/localization/landmark_correction", self.on_landmark_correction, 10
         )
         self.create_subscription(
+            Float32MultiArray, "/localization/wall_anchor_correction", self.on_wall_anchor_correction, 10
+        )
+        self.create_subscription(
+            Float32MultiArray, "/localization/wall_field_correction", self.on_wall_field_correction, 10
+        )
+        self.create_subscription(
             Float32MultiArray, "/localization/object_odom", self.on_object_odom, 10
         )
         self.pub = self.create_publisher(PoseStamped, "/localization/pose", 10)
         self.pub_stationary = self.create_publisher(Bool, "/localization/is_stationary", 10)
+        self.pub_wall_map_transform = self.create_publisher(
+            Float32MultiArray, "/localization/wall_map_transform", 10
+        )
         self.timer = self.create_timer(1.0 / rate, self.publish_pose)
 
         self.get_logger().info(
@@ -284,7 +321,6 @@ class LocalizerNode(Node):
         if self.wheel_odom_deadband > 0.0:
             wheels[np.abs(wheels) < self.wheel_odom_deadband] = 0.0
         self._update_stationary(now, wheels)
-
         if self.last_odom_time is None:
             # First sample only establishes a timestamp; no integration yet.
             self.last_odom_time = now
@@ -320,7 +356,9 @@ class LocalizerNode(Node):
             and self.last_objflow_time is not None
             and (now - self.last_objflow_time) <= self.object_flow_stale_sec
         )
-        if not flow_trans_fresh:
+        # Stationary protection freezes only translation.  Rotation is still allowed to come
+        # from the IMU (or the wheel fallback), so a manually rotated robot changes its map arrow.
+        if not flow_trans_fresh and not (self.freeze_pose_when_stationary and self.is_stationary):
             self.x += vxw * dt
             self.y += vyw * dt
         # Rotation: IMU > VO > wheel. Only integrate the (open-loop, drift-prone) wheel yaw when BOTH
@@ -384,9 +422,18 @@ class LocalizerNode(Node):
         if conf < self.object_flow_min_conf:
             return
         now = self.get_clock().now().nanoseconds * 1e-9
-        if self.suppress_object_flow_when_stationary and self.is_stationary:
+        # Object-flow remains the fast motion source even while a yellow wall is available.
+        # Wall correction is a slower absolute drift trim; it must not block live translation.
+        # If no wall correction is available, stationary suppression still protects against
+        # object-flow noise when the robot is genuinely still.
+        wall_fresh = self._wall_correction_fresh(now)
+        if self.suppress_object_flow_when_stationary and self.is_stationary and not wall_fresh:
             self.last_objflow_time = now
             self.last_vo_time = now
+            # Keep a credible rotation measurement even while translation is frozen. IMU has
+            # priority when fresh, so this is only a fallback for robots without IMU data.
+            if not self._imu_fresh(now) and abs(dtheta) >= self.vo_deadband:
+                self.theta = wrap_angle(self.theta + dtheta)
             return
         self.last_objflow_time = now
         self.last_vo_time = now      # object-flow owns rotation -> keep wheel-yaw AND LK-VO suppressed
@@ -407,6 +454,8 @@ class LocalizerNode(Node):
         """
         if not (self.use_object_landmarks or self.use_landmark_correction):
             return
+        if self.freeze_pose_when_stationary and self.is_stationary:
+            return
         d = msg.data
         if len(d) < 3:
             return
@@ -422,6 +471,53 @@ class LocalizerNode(Node):
         self.y += max(-mx, min(mx, g_xy * dy))
         g_th = self.landmark_theta_gain * cf                        # confidence-scaled heading authority
         self.theta = wrap_angle(self.theta + max(-mr, min(mr, g_th * dth)))
+
+    def on_wall_anchor_correction(self, msg: Float32MultiArray) -> None:
+        """Pull a stationary pose back toward the initial yellow-wall anchor."""
+        if not self.freeze_pose_when_stationary or not self.is_stationary or len(msg.data) < 3:
+            return
+        dx, dy, dth = (float(msg.data[i]) for i in range(3))
+        conf = max(0.0, min(1.0, float(msg.data[3]) if len(msg.data) > 3 else 1.0))
+        if math.hypot(dx, dy) < self.wall_anchor_deadband_m and abs(dth) < math.radians(0.3):
+            return
+        gain = max(0.0, self.wall_anchor_gain) * conf
+        self.x -= max(-self.wall_anchor_max_step_m, min(self.wall_anchor_max_step_m, gain * dx))
+        self.y -= max(-self.wall_anchor_max_step_m, min(self.wall_anchor_max_step_m, gain * dy))
+        self.theta = wrap_angle(
+            self.theta - max(-self.wall_anchor_max_step_rad, min(self.wall_anchor_max_step_rad, gain * dth))
+        )
+
+    def on_wall_field_correction(self, msg: Float32MultiArray) -> None:
+        """Apply the wall alignment as one rigid transform to the robot/map frame."""
+        self.last_wall_correction_time = self.get_clock().now().nanoseconds * 1e-9
+        if len(msg.data) < 3:
+            return
+        dx, dy, dth = (float(msg.data[i]) for i in range(3))
+        conf = max(0.0, min(1.0, float(msg.data[3]) if len(msg.data) > 3 else 1.0))
+        if math.hypot(dx, dy) < self.wall_field_deadband_m and abs(dth) < math.radians(0.3):
+            return
+        gain = max(0.0, self.wall_field_gain) * conf
+        tx = max(-self.wall_field_max_step_m, min(self.wall_field_max_step_m, gain * dx))
+        ty = max(-self.wall_field_max_step_m, min(self.wall_field_max_step_m, gain * dy))
+        applied_dth = max(
+            -self.wall_field_max_step_rad,
+            min(self.wall_field_max_step_rad, gain * dth),
+        )
+        ct, st = math.cos(applied_dth), math.sin(applied_dth)
+        old_x, old_y = self.x, self.y
+        self.x = ct * old_x - st * old_y + tx
+        self.y = st * old_x + ct * old_y + ty
+        self.theta = wrap_angle(self.theta + applied_dth)
+
+        applied = Float32MultiArray()
+        applied.data = [float(tx), float(ty), float(applied_dth)]
+        self.pub_wall_map_transform.publish(applied)
+
+    def _wall_correction_fresh(self, now: float) -> bool:
+        return (
+            self.last_wall_correction_time is not None
+            and (now - self.last_wall_correction_time) <= self.wall_correction_stale_sec
+        )
 
     # ----------------------------------------------------------------- top camera
     def on_top_image(self, msg: Image) -> None:
@@ -468,7 +564,8 @@ class LocalizerNode(Node):
             self.last_vo_time = now                          # LK-VO alive -> wheel yaw stays suppressed
             # IMU gyro outranks LK-VO for yaw (LK hallucinates rotation from vibration); apply LK yaw
             # only when the IMU is stale/absent.
-            if abs(theta_visual) >= self.vo_deadband and not self._imu_fresh(now):
+            if (abs(theta_visual) >= self.vo_deadband and not self._imu_fresh(now)
+                    and not (self.freeze_pose_when_stationary and self.is_stationary)):
                 self.theta = wrap_angle(self.theta + theta_visual)
 
         # Absolute-correction hook (approximate; see _detect_landmarks docstring). Skipped
@@ -593,6 +690,9 @@ class LocalizerNode(Node):
     # --------------------------------------------------------------------- publish
     def publish_pose(self) -> None:
         """Publish the current pose; with no inputs this is the initial start pose."""
+        now = self.get_clock().now().nanoseconds * 1e-9
+        if self.last_odom_time is None or (now - self.last_odom_time) > self.stationary_cmd_stale_sec:
+            self._update_stationary(now, np.zeros(4, dtype=np.float64))
         stamp = self.get_clock().now().to_msg()
         qx, qy, qz, qw = yaw_to_quaternion(self.theta)
 
