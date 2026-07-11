@@ -1,7 +1,7 @@
 """Custom YOLOv8n detector over two camera streams (replaces yolo_world_node).
 
-Per-stream 5-class models (as of 2026-07-01; classes
-cube / octahedron / dodecahedron / icosahedron / fruit_photo_cube):
+Per-stream models (classes as of 2026-07-11:
+cube / octahedron / dodecahedron / icosahedron / fruit_photo_cube / arrival):
   • top  (wide-angle)  uses top_model_path  (models/wide.pt) -> /camera_top/detections
   • body (base-fixed)  uses body_model_path (models/cube.pt) -> /camera_body/detections
 Both models are trained on their own camera's domain, so each stream uses the matching one;
@@ -46,7 +46,7 @@ class YoloDetectorNode(Node):
     def __init__(self) -> None:
         super().__init__("yolo_detector_node")
 
-        # Per-stream models (5-class wide.pt / cube.pt as of 2026-07-01). `model_path` is the
+        # Per-stream models (wide.pt / cube.pt). `model_path` is the
         # legacy single-model fallback: if top_model_path / body_model_path are empty, both
         # streams use model_path (backward compatible with the old single-model config).
         self.declare_parameter(
@@ -258,9 +258,11 @@ class YoloDetectorNode(Node):
         """Best body SHAPE detection -> Classification on /classification/shape (Set1 gate).
 
         The FSM compares shape.label to today's set1_label itself, so is_target stays False here.
-        fruit_photo_cube is a Set2 box (SigLIP owns it), so it is excluded from the shape stream.
+        fruit_photo_cube is a Set2 box (SigLIP owns it), and arrival is a finish landmark,
+        so both are excluded from the Set1 shape stream.
         """
-        shapes = [d for d in arr.detections if d.label != "fruit_photo_cube"]
+        non_shapes = {"fruit_photo_cube", "arrival"}
+        shapes = [d for d in arr.detections if d.label not in non_shapes]
         if not shapes:
             return
         best = max(shapes, key=lambda d: d.confidence)

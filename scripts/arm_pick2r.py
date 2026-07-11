@@ -34,8 +34,8 @@ import glob
 import time
 
 # ── 검증된 포즈 (2026-07-08 사용자 직접 테스트 기준) ──
-GRIP_OPEN = 95       # 그리퍼 열림(놓기)
-GRIP_CLOSED = 40     # 그리퍼 닫힘(잡기)
+GRIP_OPEN = 115      # 그리퍼 열림(놓기)
+GRIP_CLOSED = 50     # 그리퍼 닫힘(잡기)
 
 INIT = {"shoulder": 110, "wrist": 10, "gripper": 100}        # 연결 직후/대기 자세
 PICK = {"shoulder": 25, "wrist": 150}                        # 집기 도달 자세(어깨/손목)

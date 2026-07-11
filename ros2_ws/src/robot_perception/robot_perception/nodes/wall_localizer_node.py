@@ -66,6 +66,7 @@ class WallLocalizerNode(Node):
         self.declare_parameter("segmentation_min_component_area", 120)
         self.declare_parameter("segmentation_max_components", 6)
         self.declare_parameter("segmentation_min_line_length_px", 60)
+        self.declare_parameter("wall_image_edge_reject_ratio", 0.05)
         self.declare_parameter("wall_anchor_enabled", True)
         self.declare_parameter("wall_anchor_min_lines", 2)
         self.declare_parameter("wall_anchor_smoothing", 0.20)
@@ -95,6 +96,9 @@ class WallLocalizerNode(Node):
         )
         self.segmentation_max_components = int(self.get_parameter("segmentation_max_components").value)
         self.h_len = int(self.get_parameter("segmentation_min_line_length_px").value)
+        self.wall_image_edge_reject_ratio = max(
+            0.0, min(0.49, float(self.get_parameter("wall_image_edge_reject_ratio").value))
+        )
         self.wall_anchor_enabled = bool(self.get_parameter("wall_anchor_enabled").value)
         self.wall_anchor_min_lines = int(self.get_parameter("wall_anchor_min_lines").value)
         self.wall_anchor_smoothing = float(self.get_parameter("wall_anchor_smoothing").value)
@@ -587,6 +591,21 @@ class WallLocalizerNode(Node):
         """Return only the learned mask's median/dominant-direction wall lines."""
         return self._segmentation_candidates(frame)
 
+    def _line_midpoint_in_image_edge(
+        self, line: tuple[int, int, int, int], width: int, height: int
+    ) -> bool:
+        """Reject pose correction from wall lines whose midpoint is too close to the image edge."""
+        ratio = self.wall_image_edge_reject_ratio
+        if ratio <= 0.0 or width <= 0 or height <= 0:
+            return False
+        x0, y0, x1, y1 = line
+        mx = 0.5 * (float(x0) + float(x1))
+        my = 0.5 * (float(y0) + float(y1))
+        return (
+            mx <= ratio * width or mx >= (1.0 - ratio) * width
+            or my <= ratio * height or my >= (1.0 - ratio) * height
+        )
+
     def _field_wall_correction(self, segments: list[tuple[float, float, float, float]]) -> None:
         """Estimate one rigid field-map transform from raw walls to the fixed rectangle.
 
@@ -694,13 +713,27 @@ class WallLocalizerNode(Node):
         lines = self._line_candidates(frame)
         if not lines:
             return
-        self._update_wall_anchor(self._base_line_points(lines))
+        h, w = frame.shape[:2]
+        correction_lines = [
+            ln for ln in lines
+            if not self._line_midpoint_in_image_edge(ln, w, h)
+        ]
+        if not correction_lines:
+            self.pub_raw_segments.publish(Float32MultiArray())
+            self.pub_segments.publish(Float32MultiArray())
+            self.get_logger().info(
+                f"mask wall observations image={len(lines)} correction=0 edge_rejected={len(lines)}",
+                throttle_duration_sec=1.0,
+            )
+            return
+        self._update_wall_anchor(self._base_line_points(correction_lines))
         rx, ry, rth = self._pose
         ct, st = math.cos(rth), math.sin(rth)
 
         projected: list[tuple[float, float, float, float]] = []
         correction_projected: list[tuple[float, float, float, float]] = []
-        for ln in lines:
+        edge_rejected = len(lines) - len(correction_lines)
+        for ln in correction_lines:
             base = self._to_base(np.array([[ln[0], ln[1]], [ln[2], ln[3]]], np.float64))
             if base is None:
                 continue
@@ -729,7 +762,7 @@ class WallLocalizerNode(Node):
         self._field_wall_correction(correction_projected)
         self.get_logger().info(
             f"mask wall observations image={len(lines)} projected={len(seg_msg.data) // 4} "
-            f"correction={len(correction_projected)}",
+            f"correction={len(correction_projected)} edge_rejected={edge_rejected}",
             throttle_duration_sec=1.0,
         )
 

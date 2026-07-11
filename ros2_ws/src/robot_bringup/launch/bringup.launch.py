@@ -4,7 +4,7 @@ Composed of the smaller launch files so each layer can also be run on its own:
     cameras.launch.py            two CSI cameras (top/wide=sensor-id 1, body=sensor-id 0)
     static_transforms.launch.py  rig tf frames
     perception.launch.py         localizer + perception + FSM/target selector
-    + control nodes (base/arm controllers) and MCU serial bridges
+    + control nodes and MCU serial bridge
 
 Toggle the control/hardware-bridge layer with the 'with_control' launch arg (default true).
 On a bench with no MCU/cameras every node still starts (dry-run safe) — sensors/serial just
@@ -49,18 +49,14 @@ def generate_launch_description() -> LaunchDescription:
                  name="base_controller_node", parameters=[params], output="screen"),
             Node(package="robot_control", executable="pick_sequencer_node",
                  name="pick_sequencer_node", parameters=[params], output="screen"),
-            Node(package="robot_control", executable="arm_controller_node",
-                 name="arm_controller_node", parameters=[params], output="screen"),
             Node(package="robot_hardware", executable="mcu_bridge_base_node",
                  name="mcu_bridge_base_node", parameters=[params], output="screen"),
-            Node(package="robot_hardware", executable="mcu_bridge_arm_node",
-                 name="mcu_bridge_arm_node", parameters=[params], output="screen"),
         ],
     )
 
     return LaunchDescription([
         DeclareLaunchArgument("with_control", default_value="true",
-                              description="also start base/arm controllers + MCU serial bridges"),
+                              description="also start base control + 2R pick sequencer + combined MCU bridge"),
         cameras,
         static_tf,
         imu,

@@ -46,6 +46,12 @@ class TargetSelectorNode(Node):
         # Per-set base scores (default = competition Set2>Set1). A mock test flips these.
         self.declare_parameter("set1_base", SET1_POINTS)
         self.declare_parameter("set2_base", SET2_POINTS)
+        self.declare_parameter("zone_filter_enabled", False)
+        self.declare_parameter(
+            "zone_bounds_m",
+            [-2.0, 0.0, 0.0, 2.0, -2.0, 0.0, -2.0, 0.0,
+             0.0, 2.0, -2.0, 0.0, 0.0, 2.0, 0.0, 2.0],
+        )
 
         self.set1_label = str(self.get_parameter("set1_label").value)
         self.set2_label = str(self.get_parameter("set2_label").value)
@@ -53,21 +59,29 @@ class TargetSelectorNode(Node):
         self.explore_base = float(self.get_parameter("explore_base").value)
         self.set1_base = float(self.get_parameter("set1_base").value)
         self.set2_base = float(self.get_parameter("set2_base").value)
+        self.zone_filter_enabled = bool(self.get_parameter("zone_filter_enabled").value)
+        zb = [float(v) for v in self.get_parameter("zone_bounds_m").value]
+        self.zone_bounds: dict[int, tuple[float, float, float, float]] = {}
+        for i in range(0, min(len(zb), 16), 4):
+            zid = i // 4 + 1
+            self.zone_bounds[zid] = (zb[i], zb[i + 1], zb[i + 2], zb[i + 3])
 
         # Pick phase from the FSM: 0 = no filter (competition), 1 = Set1 only, 2 = Set2 only.
         self.phase = 0
+        self.zone = 0
 
         self.world: WorldModel | None = None
 
         self.create_subscription(WorldModel, "/world_model", self.on_world, 10)
         self.create_subscription(Int8, "/planning/phase", self.on_phase, 10)
+        self.create_subscription(Int8, "/planning/zone", self.on_zone, 10)
         self.pub = self.create_publisher(Object, "/selected_target", 10)
         self.timer = self.create_timer(1.0 / rate, self.tick)
 
         self.get_logger().info(
             f"set1='{self.set1_label}'(base {self.set1_base}) "
             f"set2='{self.set2_label}'(base {self.set2_base}) "
-            f"explore_base={self.explore_base} rate={rate}Hz"
+            f"explore_base={self.explore_base} zone_filter={self.zone_filter_enabled} rate={rate}Hz"
         )
 
     def on_world(self, msg: WorldModel) -> None:
@@ -76,9 +90,20 @@ class TargetSelectorNode(Node):
     def on_phase(self, msg: Int8) -> None:
         self.phase = int(msg.data)
 
+    def on_zone(self, msg: Int8) -> None:
+        self.zone = int(msg.data)
+
+    def _in_active_zone(self, obj: Object) -> bool:
+        if not self.zone_filter_enabled or self.zone <= 0:
+            return True
+        xmin, xmax, ymin, ymax = self.zone_bounds.get(self.zone, (-2.0, 2.0, -2.0, 2.0))
+        return xmin <= float(obj.x) <= xmax and ymin <= float(obj.y) <= ymax
+
     def _score(self, obj: Object, rx: float, ry: float) -> float | None:
         # Blacklisted objects (passed or already picked) are always skipped.
         if obj.blacklisted:
+            return None
+        if not self._in_active_zone(obj):
             return None
         st = obj.set_type
         # Phase filter: in Set1 phase defer every Set2 box; in Set2 phase skip leftover Set1.

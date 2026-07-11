@@ -57,7 +57,7 @@ class MissionFsmNode(Node):
         self.declare_parameter("set2_label", "")      # e.g. "apple"
         self.declare_parameter("conf_threshold", 0.7)
         self.declare_parameter("pick_track_conf", 0.5)   # min world-model track confidence to pick the latched target
-        self.declare_parameter("approach_dist_m", 0.25)
+        self.declare_parameter("approach_dist_m", 0.525)
         self.declare_parameter("align_settle_sec", 1.0)
         self.declare_parameter("classify_timeout_sec", 2.0)
         # ALIGN visual servo: drive the mecanum base so the target lands on the arm's fixed grab
@@ -68,6 +68,7 @@ class MissionFsmNode(Node):
         self.declare_parameter("grab_y", 0.007)
         self.declare_parameter("grab_min_x", 0.255)     # never push the target closer than this
         self.declare_parameter("align_tol_m", 0.04)     # aligned within this -> grab (gripper absorbs)
+        self.declare_parameter("align_fwd_tol_m", 0.08)  # forward/back tolerance; lateral still uses align_tol_m
         # Front HC-SR04 sets the FORWARD grab distance directly (no body-cam projection error): drive
         # so the sonar reads grab_range_m. Body cam still does the LATERAL (y) align. grab_range_m must
         # be CALIBRATED (place a cube at the grab point, read /ultrasonic/range). 0 or stale -> body-cam x.
@@ -92,14 +93,14 @@ class MissionFsmNode(Node):
         # body-cam target, re-measure, repeat -> repeatable & no proportional hunting on pose noise.
         # duty/sec per direction (strafe needs ~1.7x duty & 1.5x time = higher lateral stiction):
         self.declare_parameter("align_step_fwd_duty", 0.18)     # fwd/back: 0.18/0.20s -> ~1.5-2 cm
-        self.declare_parameter("align_step_fwd_sec", 0.20)
+        self.declare_parameter("align_step_fwd_sec", 0.15)
         self.declare_parameter("align_step_strafe_duty", 0.30)  # strafe: 0.30/0.30s -> ~2.5 cm (yaw ~0)
-        self.declare_parameter("align_step_strafe_sec", 0.30)
+        self.declare_parameter("align_step_strafe_sec", 0.1575)
         self.declare_parameter("pick_duration_sec", 3.0)
         self.declare_parameter("storage_x", 0.2)
         self.declare_parameter("storage_y", 0.2)
         self.declare_parameter("shape_target_total", 4)   # set1 shape * 4
-        self.declare_parameter("fruit_target_total", 3)   # set2 fruit * 3
+        self.declare_parameter("fruit_target_total", 0)   # set2 disabled by default: shapes only
         self.declare_parameter("publish_rate_hz", 5.0)
         # --- mock-field-test knobs (all default to competition behaviour) ---
         # dry_pick: log the pick instead of firing /arm/pick_trigger (arm not driven in the test).
@@ -120,12 +121,12 @@ class MissionFsmNode(Node):
         self.declare_parameter("opening_speed", 0.35)        # >= wheel_min so it's the actual speed
         self.declare_parameter("opening_forward_sec", 1.0)
         self.declare_parameter("opening_turn_deg", 45.0)
-        self.declare_parameter("opening_turn_omega", -0.5)   # negative = CW, positive = CCW
+        self.declare_parameter("opening_turn_omega", -0.17)   # negative = CW, positive = CCW
         self.declare_parameter("opening_wait_after_turn_sec", 1.0)
         # SCAN search: the start pose likely sees nothing, so after the opening the robot turns slowly
         # CLOCKWISE in place to sweep for objects. Negative omega = CW (REP-103 +z is up). The actual
         # turn speed is set by base_controller wheel_min_rot (this just needs to be non-zero CW).
-        self.declare_parameter("scan_search_omega", -0.5)
+        self.declare_parameter("scan_search_omega", -0.17)
         # When nothing is visible, DRIVE to the map centre for a better view instead of spinning in
         # place (the wide fisheye already sees all around; a central vantage just helps).
         self.declare_parameter("map_center_x", 0.0)
@@ -135,6 +136,17 @@ class MissionFsmNode(Node):
         self.declare_parameter("patrol_waypoints",
                                [0.0, 0.0, 1.2, 1.2, 1.2, -1.2, -1.2, -1.2, -1.2, 1.2])
         self.declare_parameter("patrol_reach_tol", 0.3)   # advance to next waypoint within this
+        # Zone mission: split the field into four 2x2m zones. Zone1 is the start area
+        # (bottom-right on the live map), then zone2 above, zone3 upper-left, zone4 storage side.
+        self.declare_parameter("zone_mission_enabled", False)
+        self.declare_parameter("zone_order", [1, 2, 3, 4])
+        self.declare_parameter(
+            "zone_bounds_m",
+            [-2.0, 0.0, 0.0, 2.0, -2.0, 0.0, -2.0, 0.0,
+             0.0, 2.0, -2.0, 0.0, 0.0, 2.0, 0.0, 2.0],
+        )
+        self.declare_parameter("zone_no_target_advance_sec", 6.0)
+        self.declare_parameter("zone_center_reach_tol_m", 0.25)
         # Step-wise search: turn a little, STOP to let the cameras identify (clean, blur-free frames),
         # turn again. Continuous spinning motion-blurs the wide cam and churns tracks.
         self.declare_parameter("search_turn_sec", 0.5)    # rotate this long per step (~small angle)
@@ -144,7 +156,7 @@ class MissionFsmNode(Node):
         self.declare_parameter("approach_face_tol", 0.25)  # rad; within this heading error -> drive
         self.declare_parameter("approach_speed", 0.32)     # forward speed once facing
         self.declare_parameter("approach_kp_ang", 1.0)     # omega = kp * heading-to-target (clamped)
-        self.declare_parameter("approach_omega_max", 0.7)
+        self.declare_parameter("approach_omega_max", 0.23)
         # APPROACH is also STEP-WISE (perceive from stop, then one short move) so motion never blurs
         # the wide cam / churns the target track (that churn was the spin). And a grace window keeps
         # the target latched through a momentary dropout instead of thrashing back to SELECT.
@@ -174,6 +186,7 @@ class MissionFsmNode(Node):
         self.grab_y = float(self.get_parameter("grab_y").value)
         self.grab_min_x = float(self.get_parameter("grab_min_x").value)
         self.align_tol = float(self.get_parameter("align_tol_m").value)
+        self.align_fwd_tol = float(self.get_parameter("align_fwd_tol_m").value)
         self.align_kp = float(self.get_parameter("align_kp").value)
         self.align_vmax = float(self.get_parameter("align_vmax").value)
         self.align_vmin = float(self.get_parameter("align_vmin").value)
@@ -235,6 +248,17 @@ class MissionFsmNode(Node):
         self._patrol_waypoints = [(wp[i], wp[i + 1]) for i in range(0, len(wp) - 1, 2)] or [(0.0, 0.0)]
         self.patrol_reach_tol = float(self.get_parameter("patrol_reach_tol").value)
         self._patrol_idx = 0
+        self.zone_mission_enabled = bool(self.get_parameter("zone_mission_enabled").value)
+        self.zone_order = [int(v) for v in self.get_parameter("zone_order").value] or [1, 2, 3, 4]
+        zb = [float(v) for v in self.get_parameter("zone_bounds_m").value]
+        self.zone_bounds: dict[int, tuple[float, float, float, float]] = {}
+        for i in range(0, min(len(zb), 16), 4):
+            zid = i // 4 + 1
+            self.zone_bounds[zid] = (zb[i], zb[i + 1], zb[i + 2], zb[i + 3])
+        self.zone_no_target_advance_sec = float(self.get_parameter("zone_no_target_advance_sec").value)
+        self.zone_center_reach_tol_m = float(self.get_parameter("zone_center_reach_tol_m").value)
+        self._zone_idx = 0
+        self._zone_no_target_since: float | None = None
 
         # ---- LANE-GRAPH waypoint planner (50cm object grid, 40cm robot) ----
         # Travel goals (SCAN sweep, APPROACH stand-off, DRIVE_TO_STORAGE) route through collision-free
@@ -344,6 +368,7 @@ class MissionFsmNode(Node):
         self.pub_cmd = self.create_publisher(BaseCommand, "/base_command", 10)   # ALIGN visual servo
         # Current pick phase (1=Set1, 2=Set2) for the target selector's phase filter.
         self.pub_phase = self.create_publisher(Int8, "/planning/phase", 10)
+        self.pub_zone = self.create_publisher(Int8, "/planning/zone", 10)
         # Human-readable decision feed (PICK / PASS / SKIP / PHASE / END) for the visualiser.
         self.pub_decision = self.create_publisher(String, "/planning/decision", 10)
 
@@ -353,6 +378,7 @@ class MissionFsmNode(Node):
             f"FSM started at {self.state}  set1='{self.set1_label}' set2='{self.set2_label}' "
             f"conf>={self.conf_threshold} approach<{self.approach_dist_m}m rate={rate}Hz "
             f"dry_pick={self.dry_pick} end_after_quota={self.end_after_quota} "
+            f"zone_mission={self.zone_mission_enabled} zone={self._active_zone_id()} "
             f"select_timeout={self.select_timeout_sec}s"
         )
 
@@ -426,6 +452,14 @@ class MissionFsmNode(Node):
         """SEARCH: sweep the free lane midlines in a systematic boustrophedon (via the planner) to
         cover the whole field, driving car-like via _drive_toward. The SCAN handler leaves this the
         instant a phase target comes into view; if the sweep completes it loops (never give up)."""
+        if self.zone_mission_enabled:
+            zx, zy = self._zone_center()
+            if (d := self._distance_to(zx, zy)) is not None and d <= self.zone_center_reach_tol_m:
+                self._search_step()
+            else:
+                th = self.world.robot_theta if self.world is not None else 0.0
+                self._drive_toward(zx, zy, th, exclude_id=0)
+            return
         if not self.planner_enabled:
             wp = self._patrol_waypoints[self._patrol_idx]
             th = self.world.robot_theta if self.world is not None else 0.0
@@ -469,6 +503,10 @@ class MissionFsmNode(Node):
         bestd = 1e9
         for o in self.world.objects:
             if o.blacklisted or o.set_type != want_set:
+                continue
+            if (self.zone_mission_enabled
+                    and not self._object_in_active_zone(o)
+                    and (self.current_target is None or int(o.id) != int(self.current_target.id))):
                 continue
             if want_set == 1 and str(o.class_label) != want_label:
                 continue
@@ -570,6 +608,45 @@ class MissionFsmNode(Node):
         if rxy is None:
             return None
         return math.hypot(x - rxy[0], y - rxy[1])
+
+    def _active_zone_id(self) -> int:
+        if not self.zone_order:
+            return 0
+        return self.zone_order[self._zone_idx % len(self.zone_order)]
+
+    def _zone_center(self, zone_id: int | None = None) -> tuple[float, float]:
+        zid = self._active_zone_id() if zone_id is None else int(zone_id)
+        xmin, xmax, ymin, ymax = self.zone_bounds.get(zid, (-2.0, 2.0, -2.0, 2.0))
+        return ((xmin + xmax) * 0.5, (ymin + ymax) * 0.5)
+
+    def _object_in_active_zone(self, obj: Object) -> bool:
+        if not self.zone_mission_enabled:
+            return True
+        xmin, xmax, ymin, ymax = self.zone_bounds.get(self._active_zone_id(), (-2.0, 2.0, -2.0, 2.0))
+        return xmin <= float(obj.x) <= xmax and ymin <= float(obj.y) <= ymax
+
+    def _reset_zone_scan_timer(self) -> None:
+        self._zone_no_target_since = None
+
+    def _advance_zone_or_phase(self) -> None:
+        if not self.zone_mission_enabled:
+            return
+        prev = self._active_zone_id()
+        if self._zone_idx + 1 < len(self.zone_order):
+            self._zone_idx += 1
+            self._plan = None
+            self._coverage = None
+            self.current_target = None
+            self._reset_zone_scan_timer()
+            self.get_logger().info(f"zone {prev} done -> zone {self._active_zone_id()}")
+            self._decide(f"ZONE {prev}->{self._active_zone_id()}")
+            self._enter("SCAN")
+            return
+        self._zone_idx = 0
+        self._reset_zone_scan_timer()
+        self.get_logger().info(f"zone {prev} done -> phase sweep complete")
+        self._decide(f"ZONE {prev} complete")
+        self._advance_phase_or_end()
 
     def _publish_goal(self, x: float, y: float, theta: float = 0.0) -> None:
         msg = PoseStamped()
@@ -709,9 +786,11 @@ class MissionFsmNode(Node):
         self.current_target = None
         self.set_type = 0
 
-        # Advance to Set2 phase once the Set1 quota is met.
-        if self.phase == 1 and self.tray_shape >= self.shape_target_total:
+        # Advance to Set2 phase once the Set1 quota is met, unless fruit targets are disabled.
+        if self.phase == 1 and self.tray_shape >= self.shape_target_total and self.fruit_target_total > 0:
             self.phase = 2
+            self._zone_idx = 0
+            self._reset_zone_scan_timer()
             self.get_logger().info("Set1 quota met -> phase 2 (Set2)")
             self._decide("PHASE 1->2 (Set1 quota met)")
 
@@ -736,13 +815,28 @@ class MissionFsmNode(Node):
 
         elif self.state == "SCAN":
             if self._nearest_phase_object() is not None:
+                self._reset_zone_scan_timer()
                 self._enter("SELECT_TARGET")                   # phase target in view -> pursue it
             else:
+                if self.zone_mission_enabled:
+                    zx, zy = self._zone_center()
+                    d_zone = self._distance_to(zx, zy)
+                    if d_zone is None or d_zone > self.zone_center_reach_tol_m:
+                        self._reset_zone_scan_timer()
+                        self._patrol_search()
+                        return
+                    now = self._now_s()
+                    if self._zone_no_target_since is None:
+                        self._zone_no_target_since = now
+                    elif now - self._zone_no_target_since >= self.zone_no_target_advance_sec:
+                        self._advance_zone_or_phase()
+                        return
                 self._patrol_search()                          # not in view -> patrol the field to find it
 
         elif self.state == "SELECT_TARGET":
             tgt = self._nearest_phase_object()         # nearest visible object of this kind
             if tgt is not None:
+                self._reset_zone_scan_timer()
                 self.current_target = tgt
                 self._enter("APPROACH")
             else:
@@ -832,7 +926,17 @@ class MissionFsmNode(Node):
     def _advance_phase_or_end(self) -> None:
         """No phase-appropriate target left: Set1 phase -> Set2 phase, or Set2 phase -> END."""
         if self.phase == 1:
+            if self.fruit_target_total <= 0:
+                self.get_logger().info("phase 1 exhausted and Set2 quota is 0 -> storage/end")
+                self._decide("END SET2 DISABLED")
+                if self.tray_shape > 0 and not self.end_after_quota:
+                    self._enter("DRIVE_TO_STORAGE")
+                else:
+                    self._enter("END")
+                return
             self.phase = 2
+            self._zone_idx = 0
+            self._reset_zone_scan_timer()
             self.get_logger().info("phase 1 (Set1) exhausted -> phase 2 (Set2)")
             self._decide("PHASE 1->2 (Set1 exhausted)")
             self._enter("SELECT_TARGET")   # reset the timer and re-select for Set2
@@ -859,12 +963,12 @@ class MissionFsmNode(Node):
         t = self._time_in_state()
         leg = self._opening_leg
         if leg == "wait":
-            # Hold STATIONARY until models are loaded (warmup) AND world_model is publishing, so the
-            # localizer doesn't drift on garbage detections before the robot ever moves.
+            # Hold STATIONARY for the configured warmup, then run the opening even if perception
+            # is still late. This guarantees the match-start motion happens after the 15 s wait.
             self._drive(0.0, 0.0)
             warm = (self._now_s() - self._node_start_s) >= self.startup_warmup_sec
-            if warm and self._got_world:
-                self.get_logger().info("perception warm -> opening move (forward + 45deg turn)")
+            if warm:
+                self.get_logger().info("warmup done -> opening move (forward + 45deg turn)")
                 self._opening_leg = "forward"
                 self.state_enter_s = self._now_s()
         elif leg == "forward":
@@ -1015,7 +1119,7 @@ class MissionFsmNode(Node):
             ex_tol = self.align_sonar_tol
         else:
             ex = obj_x - self.grab_x
-            ex_tol = self.align_tol
+            ex_tol = self.align_fwd_tol
         if abs(ex) < ex_tol and abs(ey) < self.align_tol:       # both axes settled -> grab
             self._drive(0.0, 0.0)
             src = "sonar" if self._sonar_fresh() else "cam"
@@ -1144,6 +1248,7 @@ class MissionFsmNode(Node):
 
         # 3) publish current pick phase (target selector filters candidates by it)
         self.pub_phase.publish(Int8(data=int(self.phase)))
+        self.pub_zone.publish(Int8(data=int(self._active_zone_id() if self.zone_mission_enabled else 0)))
 
 
 def main(args=None) -> None:

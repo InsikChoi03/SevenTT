@@ -43,7 +43,7 @@ class BaseControllerNode(Node):
         # Separate stiction floor for PURE IN-PLACE ROTATION (|vx|,|vy|~0). In-place turns otherwise
         # get floored to wheel_min and spin too fast; set this LOWER for a slow-but-moving CW/CCW turn
         # (the start-boost still breaks static friction, then it relaxes to this). Raise if it stalls.
-        self.declare_parameter("wheel_min_rot", 0.42)
+        self.declare_parameter("wheel_min_rot", 0.07)
         # STATIC friction from REST is higher, so kick to this for wheel_boost_ms on start (the
         # motion_tune boost 0.65 / 100-120 ms). Then relax to wheel_min.
         self.declare_parameter("wheel_boost", 0.60)
@@ -56,7 +56,7 @@ class BaseControllerNode(Node):
         # ALIGN re-measures the settled position each cycle (closed loop) and the pulse only trims
         # coast, but if ALIGN regresses lower wheel_brake_scale or set wheel_brake_ms:0. 0 disables.
         self.declare_parameter("wheel_brake_ms", 120)
-        self.declare_parameter("wheel_brake_scale", 0.45)
+        self.declare_parameter("wheel_brake_scale", 0.315)
 
         self.lx = float(self.get_parameter("lx").value)
         self.ly = float(self.get_parameter("ly").value)

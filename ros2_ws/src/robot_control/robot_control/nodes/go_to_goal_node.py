@@ -42,7 +42,7 @@ class GoToGoalNode(Node):
         self.declare_parameter("kp_lin", 1.2)           # m/s per m of position error
         self.declare_parameter("kp_ang", 1.5)           # rad/s per rad of yaw error
         self.declare_parameter("max_lin_speed", 0.35)   # m/s
-        self.declare_parameter("max_ang_speed", 1.2)    # rad/s
+        self.declare_parameter("max_ang_speed", 0.27)   # rad/s
         self.declare_parameter("min_lin_speed", 0.0)    # m/s stiction floor (0 = off)
         self.declare_parameter("pos_tol_m", 0.05)
         self.declare_parameter("yaw_tol_rad", 0.05)

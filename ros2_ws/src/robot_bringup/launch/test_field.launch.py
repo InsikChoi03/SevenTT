@@ -32,12 +32,14 @@ from launch_ros.descriptions import ParameterValue
 def generate_launch_description() -> LaunchDescription:
     bringup_share = get_package_share_directory("robot_bringup")
     launch_dir = os.path.join(bringup_share, "launch")
-    params = os.path.join(bringup_share, "config", "test_field.yaml")
+    default_params = os.path.join(bringup_share, "config", "test_field.yaml")
+    params = LaunchConfiguration("params_file")
 
     with_base = LaunchConfiguration("with_base")
     with_siglip = LaunchConfiguration("with_siglip")
     with_arm = LaunchConfiguration("with_arm")     # 2R pick_sequencer (real grasp via combined board)
     with_wall_localizer = LaunchConfiguration("with_wall_localizer")
+    grid_prior_enabled = LaunchConfiguration("grid_prior_enabled")
     output_dir = LaunchConfiguration("output_dir")
     cam_yaw = LaunchConfiguration("cam_yaw")      # wide-cam mount rotation about base z (0/90/180/270)
     rot180 = LaunchConfiguration("rot180")        # optical-axis flip for the 180-rotated top image
@@ -63,6 +65,10 @@ def generate_launch_description() -> LaunchDescription:
                               description="start 2R pick_sequencer (real grasp); needs with_base (shares ttyUSB0)"),
         DeclareLaunchArgument("with_wall_localizer", default_value="true",
                               description="use arena wall/floor lines as absolute pose correction"),
+        DeclareLaunchArgument("grid_prior_enabled", default_value="false",
+                              description="enable 7x6 object grid soft-prior in world_model"),
+        DeclareLaunchArgument("params_file", default_value=default_params,
+                              description="YAML parameter file for stationary field testing"),
         DeclareLaunchArgument(
             "output_dir",
             default_value="/home/seventt/seventt/workspace/data/mock_field_test",
@@ -80,7 +86,8 @@ def generate_launch_description() -> LaunchDescription:
         node("robot_perception", "yolo_detector_node", "yolo_detector_node"),
         node("robot_perception", "world_model_node", "world_model_node",
              extra={"cam_yaw_deg": ParameterValue(cam_yaw, value_type=float),
-                    "image_rotated_180": ParameterValue(rot180, value_type=bool)}),
+                    "image_rotated_180": ParameterValue(rot180, value_type=bool),
+                    "grid_prior_enabled": ParameterValue(grid_prior_enabled, value_type=bool)}),
         node("robot_perception", "wall_localizer_node", "wall_localizer_node",
              condition=IfCondition(with_wall_localizer),
              extra={"image_rotated_180": ParameterValue(rot180, value_type=bool)}),

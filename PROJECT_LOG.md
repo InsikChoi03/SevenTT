@@ -26,10 +26,10 @@
 
 ## 2. 현재 상태 (Snapshot — 이 섹션만 최신값으로 덮어쓰기)
 
-- **현재 버전:** `v0.12.0`
-- **최종 업데이트:** 2026-07-10 22:32 (KST)
+- **현재 버전:** `v0.16.0`
+- **최종 업데이트:** 2026-07-11 23:04 (KST)
 - **최종 작업자:** `@AI`
-- **한 줄 요약:** YOLO 벽 segmentation mask 기반 벽 보정/맵 생성 로직을 메인 경기 실행에 연결하고 저속 주행 설정으로 안정화했다.
+- **한 줄 요약:** 실전 경기 FSM/인식/라이브맵을 통합 튜닝하고 구역 미션, 격자 표시, wall v3, 팔/주행 튜닝을 반영했다.
 
 ---
 
@@ -96,12 +96,132 @@
 - [ ] 팔 제어 보드 연결 후 `/dev/ttyUSB*` 또는 `/dev/ttyACM*` 포트 인식 확인하고 집기-보관 1회 재실행 — `@insik`
 - [ ] CH340 장치에 대해 `udev`/`devtmpfs` 상태를 점검해 `/dev/ttyUSB0` 노드가 생성되지 않는 원인을 해결 — `@insik`
 - [ ] `arm_controller_node`가 참조하는 `arm_ik.WRIST_ROLL_HOME` 누락을 정리해 메인 경기 런치 크래시를 제거 — `@AI`
+- [x] 종료지점 태극기 깃발 데이터 수집용 WASD 촬영·pre-label JSON export 도구 작성 — `@AI` (2026-07-11 완료)
+- [ ] `flag_capture_export.py`로 실제 경기장 종료지점 태극기 깃발 body/wide 이미지 촬영 후 X-AnyLabeling에서 `taeguk_flag` 박스 교정 — `@insik`
+- [ ] 교정된 깃발 데이터와 기존 body/wide 누적 학습셋을 6클래스 순서로 병합하고 Colab에서 `cube_v7_flag`/`wide_v6_flag` 재학습 — `@AI`
+- [ ] 새 `models/cube.pt`, `models/wide.pt` 배포 후 `/world_model`에서 `taeguk_flag`가 `set_type=3`으로 들어오는지 실제 카메라에서 확인 — `@insik`
+- [x] 종료지점 클래스명을 `taeguk_flag`에서 `arrival`로 변경하고 런타임/학습 문서/노트북 클래스 순서를 동기화 — `@AI` (2026-07-11 완료)
+- [x] `flag_capture_export.py` 촬영 중 MJPEG 라이브 화면 송출, 제자리 회전 키, 10cm 이동 기본값을 추가 — `@AI` (2026-07-11 완료)
+- [ ] 촬영·교정 완료한 arrival JSON zip을 `labelme_to_yolo.py`로 body/wide YOLO 데이터셋으로 변환 — `@insik`
+- [ ] 변환한 arrival 데이터와 `dataset_body_cube_v6.zip`/`dataset_wide_v5.zip`을 병합해 `dataset_body_flag_v7.zip`/`dataset_wide_flag_v6.zip` 생성 — `@AI`
+- [ ] Colab에서 6클래스 `cube_v7_flag`/`wide_v6_flag`를 새로 학습하고 best.pt를 버전 파일로 백업 후 실전 모델 교체 검증 — `@insik`
+- [x] 월드모델에 7x6 격자 기반 물체 위치 soft prior 보정과 런타임 on/off 파라미터 추가 — `@AI` (2026-07-11 완료)
+- [x] 로봇 정지 상태에서 격자 보정 모델과 라이브 맵 송출을 함께 실행하는 테스트 스크립트 작성 — `@AI` (2026-07-11 완료)
+- [ ] 실제 경기장 기준으로 `grid_origin_x_m`, `grid_origin_y_m`, field 축 방향을 보정하고 격자점 42개가 실물 점과 겹치는지 확인 — `@insik`
+- [ ] `scripts/grid_prior_live_test.py`로 정지 테스트를 실행해 raw 검출 위치와 격자 보정 후 track 위치가 안정적인지 비교 — `@insik`
+- [ ] 격자 보정 안정성이 확인되면 실전 실행 config에서 `grid_prior_enabled` 기본값을 켤지 결정 — `@AI`
+- [ ] body 카메라 각도 변경 후 `body_ground.npz`를 재캘리브하고 body 검출 기반 물체 거리/맵 표시가 맞는지 확인 — `@insik`
+- [ ] 구역 미션 실주행에서 zone center 도착 후 6초 타이머와 구역 전환 로그가 의도대로 작동하는지 확인 — `@insik`
+- [ ] 정이십면체 단독 목표 설정으로 실제 픽업 1회 성공 여부와 ALIGN 소요 시간을 확인 — `@insik`
 
 ---
 
 ## 5. 변경 이력 (Changelog) — ⛔ 삭제 금지 / 최신 항목이 맨 위
 
 <!-- 새 엔트리는 바로 이 줄 아래에 추가하세요. 기존 엔트리는 건드리지 마세요. -->
+
+### `v0.16.0` — 2026-07-11 23:04 (KST) · 작업자: `@AI` · ID: `2026-07-11-04`
+- **변경 요약:** 실전 경기 실행 흐름에 구역 미션, 격자/라이브맵 표시, wall v3, 팔·주행·ALIGN 튜닝을 통합 반영했다.
+- **상세:**
+  - 메인 경기 시작 흐름을 15초 대기 후 `1초 전진 → 시계방향 45도 회전 → 1초 대기 → 자율 미션` 순서로 맞췄다.
+  - 경기장을 2x2 구역 4개로 나누고, 1→2→3→4 반시계 순서로 구역 중심에 도착한 뒤 목표가 6초 동안 없을 때만 다음 구역으로 넘어가도록 FSM을 조정했다.
+  - 구역 상태를 `/planning/zone`으로 발행하고, 라이브 맵에 42개 격자점과 4개 구역 사각형을 함께 표시하도록 했다.
+  - 격자 기반 물체 위치 soft prior는 런타임 옵션으로 유지하되 실전 기본값은 꺼둔 상태(`grid_prior_enabled: false`)로 두었다.
+  - 벽 인식 모델 경로를 `wall_floor_boundary_seg_v3.pt`로 맞추고, wide 화면 가장자리 5% 영역에 걸친 노란 벽 선분은 벽 기반 보정에서 제외하도록 했다.
+  - 로봇 주행/회전/ALIGN 파라미터를 현장 피드백에 맞춰 재조정하고, 물체 선택 거리를 늘리며 미세조정 전후/좌우 이동량과 브레이크 펄스를 튜닝했다.
+  - 경기 중 정이십면체만 목표로 잡도록 target selector/FSM 설정을 조정하고, Set2 오렌지 큐브 목표는 비활성화했다.
+  - 주행 중 팔은 보관함 쪽 stow 자세로 올리고 그리퍼는 닫힌 상태를 유지하며, 팔을 내리거나 집기 전 필요한 순간에만 열도록 그리퍼 각도와 시퀀스를 정리했다.
+  - 종료지점 arrival 데이터 촬영/학습 도구와 Colab 노트북, 문서 파일을 현재 작업 상태에 맞춰 커밋 대상으로 정리했다.
+- **변경 파일:**
+  - `ros2_ws/src/robot_bringup/config/perception.yaml` / 수정
+  - `ros2_ws/src/robot_bringup/config/test_field.yaml` / 수정
+  - `ros2_ws/src/robot_bringup/launch/bringup.launch.py` / 수정
+  - `ros2_ws/src/robot_bringup/launch/test_field.launch.py` / 수정
+  - `ros2_ws/src/robot_control/robot_control/nodes/base_controller_node.py` / 수정
+  - `ros2_ws/src/robot_control/robot_control/nodes/go_to_goal_node.py` / 수정
+  - `ros2_ws/src/robot_control/robot_control/nodes/pick_sequencer_node.py` / 수정
+  - `ros2_ws/src/robot_perception/package.xml` / 수정
+  - `ros2_ws/src/robot_perception/robot_perception/nodes/recognition_viz_node.py` / 수정
+  - `ros2_ws/src/robot_perception/robot_perception/nodes/wall_localizer_node.py` / 수정
+  - `ros2_ws/src/robot_perception/robot_perception/nodes/world_model_node.py` / 수정
+  - `ros2_ws/src/robot_perception/robot_perception/nodes/yolo_detector_node.py` / 수정
+  - `ros2_ws/src/robot_planning/robot_planning/nodes/mission_fsm_node.py` / 수정
+  - `ros2_ws/src/robot_planning/robot_planning/nodes/target_selector_node.py` / 수정
+  - `scripts/arm_pick2r.py` / 수정
+  - `scripts/grid_prior_live_test.py` / 신규
+  - `scripts/flag_capture_export.py` / 신규
+  - `scripts/colab_train_body_flag_v7.ipynb` / 신규
+  - `scripts/colab_train_wide_flag_v6.ipynb` / 신규
+  - `docs/flag_capture_training.md` / 신규
+  - `PROJECT_LOG.md` / 수정
+- **다음 할 일 반영:** body 카메라 각도 변경 후 재캘리브, 구역 중심 도착 후 6초 타이머 검증, 정이십면체 단독 픽업 검증 TODO를 추가했다.
+- **버전 근거:** 실전 FSM 구역 미션, 라이브맵 구역/격자 표시, wall v3 반영, 주행/팔/ALIGN 동작 튜닝과 신규 테스트·학습 도구가 함께 추가된 기능 확장이므로 `MINOR` 버전 증가로 `v0.16.0`으로 올렸다.
+
+### `v0.15.0` — 2026-07-11 18:36 (KST) · 작업자: `@AI` · ID: `2026-07-11-03`
+- **변경 요약:** 월드모델에 7x6 격자 기반 물체 위치 soft prior를 추가하고, 정지 상태 라이브 테스트 경로를 만들었다.
+- **상세:**
+  - `world_model_node.py`에 6행 x 7열, 0.5m 간격의 격자 prior를 추가하고, 새 track 확정 시에만 nearest grid로 soft snap하도록 했다.
+  - 기존 track 매칭은 항상 우선 처리하고, 이미 움직인 물체는 관측 위치를 유지하며 spawn grid에서 일정 거리 이상 벗어나면 `moved` 상태로 표시하도록 했다.
+  - `grid_prior_enabled`, `grid_prior_debug`, snap 반경/alpha, moved threshold 등 파라미터를 추가하고, ROS parameter callback으로 실행 중 on/off 가능하게 했다.
+  - `recognition_viz_node.py` 맵에 같은 격자 파라미터를 쓰는 작은 회색 점 42개를 표시해 실제 경기장 점과 인식 track 위치를 함께 볼 수 있게 했다.
+  - `test_field.launch.py`에 `grid_prior_enabled`와 `params_file` launch 인자를 추가해 정지 테스트에서 source YAML과 격자 보정 옵션을 바로 주입할 수 있게 했다.
+  - `scripts/grid_prior_live_test.py`를 추가해 `with_base:=false`로 로봇 구동 노드를 띄우지 않고, 격자 보정 perception stack과 브라우저용 live stream을 같이 실행하도록 했다.
+  - `py_compile`, YAML 파싱, source launch 인자 확인, `git diff --check`로 정적 검증했다. 전체 ROS build는 기존 setuptools/colcon 설치 환경 문제로 별도 해결이 필요하다.
+- **변경 파일:**
+  - `ros2_ws/src/robot_perception/robot_perception/nodes/world_model_node.py` / 수정
+  - `ros2_ws/src/robot_perception/robot_perception/nodes/recognition_viz_node.py` / 수정
+  - `ros2_ws/src/robot_bringup/config/perception.yaml` / 수정
+  - `ros2_ws/src/robot_bringup/config/test_field.yaml` / 수정
+  - `ros2_ws/src/robot_bringup/launch/test_field.launch.py` / 수정
+  - `ros2_ws/src/robot_perception/package.xml` / 수정
+  - `scripts/grid_prior_live_test.py` / 신규
+  - `PROJECT_LOG.md` / 수정
+- **다음 할 일 반영:** 격자 prior 구현과 정지 라이브 테스트 스크립트 작성을 완료 처리하고, 실제 경기장 기준 격자 원점/축 보정, 정지 테스트 비교, 실전 config 기본값 전환 판단 TODO를 추가했다.
+- **버전 근거:** 월드모델 보정 알고리즘, 시각화 레이어, 테스트 실행 스크립트가 추가된 기능 확장이므로 `MINOR` 버전 증가로 `v0.15.0`으로 올렸다.
+
+### `v0.14.0` — 2026-07-11 15:13 (KST) · 작업자: `@AI` · ID: `2026-07-11-02`
+- **변경 요약:** 종료지점 클래스를 `arrival`로 확정하고, WASD 촬영 도구에 라이브 화면·10cm 이동·제자리 회전·6클래스 병합 학습 절차를 정리했다.
+- **상세:**
+  - 신규 종료지점/깃발 클래스명을 `taeguk_flag`에서 `arrival`로 변경하고, `flag_capture_export.py`, Colab 학습 노트북, 문서, perception 런타임의 클래스명을 맞췄다.
+  - `world_model_node.py`에서 `arrival` 검출을 `set_type=3`으로 분류하고, Set1 shape vote 및 `fruit_photo_cube` 판단과 섞이지 않도록 했다.
+  - `yolo_detector_node.py`에서 `arrival`이 `/classification/shape`로 재발행되지 않도록 제외했다.
+  - `recognition_viz_node.py`의 training dump 클래스 목록과 시각화 색상에 `arrival`을 반영했다.
+  - `flag_capture_export.py`에 MJPEG 라이브 화면 송출(`--mjpeg-port`, 기본 8090), 제자리 좌/우 회전 키(`j/l`), 10cm 이동 기본값(`speed=0.375`, `move_dur=0.29`, `strafe_dur=0.56`)을 추가했다.
+  - `docs/flag_capture_training.md`에 라이브 화면 접속, `arrival` 라벨링, JSON→YOLO 변환, 기존 최신 학습셋(`dataset_body_cube_v6.zip`, `dataset_wide_v5.zip`)과 병합해 Colab용 zip을 만드는 흐름을 정리했다.
+  - Colab 학습은 기존 모델 이어학습이 아니라 기존 누적 데이터와 `arrival` 데이터를 합친 6클래스 zip으로 `yolov8n.pt`에서 새로 학습하는 방향으로 정리했다.
+- **변경 파일:**
+  - `scripts/flag_capture_export.py` / 신규·수정
+  - `scripts/colab_train_body_flag_v7.ipynb` / 신규·수정
+  - `scripts/colab_train_wide_flag_v6.ipynb` / 신규·수정
+  - `docs/flag_capture_training.md` / 신규·수정
+  - `ros2_ws/src/robot_perception/robot_perception/nodes/yolo_detector_node.py` / 수정
+  - `ros2_ws/src/robot_perception/robot_perception/nodes/world_model_node.py` / 수정
+  - `ros2_ws/src/robot_perception/robot_perception/nodes/recognition_viz_node.py` / 수정
+  - `PROJECT_LOG.md` / 수정
+- **다음 할 일 반영:** `arrival` 클래스명 전환과 촬영 도구 라이브/제자리회전/10cm 이동 기본값 반영을 완료 처리하고, arrival JSON zip 변환, 기존 최종 학습셋과 병합, Colab 재학습 및 모델 교체 검증 TODO를 추가했다.
+- **버전 근거:** 종료지점 클래스 계약을 `arrival`로 확정하고 촬영 도구 기능과 학습 데이터 병합 절차를 확장한 기능 추가이므로 `MINOR` 버전 증가로 `v0.14.0`으로 올렸다.
+
+### `v0.13.0` — 2026-07-11 13:46 (KST) · 작업자: `@AI` · ID: `2026-07-11-01`
+- **변경 요약:** 종료지점 태극기 깃발 학습을 위한 WASD 촬영·pre-label JSON export 도구와 6클래스 학습/런타임 연결을 추가했다.
+- **상세:**
+  - `scripts/flag_capture_export.py`를 새로 만들어 터미널 WASD 입력마다 0.5초 오픈루프 이동 후 body/wide 카메라 이미지를 저장하도록 했다.
+  - 촬영 종료 시 기존 `models/cube.pt`, `models/wide.pt`로 각 카메라 이미지를 pre-label하고, X-AnyLabeling/LabelMe JSON과 이미지를 카메라별 폴더에 묶어 zip으로 내보내도록 했다.
+  - 새 클래스명은 `taeguk_flag`로 고정하고, 기존 5클래스 뒤에 6번째 클래스로 추가하는 클래스 순서를 문서화했다.
+  - `labelme_to_yolo.py`로 교정 JSON을 다시 YOLO 학습셋으로 변환한 뒤 Colab에서 학습할 수 있도록 body/wide 6클래스 학습 노트북을 추가했다.
+  - `yolo_detector_node.py`에서 `taeguk_flag`가 Set1 shape classification으로 재발행되지 않도록 제외했다.
+  - `world_model_node.py`에서 `taeguk_flag`를 `set_type=3` 도착점/깃발 표식으로 분류하고, fruit/shape identity vote와 섞이지 않도록 했다.
+  - `recognition_viz_node.py`의 training dump 클래스 목록과 시각화 색상에 `taeguk_flag`를 추가했다.
+- **변경 파일:**
+  - `scripts/flag_capture_export.py` / 신규
+  - `scripts/colab_train_body_flag_v7.ipynb` / 신규
+  - `scripts/colab_train_wide_flag_v6.ipynb` / 신규
+  - `docs/flag_capture_training.md` / 신규
+  - `ros2_ws/src/robot_perception/robot_perception/nodes/yolo_detector_node.py` / 수정
+  - `ros2_ws/src/robot_perception/robot_perception/nodes/world_model_node.py` / 수정
+  - `ros2_ws/src/robot_perception/robot_perception/nodes/recognition_viz_node.py` / 수정
+  - `PROJECT_LOG.md` / 수정
+- **다음 할 일 반영:** 깃발 데이터 수집/export 도구 작성 TODO를 완료 처리하고, 실제 촬영·라벨 교정, 6클래스 병합/재학습, 새 모델 배포 후 `set_type=3` 확인 TODO를 추가했다.
+- **버전 근거:** 새 데이터 수집/export 스크립트, 6클래스 학습 노트북, 런타임 깃발 타입 처리가 추가된 기능 확장이므로 `MINOR` 버전 증가로 `v0.13.0`으로 올렸다.
 
 ### `v0.12.0` — 2026-07-10 22:32 (KST) · 작업자: `@AI` · ID: `2026-07-10-01`
 - **변경 요약:** YOLO 벽 segmentation mask 기반 벽 보정/맵 생성 로직을 메인 경기 실행에 연결하고 저속 주행 설정으로 안정화했다.

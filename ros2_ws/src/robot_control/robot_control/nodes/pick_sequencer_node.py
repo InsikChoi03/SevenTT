@@ -8,8 +8,8 @@ does not match the physical 2R arm. Each step is host-ramped so the main field l
 same stage order and does not drop the gripper too quickly.
 
     trigger True  -> GRASP: reach to PICK pose (open) -> close -> lift while holding
-                     -> move to PLACE while holding -> open at PLACE.
-    trigger False -> RELEASE: move to PLACE while holding -> open at PLACE.
+                     -> move to PLACE while holding -> open at PLACE -> stow closed.
+    trigger False -> RELEASE: move to PLACE while holding -> open at PLACE -> stow closed.
 
 The arm boots LIMP and snaps to the first <ARM> it receives, so INIT is published on startup to
 absorb that snap safely. Angles are the arm_pick2r verified values (params to tune).
@@ -26,11 +26,11 @@ class PickSequencerNode(Node):
         super().__init__("pick_sequencer_node")
 
         # 2R verified poses (re-taught 2026-07-08). Servo degrees.
-        self.declare_parameter("init_pose", [110.0, 10.0, 100.0])   # shoulder, wrist, gripper (idle)
+        self.declare_parameter("init_pose", [110.0, 30.0, 50.0])    # shoulder, wrist, gripper (stowed)
         self.declare_parameter("pick_shoulder_wrist", [25.0, 150.0])
         self.declare_parameter("place_shoulder_wrist", [110.0, 30.0])
-        self.declare_parameter("grip_open", 95.0)
-        self.declare_parameter("grip_closed", 40.0)
+        self.declare_parameter("grip_open", 115.0)
+        self.declare_parameter("grip_closed", 50.0)
         self.declare_parameter("move_sec", 2.5)     # dwell for an arm move (>= firmware smooth time)
         self.declare_parameter("grasp_sec", 0.7)    # dwell for a gripper open/close
         self.declare_parameter("rate_hz", 20.0)
@@ -42,6 +42,7 @@ class PickSequencerNode(Node):
         self.place_sw = (plsw[0], plsw[1])
         self.grip_open = float(self.get_parameter("grip_open").value)
         self.grip_closed = float(self.get_parameter("grip_closed").value)
+        self.stow_pose = (self.place_sw[0], self.place_sw[1], self.grip_closed)
         self.move_sec = float(self.get_parameter("move_sec").value)
         self.grasp_sec = float(self.get_parameter("grasp_sec").value)
         rate = float(self.get_parameter("rate_hz").value)
@@ -59,7 +60,7 @@ class PickSequencerNode(Node):
         self.kind = ""
         self._last_step = ""
         self._last_trigger: bool | None = None
-        self.current_pose = tuple(float(v) for v in self.init_pose)
+        self.current_pose = self.stow_pose
 
         # Absorb the boot-limp snap: hold INIT for the first ~1.5 s before accepting triggers.
         self._init_until = self._now_s() + 1.5
@@ -117,6 +118,7 @@ class PickSequencerNode(Node):
             ("LIFT",     self.move_sec,  (ish, iwr, self.grip_closed)),    # lift to init, holding
             ("TO_PLACE", self.move_sec,  (plsh, plwr, self.grip_closed)),  # move to place, holding
             ("PLACE",    self.grasp_sec, (plsh, plwr, self.grip_open)),    # open at place pose
+            ("STOW",     self.grasp_sec, (plsh, plwr, self.grip_closed)),  # drive with gripper closed
         ]
         self._launch("PICK_PLACE")
 
@@ -125,6 +127,7 @@ class PickSequencerNode(Node):
         self.seq = [
             ("TO_PLACE", self.move_sec,  (sh, wr, self.grip_closed)),  # move to place, holding
             ("RELEASE",  self.grasp_sec, (sh, wr, self.grip_open)),    # open at place pose
+            ("STOW",     self.grasp_sec, (sh, wr, self.grip_closed)),  # drive with gripper closed
         ]
         self._launch("RELEASE")
 
@@ -150,6 +153,8 @@ class PickSequencerNode(Node):
         if not self.running:
             if self._now_s() < self._init_until:
                 self._publish(tuple(self.init_pose))   # snap-absorb: hold INIT on boot
+            else:
+                self._publish(self.stow_pose)          # match driving: arm up at tray side, gripper closed
             return
         el = self._now_s() - self.seq_start_s
         if el >= self.total:

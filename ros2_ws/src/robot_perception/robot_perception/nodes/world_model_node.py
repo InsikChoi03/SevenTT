@@ -27,6 +27,7 @@ from dataclasses import dataclass, field
 
 import rclpy
 from rclpy.node import Node
+from rcl_interfaces.msg import SetParametersResult
 
 from geometry_msgs.msg import PoseStamped, Vector3
 from std_msgs.msg import Float32MultiArray, UInt64
@@ -43,16 +44,16 @@ except Exception:  # noqa: BLE001
     _CV2_AVAILABLE = False
 
 
-# Label -> set_type. The custom YOLOv8n (wide.pt / cube.pt) is 5-class as of 2026-07-01:
-# the 4 white polyhedra are Set1 and fruit_photo_cube is the printed Set2 box. BOTH cameras
-# emit these labels, so detections carry a concrete set_type straight from YOLO. The specific
-# fruit (apple/orange/...) is filled in later by SigLIP (fruit-type only); see on_siglip.
+# Label -> set_type. The custom YOLOv8n models emit Set1 shapes, Set2 fruit-photo cubes,
+# and the finish/storage landmark flag. The specific fruit (apple/orange/...) is filled in
+# later by SigLIP (fruit-type only); see on_siglip.
 _LABEL_TO_SET_TYPE: dict[str, int] = {
     "cube": 1,
     "octahedron": 1,
     "dodecahedron": 1,
     "icosahedron": 1,
     "fruit_photo_cube": 2,
+    "arrival": 3,
 }
 
 # The set of SigLIP-identified fruit names count as Set2 too (once a track's class_label is
@@ -100,6 +101,12 @@ class Track:
     anchor_y: float = 0.0
     outlier_count: int = 0        # consecutive frames this anchor disagreed with the consensus
                                   # drift (i.e. the object itself moved) -> triggers an unlock
+    # Optional field-grid prior. A grid id is assigned only when a NEW confirmed track is close
+    # enough to a free grid point; subsequent observations always own the live position.
+    spawn_grid_id: int = -1
+    current_grid_id: int = -1
+    grid_state: str = "off_grid"  # "grid_spawned", "moved", or "off_grid"
+    grid_snapped: bool = False
 
 
 class WorldModelNode(Node):
@@ -216,6 +223,23 @@ class WorldModelNode(Node):
         self.declare_parameter("conf_ema", 0.5)            # EMA weight on new sample
         self.declare_parameter("forget_after_sec", 6.0)    # drop unseen non-blacklisted
 
+        # Optional 7x6, 50-cm field-grid prior. It is applied only when a confirmed NEW track is
+        # created, never while updating an existing track. Defaults off until field-frame origin
+        # and axes have been checked against the real arena.
+        self.declare_parameter("grid_prior_enabled", False)
+        self.declare_parameter("grid_prior_debug", False)
+        self.declare_parameter("grid_rows", 6)
+        self.declare_parameter("grid_cols", 7)
+        self.declare_parameter("grid_spacing_m", 0.50)
+        self.declare_parameter("grid_origin_x_m", 0.50)
+        self.declare_parameter("grid_origin_y_m", 0.50)
+        self.declare_parameter("grid_initial_phase_sec", 20.0)
+        self.declare_parameter("grid_initial_snap_radius_m", 0.15)
+        self.declare_parameter("grid_new_snap_radius_m", 0.12)
+        self.declare_parameter("grid_initial_snap_alpha", 0.80)
+        self.declare_parameter("grid_new_snap_alpha", 0.45)
+        self.declare_parameter("grid_moved_threshold_m", 0.22)
+
         # --- Position vs identity: DIFFERENT confidence cut-offs ---
         # The detector's own conf_threshold is the POSITION cut-off (a box above it means SOMETHING
         # is there — the wide cam is good at this). class_conf_threshold is the higher IDENTITY
@@ -266,6 +290,19 @@ class WorldModelNode(Node):
         self._candidates: list[dict] = []   # unconfirmed detections awaiting new_track_min_hits
         self.conf_ema = float(self.get_parameter("conf_ema").value)
         self.forget_after = float(self.get_parameter("forget_after_sec").value)
+        self.grid_prior_enabled = bool(self.get_parameter("grid_prior_enabled").value)
+        self.grid_prior_debug = bool(self.get_parameter("grid_prior_debug").value)
+        self.grid_rows = max(0, int(self.get_parameter("grid_rows").value))
+        self.grid_cols = max(0, int(self.get_parameter("grid_cols").value))
+        self.grid_spacing = max(0.0, float(self.get_parameter("grid_spacing_m").value))
+        self.grid_origin_x = float(self.get_parameter("grid_origin_x_m").value)
+        self.grid_origin_y = float(self.get_parameter("grid_origin_y_m").value)
+        self.grid_initial_phase = max(0.0, float(self.get_parameter("grid_initial_phase_sec").value))
+        self.grid_initial_radius = max(0.0, float(self.get_parameter("grid_initial_snap_radius_m").value))
+        self.grid_new_radius = max(0.0, float(self.get_parameter("grid_new_snap_radius_m").value))
+        self.grid_initial_alpha = min(1.0, max(0.0, float(self.get_parameter("grid_initial_snap_alpha").value)))
+        self.grid_new_alpha = min(1.0, max(0.0, float(self.get_parameter("grid_new_snap_alpha").value)))
+        self.grid_moved_threshold = max(0.0, float(self.get_parameter("grid_moved_threshold_m").value))
         self.class_conf_threshold = float(self.get_parameter("class_conf_threshold").value)
         self.class_conf_threshold_body = float(self.get_parameter("class_conf_threshold_body").value)
         self.body_fov_half = math.radians(float(self.get_parameter("body_fov_half_deg").value))
@@ -389,6 +426,14 @@ class WorldModelNode(Node):
         # Track store.
         self.tracks: dict[int, Track] = {}
         self._next_id: int = 1
+        self._grid_points: list[tuple[float, float]] = [
+            (self.grid_origin_x + c * self.grid_spacing,
+             self.grid_origin_y + r * self.grid_spacing)
+            for r in range(self.grid_rows)
+            for c in range(self.grid_cols)
+        ]
+        self._grid_start_sec = self._now_sec()
+        self.add_on_set_parameters_callback(self._on_parameters_changed)
         # Last track updated by a body-cam fruit_photo_cube detection — the SigLIP fruit
         # result (which carries no position) is attached to this track, but only if that detection
         # was recent (see on_siglip): a stale id would bind the fruit type to the wrong track.
@@ -434,6 +479,7 @@ class WorldModelNode(Node):
             f"rate={rate}Hz project={self.can_project} fisheye={self.use_fisheye} "
             f"rot180={self.rotated_180} body_fusion={self.can_project_body} "
             f"landmark_corr={self.landmark_correction} "
+            f"grid_prior={self.grid_prior_enabled} grid_points={len(self._grid_points)} "
             f"cam_h={self.cam_height}m pitch={self.cam_pitch_deg}deg yaw={self.cam_yaw_deg}deg "
             f"offset=({self.cam_offset_x},{self.cam_offset_y}) "
             f"arm_base_off=({self.arm_base_off_x},{self.arm_base_off_y}) body_ws={self.body_ws} "
@@ -494,6 +540,15 @@ class WorldModelNode(Node):
 
     def _now_sec(self) -> float:
         return self.get_clock().now().nanoseconds * 1e-9
+
+    def _on_parameters_changed(self, params) -> SetParametersResult:
+        """Allow the grid prior and its debug logging to be toggled without restarting ROS."""
+        for param in params:
+            if param.name == "grid_prior_enabled":
+                self.grid_prior_enabled = bool(param.value)
+            elif param.name == "grid_prior_debug":
+                self.grid_prior_debug = bool(param.value)
+        return SetParametersResult(successful=True)
 
     @staticmethod
     def _stamp_to_sec(stamp) -> float:
@@ -856,6 +911,60 @@ class WorldModelNode(Node):
 
     # ------------------------------------------------------------------- tracker
 
+    def _occupied_grid_ids(self) -> set[int]:
+        """Grid points still claimed by live, unmoved tracks."""
+        return {
+            tr.spawn_grid_id
+            for tr in self.tracks.values()
+            if (tr.spawn_grid_id >= 0 and tr.grid_state == "grid_spawned"
+                and not tr.blacklisted)
+        }
+
+    def _apply_grid_prior(
+        self, x: float, y: float, set_type: int, now: float
+    ) -> tuple[float, float, int, bool, float]:
+        """Soft-snap a confirmed NEW object to the nearest free field-grid point.
+
+        Set1/Set2 game objects are eligible. Arrival landmarks and unknown classes are kept at
+        their observed positions because they are not part of the 28 grid-spawned objects.
+        """
+        if not self.grid_prior_enabled or set_type not in (1, 2) or not self._grid_points:
+            return x, y, -1, False, math.inf
+
+        gid, (gx, gy) = min(
+            enumerate(self._grid_points),
+            key=lambda item: math.hypot(item[1][0] - x, item[1][1] - y),
+        )
+        distance = math.hypot(gx - x, gy - y)
+        initial = (now - self._grid_start_sec) <= self.grid_initial_phase
+        radius = self.grid_initial_radius if initial else self.grid_new_radius
+        alpha = self.grid_initial_alpha if initial else self.grid_new_alpha
+        if distance > radius or gid in self._occupied_grid_ids():
+            return x, y, -1, False, distance
+        return (
+            (1.0 - alpha) * x + alpha * gx,
+            (1.0 - alpha) * y + alpha * gy,
+            gid,
+            True,
+            distance,
+        )
+
+    def _update_grid_state(self, tr: Track, observed_x: float, observed_y: float) -> None:
+        """Release a spawn grid after an existing object has physically moved away from it."""
+        if tr.spawn_grid_id < 0 or tr.grid_state != "grid_spawned":
+            return
+        gx, gy = self._grid_points[tr.spawn_grid_id]
+        distance = math.hypot(observed_x - gx, observed_y - gy)
+        if distance <= self.grid_moved_threshold:
+            tr.current_grid_id = tr.spawn_grid_id
+            return
+        tr.current_grid_id = -1
+        tr.grid_state = "moved"
+        if self.grid_prior_debug:
+            self.get_logger().info(
+                f"grid moved: track={tr.id} spawn_grid={tr.spawn_grid_id} distance={distance:.3f}m"
+            )
+
     def _candidate_hit(self, x: float, y: float, conf: float, label: str, set_type: int,
                        now: float, is_body: bool, vote_thresh: float) -> int:
         """A detection with no matching track: hold it as a CANDIDATE and only spawn a real track once
@@ -885,17 +994,30 @@ class WorldModelNode(Node):
         tid = self._next_id
         self._next_id += 1
         body = bool(best["body"])
+        raw_x, raw_y = float(best["x"]), float(best["y"])
+        track_x, track_y, grid_id, snapped, snap_distance = self._apply_grid_prior(
+            raw_x, raw_y, int(best["set"]), now
+        )
         tr = Track(
-            id=tid, x=best["x"], y=best["y"], confidence=best["conf"], last_seen_sec=now,
+            id=tid, x=track_x, y=track_y, confidence=best["conf"], last_seen_sec=now,
             source=("body" if body else "wide"), seen_body=body,
             last_body_sec=(now if is_body else 0.0), last_wide_sec=(0.0 if is_body else now),
             n_obs=best["n"], n_body=(best["n"] if body else 0),
+            spawn_grid_id=grid_id, current_grid_id=grid_id,
+            grid_state=("grid_spawned" if snapped else "off_grid"), grid_snapped=snapped,
         )
         if conf >= vote_thresh:
             self._vote(tr, label, conf, is_body)
         self._refresh_identity(tr)
         self.tracks[tid] = tr
         self._candidates.remove(best)
+        if self.grid_prior_debug:
+            nearest = "none" if not math.isfinite(snap_distance) else f"{snap_distance:.3f}m"
+            self.get_logger().info(
+                f"grid new track={tid} raw=({raw_x:.3f},{raw_y:.3f}) "
+                f"map=({track_x:.3f},{track_y:.3f}) grid={grid_id} "
+                f"nearest_distance={nearest} snapped={snapped}"
+            )
         return tid
 
     def _associate(
@@ -931,6 +1053,7 @@ class WorldModelNode(Node):
 
         # Fuse into the matched track.
         tr = self.tracks[best_id]
+        self._update_grid_state(tr, x, y)
         if tr.locked and self.landmark_correction:
             # Frozen landmark: don't move it — record (track id, fresh obs, anchor) so the batch
             # solve can recover the robot-pose drift AND spot anchors that moved (object picked up).
@@ -991,6 +1114,11 @@ class WorldModelNode(Node):
             tr.fruit_label = tr.class_label
             tr.set_type = 2
             return
+        arrival = tr.body_votes.get("arrival", 0.0) + tr.wide_votes.get("arrival", 0.0)
+        if arrival > 0.0:
+            tr.class_label = "arrival"
+            tr.set_type = 3
+            return
         # fruit_photo_cube (nested printed-fruit patch, even inside a plain 'cube' box) means this is
         # a Set2 FRUIT cube, not a Set1 shape. But a SINGLE spurious fpc detection on a white
         # polyhedron must NOT irreversibly flip a real Set1 target to Set2 (the target then vanishes
@@ -999,8 +1127,8 @@ class WorldModelNode(Node):
         # this easily, whereas a one-frame misread is out-voted by the shape stream.
         fpc = tr.body_votes.get("fruit_photo_cube", 0.0) + tr.wide_votes.get("fruit_photo_cube", 0.0)
         shape_max = max(
-            [v for k, v in tr.body_votes.items() if k != "fruit_photo_cube"]
-            + [v for k, v in tr.wide_votes.items() if k != "fruit_photo_cube"],
+            [v for k, v in tr.body_votes.items() if k not in ("fruit_photo_cube", "arrival")]
+            + [v for k, v in tr.wide_votes.items() if k not in ("fruit_photo_cube", "arrival")],
             default=0.0,
         )
         if fpc > 0.0 and fpc >= 0.5 * shape_max:
@@ -1010,7 +1138,7 @@ class WorldModelNode(Node):
         pool = tr.body_votes if tr.body_votes else tr.wide_votes
         if pool:
             # fruit_photo_cube handled above; pick the best SHAPE vote for a Set1 object.
-            shapes = {k: v for k, v in pool.items() if k != "fruit_photo_cube"}
+            shapes = {k: v for k, v in pool.items() if k not in ("fruit_photo_cube", "arrival")}
             if shapes:
                 best = max(shapes, key=shapes.get)
                 tr.class_label = best
@@ -1308,6 +1436,11 @@ class WorldModelNode(Node):
                 ta.last_seen_sec = max(ta.last_seen_sec, tb.last_seen_sec)
                 ta.last_body_sec = max(ta.last_body_sec, tb.last_body_sec)
                 ta.last_wide_sec = max(ta.last_wide_sec, tb.last_wide_sec)
+                if ta.spawn_grid_id < 0 and tb.spawn_grid_id >= 0:
+                    ta.spawn_grid_id = tb.spawn_grid_id
+                    ta.current_grid_id = tb.current_grid_id
+                    ta.grid_state = tb.grid_state
+                    ta.grid_snapped = tb.grid_snapped
                 if tb.locked and not ta.locked:   # inherit the confirmed anchor position
                     ta.locked = True
                     ta.anchor_x, ta.anchor_y, ta.x, ta.y = tb.anchor_x, tb.anchor_y, tb.x, tb.y

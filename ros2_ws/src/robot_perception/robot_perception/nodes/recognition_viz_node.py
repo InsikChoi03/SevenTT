@@ -19,6 +19,7 @@ Subscribes:
   /selected_target          robot_interfaces/Object         — highlighted target
   /mission_state            robot_interfaces/MissionState   — state/tray counts/current target
   /planning/phase           std_msgs/Int8                   — Set1/Set2 pick phase (HUD)
+  /planning/zone            std_msgs/Int8                   — active 2x2m mission zone (HUD/map)
 
 Artefacts under output_dir/<YYYYmmdd_HHMMSS>/:
   events.csv / events.jsonl   — one row per first-seen object, per pick, and per state change
@@ -105,13 +106,21 @@ class _MjpegStreamer:
 # BGR colours by set_type (and states).
 _COL_SET1 = (80, 200, 80)      # shapes -> green
 _COL_SET2 = (0, 150, 255)      # fruit cubes -> orange
+_COL_FLAG = (60, 210, 255)     # finish/storage flag -> yellow-ish
 _COL_UNKNOWN = (170, 170, 170)  # unknown -> gray
 _COL_BLACKLIST = (90, 90, 90)  # picked/passed -> dark gray
 _COL_TARGET = (0, 255, 255)    # current target ring -> yellow
 _COL_ROBOT = (255, 90, 40)     # robot -> blue
 _COL_TRAIL = (200, 130, 60)    # trajectory
 _COL_GRID = (60, 60, 60)
+_COL_OBJECT_GRID = (115, 115, 115)
 _COL_TEXT = (235, 235, 235)
+_ZONE_COLORS = {
+    1: (70, 120, 220),
+    2: (60, 170, 120),
+    3: (180, 130, 70),
+    4: (170, 90, 170),
+}
 
 _SHAPE_LABELS = frozenset({"cube", "octahedron", "dodecahedron", "icosahedron"})
 _FRUIT_LABELS = frozenset({"apple", "orange", "banana", "pineapple"})
@@ -149,6 +158,8 @@ def _label_color(label: str):
         return _FRUIT_COLORS[label]
     if label == "fruit_photo_cube":
         return _COL_FRUITCUBE
+    if label == "arrival":
+        return _COL_FLAG
     return _COL_UNKNOWN
 
 
@@ -194,6 +205,22 @@ class RecognitionVizNode(Node):
         self.declare_parameter("wide_fov_forward_m", 1.6)
         self.declare_parameter("wide_fov_lateral_m", 1.3)
         self.declare_parameter("wide_fov_center_x", 0.3)
+        # Optional 7x6 arena object-grid overlay. This is a visual aid for the world_model
+        # grid prior, not a synthetic object layer.
+        self.declare_parameter("show_object_grid_points", True)
+        self.declare_parameter("grid_rows", 6)
+        self.declare_parameter("grid_cols", 7)
+        self.declare_parameter("grid_spacing_m", 0.50)
+        self.declare_parameter("grid_origin_x_m", 0.50)
+        self.declare_parameter("grid_origin_y_m", 0.50)
+        # Visualise the 2x2m mission zones used by mission_fsm_node:
+        # 1=start(bottom-right on rotated live map), 2=above, 3=upper-left, 4=storage side.
+        self.declare_parameter("show_zone_regions", True)
+        self.declare_parameter(
+            "zone_bounds_m",
+            [-2.0, 0.0, 0.0, 2.0, -2.0, 0.0, -2.0, 0.0,
+             0.0, 2.0, -2.0, 0.0, 0.0, 2.0, 0.0, 2.0],
+        )
 
         ext = [float(v) for v in self.get_parameter("field_extent_m").value]
         self.extent = ext if len(ext) == 4 else [-2.0, 2.0, -2.0, 2.0]
@@ -212,8 +239,10 @@ class RecognitionVizNode(Node):
         self.save_training = bool(self.get_parameter("save_training_data").value) and _BRIDGE_AVAILABLE
         self.training_interval = float(self.get_parameter("training_interval_sec").value)
         self._last_training_save = 0.0
-        # YOLO class order shared by wide.pt / cube.pt (see project_shape_id_finding memory).
-        self._train_classes = ["cube", "octahedron", "dodecahedron", "icosahedron", "fruit_photo_cube"]
+        # YOLO class order shared by wide.pt / cube.pt.
+        self._train_classes = [
+            "cube", "octahedron", "dodecahedron", "icosahedron", "fruit_photo_cube", "arrival"
+        ]
         self._train_cls_idx = {c: i for i, c in enumerate(self._train_classes)}
         self.confirm_min_obs = int(self.get_parameter("confirm_min_obs").value)
         self.body_fov_half = math.radians(float(self.get_parameter("body_fov_half_deg").value))
@@ -223,6 +252,18 @@ class RecognitionVizNode(Node):
         self.wide_fov_fwd = float(self.get_parameter("wide_fov_forward_m").value)
         self.wide_fov_lat = float(self.get_parameter("wide_fov_lateral_m").value)
         self.wide_fov_cx = float(self.get_parameter("wide_fov_center_x").value)
+        self.show_object_grid_points = bool(self.get_parameter("show_object_grid_points").value)
+        self.grid_rows = max(0, int(self.get_parameter("grid_rows").value))
+        self.grid_cols = max(0, int(self.get_parameter("grid_cols").value))
+        self.grid_spacing = float(self.get_parameter("grid_spacing_m").value)
+        self.grid_origin_x = float(self.get_parameter("grid_origin_x_m").value)
+        self.grid_origin_y = float(self.get_parameter("grid_origin_y_m").value)
+        self.show_zone_regions = bool(self.get_parameter("show_zone_regions").value)
+        zb = [float(v) for v in self.get_parameter("zone_bounds_m").value]
+        self.zone_bounds: dict[int, tuple[float, float, float, float]] = {}
+        for i in range(0, min(len(zb), 16), 4):
+            zid = i // 4 + 1
+            self.zone_bounds[zid] = (zb[i], zb[i + 1], zb[i + 2], zb[i + 3])
         self.bridge = CvBridge() if _BRIDGE_AVAILABLE else None
 
         # Run directory (wallclock timestamp -> unique per run).
@@ -267,6 +308,7 @@ class RecognitionVizNode(Node):
         self.current_target_id = 0
         self.selected_id = 0
         self.phase = 0
+        self.zone = 0
         self.siglip: Classification | None = None
         self.shape: Classification | None = None
         # Latest raw camera image msgs + their detections (converted at draw time, ~redraw rate).
@@ -326,6 +368,7 @@ class RecognitionVizNode(Node):
         self.create_subscription(Object, "/selected_target", self.on_selected, 10)
         self.create_subscription(MissionState, "/mission_state", self.on_mission, 10)
         self.create_subscription(Int8, "/planning/phase", self.on_phase, 10)
+        self.create_subscription(Int8, "/planning/zone", self.on_zone, 10)
         self.create_subscription(String, "/planning/decision", self.on_decision, 10)
         self.create_subscription(Float32MultiArray, "/world_model/projected_dets", self.on_proj, 10)
         self.create_subscription(Float32MultiArray, "/localization/wall_segments",
@@ -449,6 +492,9 @@ class RecognitionVizNode(Node):
 
     def on_phase(self, msg: Int8) -> None:
         self.phase = int(msg.data)
+
+    def on_zone(self, msg: Int8) -> None:
+        self.zone = int(msg.data)
 
     def on_decision(self, msg: String) -> None:
         self.decisions.append(f"[{time.time() - self._t0:5.0f}s] {msg.data}")
@@ -695,6 +741,8 @@ class RecognitionVizNode(Node):
         canvas = np.full((H, W, 3), 24, np.uint8)
         self._extent_now = self._current_extent()   # auto-fit (or fixed) for this frame
         self._draw_grid(canvas)
+        self._draw_zone_regions(canvas)
+        self._draw_object_grid_points(canvas)
         self._draw_wall_raw_segments(canvas)
         self._draw_wall_segments(canvas)
         self._draw_fov(canvas)                       # camera coverage under the objects
@@ -845,6 +893,48 @@ class RecognitionVizNode(Node):
         cv2.line(canvas, (x0, oy), (x1, oy), (90, 90, 90), 1)
         cv2.rectangle(canvas, (x0, y0), (x1, y1), (150, 150, 150), 2)
 
+    def _draw_zone_regions(self, canvas) -> None:
+        if not self.show_zone_regions or not self.zone_bounds:
+            return
+        overlay = canvas.copy()
+        rects = []
+        for zid, (xmin, xmax, ymin, ymax) in sorted(self.zone_bounds.items()):
+            pts = [self._w2p(xmin, ymin), self._w2p(xmin, ymax),
+                   self._w2p(xmax, ymax), self._w2p(xmax, ymin)]
+            xs = [p[0] for p in pts]
+            ys = [p[1] for p in pts]
+            x0, x1 = min(xs), max(xs)
+            y0, y1 = min(ys), max(ys)
+            col = _ZONE_COLORS.get(zid, (120, 120, 120))
+            cv2.rectangle(overlay, (x0, y0), (x1, y1), col, -1)
+            rects.append((zid, x0, y0, x1, y1, col))
+        cv2.addWeighted(overlay, 0.16, canvas, 0.84, 0.0, dst=canvas)
+        for zid, x0, y0, x1, y1, col in rects:
+            active = self.zone == zid
+            thickness = 3 if active else 1
+            label_col = (255, 255, 255) if active else (190, 190, 190)
+            cv2.rectangle(canvas, (x0, y0), (x1, y1), col, thickness, cv2.LINE_AA)
+            cx, cy = (x0 + x1) // 2, (y0 + y1) // 2
+            cv2.putText(canvas, f"Z{zid}", (cx - 14, cy + 5),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, label_col, 2, cv2.LINE_AA)
+
+    def _draw_object_grid_points(self, canvas) -> None:
+        if not self.show_object_grid_points or self.grid_rows <= 0 or self.grid_cols <= 0:
+            return
+        xmin, xmax, ymin, ymax = self._extent_now
+        r = 3
+        for row in range(self.grid_rows):
+            gy = self.grid_origin_y + row * self.grid_spacing
+            if gy < ymin or gy > ymax:
+                continue
+            for col in range(self.grid_cols):
+                gx = self.grid_origin_x + col * self.grid_spacing
+                if gx < xmin or gx > xmax:
+                    continue
+                px, py = self._w2p(gx, gy)
+                cv2.circle(canvas, (px, py), r + 1, (20, 20, 20), 1, cv2.LINE_AA)
+                cv2.circle(canvas, (px, py), r, _COL_OBJECT_GRID, -1, cv2.LINE_AA)
+
     def _draw_trail(self, canvas) -> None:
         pts = [self._w2p(x, y) for (x, y) in self.trail]
         for i in range(1, len(pts)):
@@ -884,6 +974,8 @@ class RecognitionVizNode(Node):
             col = _FRUIT_COLORS[label]
         elif label == "fruit_photo_cube" or obj.set_type == 2:
             col = _COL_FRUITCUBE
+        elif label == "arrival" or obj.set_type == 3:
+            col = _COL_FLAG
         else:
             col = _COL_UNKNOWN
         # marker: identified shape -> form polygon; else circle. CONFIRMED filled, PROVISIONAL hollow.
@@ -926,7 +1018,8 @@ class RecognitionVizNode(Node):
         n_obj = len(self.world.objects) if self.world is not None else 0
         n_bl = sum(1 for o in self.world.objects if o.blacklisted) if self.world is not None else 0
         lines = [
-            f"state={self.mission_state}  phase={self.phase}  t={time.time() - self._t0:5.0f}s",
+            f"state={self.mission_state}  phase={self.phase} zone={self.zone}  "
+            f"t={time.time() - self._t0:5.0f}s",
             f"objects={n_obj} (picked/bl={n_bl})  tray shape={self.tray_shape} fruit={self.tray_fruit}",
             f"det wide={len(self.top_dets)} body={len(self.body_dets)}",
         ]
