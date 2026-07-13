@@ -148,9 +148,9 @@ class WorldModelNode(Node):
         # to the object's true ground centre: P = G - (h/H)(G - C_nadir). The low body cam (H≈0.145,
         # h/H≈0.28) needs it far more than the top wide cam (H≈0.885, h/H≈0.045). C_nadir/H per cam.
         self.declare_parameter("height_correct", True)
-        self.declare_parameter("body_cam_nadir_x", 0.065)   # body cam ground nadir (base_link x), fwd
+        self.declare_parameter("body_cam_nadir_x", 0.055)   # body cam ground nadir (base_link x), fwd
         self.declare_parameter("body_cam_nadir_y", 0.0)
-        self.declare_parameter("body_cam_height_m", 0.145)  # body cam height above floor
+        self.declare_parameter("body_cam_height_m", 0.155)  # body cam height above floor
         # Residual systematic bias: the oblique body cam's box CENTRE sits on the object's FRONT
         # face, so it reports the object ~half-depth NEARER than its true centroid (measured +3.9cm
         # radial over a full-turn: wide=centroid is farther). Push the body projection this far

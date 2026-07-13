@@ -44,8 +44,9 @@ class BaseControllerNode(Node):
         # get floored to wheel_min and spin too fast; set this LOWER for a slow-but-moving CW/CCW turn
         # (the start-boost still breaks static friction, then it relaxes to this). Raise if it stalls.
         self.declare_parameter("wheel_min_rot", 0.07)
-        # STATIC friction from REST is higher, so kick to this for wheel_boost_ms on start (the
-        # motion_tune boost 0.65 / 100-120 ms). Then relax to wheel_min.
+        # STATIC friction from REST is higher, so strafe/rotation starts kick to this for
+        # wheel_boost_ms, then relax to wheel_min/wheel_min_rot. Forward starts stay unboosted so
+        # straight-line tuning is not disturbed.
         self.declare_parameter("wheel_boost", 0.60)
         self.declare_parameter("wheel_boost_ms", 120)
         self.declare_parameter("wheel_deadband", 0.02)   # below this = treat as stop
@@ -161,19 +162,29 @@ class BaseControllerNode(Node):
             else:
                 wheels = [0.0, 0.0, 0.0, 0.0]
         else:
+            was_moving = self._moving
             self._moving = True
             self._brake_until = 0.0                   # a fresh move cancels any pending brake
             if aligning:
                 kick = True                           # ALIGN unit steps bypass slew -> hit full duty
                                                       # immediately, matching the boost-free calibration
-            # NO start-boost (removed per tuning: it jerked and made each pulse's distance unrepeatable).
-            # The steady floor is the min duty that keeps the base moving; cruise must sit above the
-            # static breakaway to start from rest. Pure in-place rotation gets its own (slower) floor.
+            # The steady floor is the min duty that keeps the base moving. Pure in-place rotation gets
+            # its own floor, while strafe/rotation starts also get a short breakaway boost.
             is_rot = abs(vx) < 0.02 and abs(vy) < 0.02 and abs(omega) > 1e-3
+            is_strafe = abs(vy) >= 0.02 and abs(vy) >= abs(vx)
+            if (not aligning and not was_moving and (is_rot or is_strafe)
+                    and self.wheel_boost > 0.0 and self.wheel_boost_ms > 0.0):
+                self._boost_until = now + self.wheel_boost_ms / 1000.0
             steady_floor = self.wheel_min_rot if is_rot else self.wheel_min
             if 0.0 < m < steady_floor:
                 s = steady_floor / m
                 wheels = [max(-1.0, min(1.0, w * s)) for w in wheels]
+            if (is_rot or is_strafe) and now < self._boost_until:
+                bm = max(abs(w) for w in wheels)
+                if 0.0 < bm < self.wheel_boost:
+                    s = self.wheel_boost / bm
+                    wheels = [max(-1.0, min(1.0, w * s)) for w in wheels]
+                kick = True                           # boost pulse must hit immediately
             self._last_move_wheels = list(wheels)     # remember travel direction for the stop brake
 
         # Slew-limit toward the target so accel/decel is smooth (no jack-rabbit start / no slip).

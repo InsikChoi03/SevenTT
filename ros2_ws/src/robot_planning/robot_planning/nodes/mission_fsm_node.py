@@ -96,6 +96,12 @@ class MissionFsmNode(Node):
         self.declare_parameter("align_step_fwd_sec", 0.15)
         self.declare_parameter("align_step_strafe_duty", 0.30)  # strafe: 0.30/0.30s -> ~2.5 cm (yaw ~0)
         self.declare_parameter("align_step_strafe_sec", 0.1575)
+        # If the target remains in the wide/world map but drops out of the body cam at ALIGN,
+        # back up once so the body cam can reacquire it instead of waiting stationary for timeout.
+        self.declare_parameter("align_body_lost_backoff_enabled", True)
+        self.declare_parameter("align_body_lost_backoff_speed", 0.189)
+        self.declare_parameter("align_body_lost_backoff_sec", 0.54)
+        self.declare_parameter("align_body_lost_backoff_settle_sec", 1.0)
         self.declare_parameter("pick_duration_sec", 3.0)
         self.declare_parameter("storage_x", 0.2)
         self.declare_parameter("storage_y", 0.2)
@@ -111,7 +117,7 @@ class MissionFsmNode(Node):
         self.declare_parameter("end_after_quota", False)
         self.declare_parameter("select_timeout_sec", 0.0)
         # --- hardcoded opening move (very first thing at match start), BODY frame ---
-        # Drive forward, rotate in place by opening_turn_deg, wait, then hand over to SCAN.
+        # Drive forward, strafe right, rotate in place by opening_turn_deg, wait, then hand over to SCAN.
         # Timed through /base_command so the base_controller's start-boost + stop-brake apply.
         self.declare_parameter("opening_enabled", True)
         # Hold STATIONARY at startup until perception is warm: YOLO (wide.pt@1280) takes ~10-15 s to
@@ -120,6 +126,8 @@ class MissionFsmNode(Node):
         self.declare_parameter("startup_warmup_sec", 15.0)
         self.declare_parameter("opening_speed", 0.35)        # >= wheel_min so it's the actual speed
         self.declare_parameter("opening_forward_sec", 1.0)
+        self.declare_parameter("opening_strafe_speed", 0.35)
+        self.declare_parameter("opening_strafe_right_sec", 0.0)
         self.declare_parameter("opening_turn_deg", 45.0)
         self.declare_parameter("opening_turn_omega", -0.17)   # negative = CW, positive = CCW
         self.declare_parameter("opening_wait_after_turn_sec", 1.0)
@@ -199,7 +207,13 @@ class MissionFsmNode(Node):
         self.align_step_fwd_sec = float(self.get_parameter("align_step_fwd_sec").value)
         self.align_step_strafe_duty = float(self.get_parameter("align_step_strafe_duty").value)
         self.align_step_strafe_sec = float(self.get_parameter("align_step_strafe_sec").value)
-        self._align_phase = "measure"      # measure -> pulse -> settle -> measure ...
+        self.align_body_lost_backoff_enabled = bool(self.get_parameter("align_body_lost_backoff_enabled").value)
+        self.align_body_lost_backoff_speed = float(self.get_parameter("align_body_lost_backoff_speed").value)
+        self.align_body_lost_backoff_sec = float(self.get_parameter("align_body_lost_backoff_sec").value)
+        self.align_body_lost_backoff_settle_sec = float(
+            self.get_parameter("align_body_lost_backoff_settle_sec").value
+        )
+        self._align_phase = "measure"      # measure -> pulse/body_lost_backoff -> settle/SELECT -> measure ...
         self._align_phase_start = 0.0
         self._pulse_vx = 0.0
         self._pulse_vy = 0.0
@@ -208,8 +222,8 @@ class MissionFsmNode(Node):
         # straight to base_link (no robot pose), so pose drift can't wander the servo target.
         self.declare_parameter("body_ground_homography_path",
                                "/home/seventt/seventt/workspace/data/calib/body_ground.npz")
-        self.declare_parameter("body_cam_nadir_x", 0.065)
-        self.declare_parameter("body_cam_height_m", 0.145)
+        self.declare_parameter("body_cam_nadir_x", 0.055)
+        self.declare_parameter("body_cam_height_m", 0.155)
         self.declare_parameter("object_center_height_m", 0.04)
         # Body-cam downscale compensation: multiply each body detection pixel by these before the
         # ALIGN homography (calibrated at 1640x1232). 1.0 = body published at full res.
@@ -238,6 +252,8 @@ class MissionFsmNode(Node):
         self.startup_warmup_sec = float(self.get_parameter("startup_warmup_sec").value)
         self.opening_speed = float(self.get_parameter("opening_speed").value)
         self.opening_forward_sec = float(self.get_parameter("opening_forward_sec").value)
+        self.opening_strafe_speed = float(self.get_parameter("opening_strafe_speed").value)
+        self.opening_strafe_right_sec = float(self.get_parameter("opening_strafe_right_sec").value)
         self.opening_turn_deg = float(self.get_parameter("opening_turn_deg").value)
         self.opening_turn_omega = float(self.get_parameter("opening_turn_omega").value)
         self.opening_wait_after_turn_sec = float(self.get_parameter("opening_wait_after_turn_sec").value)
@@ -332,7 +348,7 @@ class MissionFsmNode(Node):
         # --- runtime state ---
         # Start with the hardcoded opening move, then fall into SCAN. Disable via param.
         self.state = "OPENING" if self.opening_enabled else "SCAN"
-        self._opening_leg = "wait"      # wait(ready) -> forward -> turn -> settle -> SCAN
+        self._opening_leg = "wait"      # wait -> forward -> strafe_right -> turn -> settle -> SCAN
         self._opening_turn_start_theta: float | None = None
         self._got_world = False         # set on first /world_model (perception up)
         self._node_start_s = self._now_s()
@@ -580,6 +596,17 @@ class MissionFsmNode(Node):
                 bestd = d
                 best = (label, bx, by)
         return best
+
+    def _align_target_still_in_world(self) -> bool:
+        """True when the latched ALIGN target is still visible in the wide/world map."""
+        if self.current_target is None or self.world is None:
+            return False
+        fresh = self._lookup_object(int(self.current_target.id))
+        if fresh is not None and not fresh.blacklisted:
+            self.current_target = fresh
+            return True
+        ref = (float(self.current_target.x), float(self.current_target.y))
+        return self._nearest_phase_object(ref_xy=ref) is not None
 
     def _drive(self, vx: float, vy: float, omega: float = 0.0) -> None:
         c = BaseCommand()
@@ -955,7 +982,7 @@ class MissionFsmNode(Node):
         self._enter("SELECT_TARGET")
 
     def _step_opening(self) -> None:
-        """Hardcoded match opening: forward -> 45deg turn -> wait -> SCAN.
+        """Hardcoded match opening: forward -> right strafe -> 45deg turn -> wait -> SCAN.
 
         BODY-frame commands are timed; state_enter_s is reset at each leg so _time_in_state()
         measures that leg only. The turn duration is derived from opening_turn_deg/omega.
@@ -968,12 +995,19 @@ class MissionFsmNode(Node):
             self._drive(0.0, 0.0)
             warm = (self._now_s() - self._node_start_s) >= self.startup_warmup_sec
             if warm:
-                self.get_logger().info("warmup done -> opening move (forward + 45deg turn)")
+                self.get_logger().info("warmup done -> opening move (forward + right strafe + 45deg turn)")
                 self._opening_leg = "forward"
                 self.state_enter_s = self._now_s()
         elif leg == "forward":
             if t < self.opening_forward_sec:
                 self._drive(self.opening_speed, 0.0)          # +vx = robot forward
+            else:
+                self._drive(0.0, 0.0)
+                self._opening_leg = "strafe_right"
+                self.state_enter_s = self._now_s()
+        elif leg == "strafe_right":
+            if t < self.opening_strafe_right_sec:
+                self._drive(0.0, -self.opening_strafe_speed)  # -vy = robot right
             else:
                 self._drive(0.0, 0.0)
                 self._opening_leg = "turn"
@@ -1002,7 +1036,7 @@ class MissionFsmNode(Node):
         else:  # settle
             self._drive(0.0, 0.0)
             if t >= self.opening_wait_after_turn_sec:
-                self.get_logger().info("opening done (forward + 45deg turn + wait) -> SCAN")
+                self.get_logger().info("opening done (forward + right strafe + 45deg turn + wait) -> SCAN")
                 self._enter("SCAN")
 
     def _search_step(self) -> None:
@@ -1089,6 +1123,21 @@ class MissionFsmNode(Node):
             if now - self._align_phase_start >= self.align_settle_pulse_sec:
                 self._align_phase = "measure"
             return
+        if self._align_phase == "body_lost_backoff":
+            if now - self._align_phase_start < self.align_body_lost_backoff_sec:
+                self._drive(-abs(self.align_body_lost_backoff_speed), 0.0)
+            else:
+                self._drive(0.0, 0.0)
+                self._align_phase = "body_lost_backoff_settle"
+                self._align_phase_start = now
+            return
+        if self._align_phase == "body_lost_backoff_settle":
+            self._drive(0.0, 0.0)
+            if now - self._align_phase_start >= self.align_body_lost_backoff_settle_sec:
+                self.get_logger().info("ALIGN: body lost target -> backed off, settled, reselect")
+                self._decide("ALIGN BODY LOST -> BACKOFF+SETTLE")
+                self._enter("SELECT_TARGET")
+            return
 
         # measure (base is settled/stationary) — align ONLY to the target label (body-cam truth)
         base = self._body_target_base(self._body_label())
@@ -1104,6 +1153,13 @@ class MissionFsmNode(Node):
                 self.current_target = None
                 self._align_fail_count = 0
                 self._enter("SELECT_TARGET")
+                return
+            if self.align_body_lost_backoff_enabled and self._align_target_still_in_world():
+                self.get_logger().info(
+                    "ALIGN: target in world/wide but not body -> back off to reacquire")
+                self._drive(-abs(self.align_body_lost_backoff_speed), 0.0)
+                self._align_phase = "body_lost_backoff"
+                self._align_phase_start = now
                 return
             # nothing there (or the target just blinked) -> re-settle & re-measure, don't bail.
             self._drive(0.0, 0.0)

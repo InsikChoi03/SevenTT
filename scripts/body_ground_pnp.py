@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 """본체캠 지면 호모그래피 — 마커 '크기'만으로 (손측정 0).
 
-본체캠은 intrinsics(data/calib/body_calib.npz)와 고정위치(앞6.5·왼0·높이14.5cm)를 알므로,
-바닥에 ArUco(45mm) 몇 개 깔고 찍으면:
+본체캠은 intrinsics(data/calib/body_calib.npz)와 고정위치(앞5.5·왼0·높이15.5cm)를 알므로,
+바닥에 ArUco(38mm) 몇 개 깔고 찍으면:
   1) solvePnP(코너4점+크기)로 각 마커 중심을 카메라프레임 미터로 복원(스케일=마커크기)
-  2) 마커중심들로 지면평면 fit → 카메라 pitch/roll + 복원높이(14.5 검증)
+  2) 마커중심들로 지면평면 fit → 카메라 pitch/roll + 복원높이(15.5 검증)
   3) yaw≈0(정면장착) 가정 → 카메라 자세 완성
   4) 각 마커중심을 base_link(x앞,y좌)로 변환 → (픽셀↔base_link) 호모그래피 fit → 저장
-검증: 복원 카메라높이 ≈ 14.5cm, 마커 배치가 상식적인지.
+검증: 복원 카메라높이 ≈ 15.5cm, 마커 배치가 상식적인지.
 
-  python3 scripts/body_ground_pnp.py                       # 기본위치(6.5,0,14.5)
-  python3 scripts/body_ground_pnp.py --cam-xyz 6.5 0 14.5  # 위치 override (cm)
+  python3 scripts/body_ground_pnp.py                       # 기본위치(5.5,0,15.5)
+  python3 scripts/body_ground_pnp.py --cam-xyz 5.5 0 15.5  # 위치 override (cm)
 """
 from __future__ import annotations
 import argparse, os, sys
@@ -22,12 +22,12 @@ from csi_capture import CsiCamera  # noqa: E402
 
 CALIB = "/home/seventt/seventt/workspace/data/calib/body_calib.npz"
 OUT = "/home/seventt/seventt/workspace/data/calib/body_ground.npz"
-MARKER_SIZE = 0.045
+MARKER_SIZE = 0.038
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--cam-xyz", type=float, nargs=3, default=[6.5, 0.0, 14.5],
+    ap.add_argument("--cam-xyz", type=float, nargs=3, default=[5.5, 0.0, 15.5],
                     help="본체캠 위치 앞 왼 높이 (cm, base_link)")
     ap.add_argument("--frames", type=int, default=12)
     ap.add_argument("--size", type=float, default=MARKER_SIZE)
@@ -134,7 +134,7 @@ def main():
                         (int(c[0]) + 8, int(c[1])), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
         dp = "/home/seventt/seventt/workspace/data/calib/body_ground_debug.png"
         cv2.imwrite(dp, dbg); print(f"디버그 -> {dp}")
-    print("\n→ 검증: 복원높이가 14.5 근처 + 마커 앞좌표가 상식적이면 OK. "
+    print("\n→ 검증: 복원높이가 15.5 근처 + 마커 앞좌표가 상식적이면 OK. "
           "test_field.yaml 의 body_ground_homography_path 주석 해제 후 빌드.")
     return 0
 
