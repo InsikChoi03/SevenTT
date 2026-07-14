@@ -26,10 +26,10 @@
 
 ## 2. 현재 상태 (Snapshot — 이 섹션만 최신값으로 덮어쓰기)
 
-- **현재 버전:** `v1.1.0`
-- **최종 업데이트:** 2026-07-14 16:54 (KST)
+- **현재 버전:** `v1.2.0`
+- **최종 업데이트:** 2026-07-14 17:04 (KST)
 - **최종 작업자:** `@AI`
-- **한 줄 요약:** 구역 미션을 각 zone 안에서 Set1 확인 후 Set2까지 처리하고 다음 zone으로 넘어가는 흐름으로 조정했다.
+- **한 줄 요약:** 경기용 motion tuning 프리셋과 perception/test_field YAML을 동기화하고 관련 런타임 파라미터 지원을 묶었다.
 
 ---
 
@@ -115,12 +115,32 @@
 - [ ] 정이십면체 단독 목표 설정으로 실제 픽업 1회 성공 여부와 ALIGN 소요 시간을 확인 — `@insik`
 - [ ] 각 zone 안에서 Set1/Set2를 모두 처리한 뒤 다음 zone으로 넘어가는 FSM 로그와 실제 동작을 확인 — `@insik`
 - [ ] Set1 목표와 fruit cube 후보를 섞어 다음 zone 방향으로 훑는 one-stroke inspection route 점수식과 YAML 파라미터를 구현·튜닝 — `@AI`
+- [ ] `motion_tuning.yaml` 수정 후 `scripts/apply_motion_tuning.py`로 `perception.yaml`/`test_field.yaml` 동기화가 의도대로 되는지 dry-run과 실제 적용을 비교 — `@AI`
 
 ---
 
 ## 5. 변경 이력 (Changelog) — ⛔ 삭제 금지 / 최신 항목이 맨 위
 
 <!-- 새 엔트리는 바로 이 줄 아래에 추가하세요. 기존 엔트리는 건드리지 마세요. -->
+
+### `v1.2.0` — 2026-07-14 17:04 (KST) · 작업자: `@AI` · ID: `2026-07-14-02`
+- **변경 요약:** 경기용 `motion_tuning.yaml` 프리셋과 적용된 ROS YAML 설정을 커밋 대상으로 정리했다.
+- **상세:**
+  - `motion_tuning.yaml`을 경기 주행/인식/정렬/팔/플래너 튜닝의 단일 프리셋 파일로 추가했다.
+  - `perception.yaml`과 `test_field.yaml`을 프리셋 값에 맞춰 동기화해 Set1/Set2 라벨, grid prior, opening, approach, ALIGN, planner, arm, live view 설정을 반영했다.
+  - 프리셋을 ROS parameter YAML에 반영하는 `scripts/apply_motion_tuning.py`를 추가했다.
+  - YAML에서 쓰는 adaptive ALIGN, taxi-style planner 옵션, reach 중 gripper 선개방 파라미터가 런타임에서 선언/동작하도록 관련 노드를 함께 맞췄다.
+- **변경 파일:**
+  - `ros2_ws/src/robot_bringup/config/motion_tuning.yaml` / 신규
+  - `ros2_ws/src/robot_bringup/config/perception.yaml` / 수정
+  - `ros2_ws/src/robot_bringup/config/test_field.yaml` / 수정
+  - `scripts/apply_motion_tuning.py` / 신규
+  - `ros2_ws/src/robot_planning/robot_planning/nodes/mission_fsm_node.py` / 수정
+  - `ros2_ws/src/robot_planning/robot_planning/lane_planner.py` / 수정
+  - `ros2_ws/src/robot_control/robot_control/nodes/pick_sequencer_node.py` / 수정
+  - `PROJECT_LOG.md` / 수정
+- **다음 할 일 반영:** `motion_tuning.yaml`과 적용 대상 YAML의 동기화 결과를 dry-run/실제 적용으로 비교하는 TODO를 추가했다.
+- **버전 근거:** 신규 튜닝 프리셋 파일과 적용 스크립트가 추가되고, 설정에서 참조하는 새 런타임 파라미터 지원이 포함된 기능 확장이므로 `MINOR` 버전 증가로 `v1.2.0`으로 올렸다.
 
 ### `v1.1.0` — 2026-07-14 16:54 (KST) · 작업자: `@AI` · ID: `2026-07-14-01`
 - **변경 요약:** 구역 미션 phase 전환을 전역 Set1→Set2 방식에서 zone-local Set1→Set2 방식으로 바꿨다.
