@@ -26,10 +26,10 @@
 
 ## 2. 현재 상태 (Snapshot — 이 섹션만 최신값으로 덮어쓰기)
 
-- **현재 버전:** `v1.0.0`
-- **최종 업데이트:** 2026-07-13 18:17 (KST)
+- **현재 버전:** `v1.1.0`
+- **최종 업데이트:** 2026-07-14 16:54 (KST)
 - **최종 작업자:** `@AI`
-- **한 줄 요약:** 정십이면체 실전 미션 기준으로 구역 중첩, 주행/ALIGN fallback, body 보정, 모델 교체 상태를 통합했다.
+- **한 줄 요약:** 구역 미션을 각 zone 안에서 Set1 확인 후 Set2까지 처리하고 다음 zone으로 넘어가는 흐름으로 조정했다.
 
 ---
 
@@ -113,12 +113,28 @@
 - [ ] body 카메라 각도 변경 후 `body_ground.npz`를 재캘리브하고 body 검출 기반 물체 거리/맵 표시가 맞는지 확인 — `@insik`
 - [ ] 구역 미션 실주행에서 zone center 도착 후 6초 타이머와 구역 전환 로그가 의도대로 작동하는지 확인 — `@insik`
 - [ ] 정이십면체 단독 목표 설정으로 실제 픽업 1회 성공 여부와 ALIGN 소요 시간을 확인 — `@insik`
+- [ ] 각 zone 안에서 Set1/Set2를 모두 처리한 뒤 다음 zone으로 넘어가는 FSM 로그와 실제 동작을 확인 — `@insik`
+- [ ] Set1 목표와 fruit cube 후보를 섞어 다음 zone 방향으로 훑는 one-stroke inspection route 점수식과 YAML 파라미터를 구현·튜닝 — `@AI`
 
 ---
 
 ## 5. 변경 이력 (Changelog) — ⛔ 삭제 금지 / 최신 항목이 맨 위
 
 <!-- 새 엔트리는 바로 이 줄 아래에 추가하세요. 기존 엔트리는 건드리지 마세요. -->
+
+### `v1.1.0` — 2026-07-14 16:54 (KST) · 작업자: `@AI` · ID: `2026-07-14-01`
+- **변경 요약:** 구역 미션 phase 전환을 전역 Set1→Set2 방식에서 zone-local Set1→Set2 방식으로 바꿨다.
+- **상세:**
+  - 기존 FSM은 전체 field에서 Set1 phase를 먼저 끝낸 뒤 Set2 phase로 다시 zone 1부터 순회했다.
+  - 실제 대회 운용 의도에 맞춰 각 zone에서 Set1 목표를 확인하고, 같은 zone 안에서 Set2 fruit cube까지 확인한 뒤 다음 zone으로 넘어가도록 phase 전환을 조정했다.
+  - `shape_target_total`이 0이면 처음부터 Set2 phase로 시작할 수 있게 해, 시작 모드가 반드시 phase 1일 필요 없도록 했다.
+  - quota 충족으로 phase가 바뀌는 경우도 zone-local 규칙을 따르도록 정리했다.
+  - 향후 Set1 목표와 fruit cube 후보를 한 후보 큐로 섞어 다음 zone 방향으로 훑는 one-stroke inspection route는 별도 TODO로 남겼다.
+- **변경 파일:**
+  - `ros2_ws/src/robot_planning/robot_planning/nodes/mission_fsm_node.py` / 수정
+  - `PROJECT_LOG.md` / 수정
+- **다음 할 일 반영:** zone-local Set1/Set2 FSM 실주행 검증 TODO와 one-stroke inspection route 점수식/YAML 구현 TODO를 추가했다.
+- **버전 근거:** 구역 미션의 phase 진행 방식이 실제 대회 전략에 맞게 새 동작으로 확장된 기능 변경이므로 `MINOR` 버전 증가로 `v1.1.0`으로 올렸다.
 
 ### `v1.0.0` — 2026-07-13 18:17 (KST) · 작업자: `@AI` · ID: `2026-07-13-01`
 - **변경 요약:** 정십이면체 4개 실전 경기 흐름을 기준으로 인식/구역/주행/ALIGN 튜닝과 모델 교체 상태를 1.0.0 기준선으로 정리했다.

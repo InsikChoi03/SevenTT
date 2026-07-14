@@ -352,7 +352,9 @@ class MissionFsmNode(Node):
         self._opening_turn_start_theta: float | None = None
         self._got_world = False         # set on first /world_model (perception up)
         self._node_start_s = self._now_s()
-        self.phase = 1          # 1 = pursue Set1, 2 = pursue Set2 (pick ordering; mapping is continuous)
+        self.phase = 1 if self.shape_target_total > 0 else 2
+        # 1 = pursue Set1, 2 = pursue Set2. With zone_mission enabled this is zone-local:
+        # sweep Set1 in the current zone, then Set2 in the same zone, then advance zones.
         self.tray_shape = 0
         self.tray_fruit = 0
         self.current_target: Object | None = None    # latched selected target (id, set_type, ...)
@@ -655,25 +657,71 @@ class MissionFsmNode(Node):
     def _reset_zone_scan_timer(self) -> None:
         self._zone_no_target_since = None
 
+    def _shape_needed(self) -> bool:
+        return self.shape_target_total > 0 and self.tray_shape < self.shape_target_total
+
+    def _fruit_needed(self) -> bool:
+        return self.fruit_target_total > 0 and self.tray_fruit < self.fruit_target_total
+
+    def _both_quotas_met(self) -> bool:
+        return (
+            self.tray_shape >= self.shape_target_total
+            and self.tray_fruit >= self.fruit_target_total
+        )
+
+    def _first_needed_phase(self) -> int:
+        if self._shape_needed():
+            return 1
+        if self._fruit_needed():
+            return 2
+        return 0
+
+    def _reset_zone_phase_context(self) -> None:
+        self._plan = None
+        self._coverage = None
+        self.current_target = None
+        self._reset_zone_scan_timer()
+
     def _advance_zone_or_phase(self) -> None:
         if not self.zone_mission_enabled:
+            self._advance_phase_or_end()
             return
         prev = self._active_zone_id()
+        if self.phase == 1 and self._fruit_needed():
+            self.phase = 2
+            self._reset_zone_phase_context()
+            self.get_logger().info(f"zone {prev} Set1 done -> Set2 in same zone")
+            self._decide(f"ZONE {prev} SET1->SET2")
+            self._enter("SCAN")
+            return
         if self._zone_idx + 1 < len(self.zone_order):
             self._zone_idx += 1
-            self._plan = None
-            self._coverage = None
-            self.current_target = None
-            self._reset_zone_scan_timer()
-            self.get_logger().info(f"zone {prev} done -> zone {self._active_zone_id()}")
-            self._decide(f"ZONE {prev}->{self._active_zone_id()}")
+            next_phase = self._first_needed_phase()
+            if next_phase == 0:
+                self._zone_idx -= 1
+                self._reset_zone_phase_context()
+                self.get_logger().info("all quotas met while advancing zones -> storage/end")
+                self._decide("END (quotas met)")
+                if self.tray_shape > 0 and not self.end_after_quota:
+                    self._enter("DRIVE_TO_STORAGE")
+                else:
+                    self._enter("END")
+                return
+            self.phase = next_phase
+            self._reset_zone_phase_context()
+            self.get_logger().info(
+                f"zone {prev} done -> zone {self._active_zone_id()} Set{self.phase}")
+            self._decide(f"ZONE {prev}->{self._active_zone_id()} SET{self.phase}")
             self._enter("SCAN")
             return
         self._zone_idx = 0
-        self._reset_zone_scan_timer()
-        self.get_logger().info(f"zone {prev} done -> phase sweep complete")
+        self._reset_zone_phase_context()
+        self.get_logger().info(f"zone {prev} done -> zone-local sweep complete")
         self._decide(f"ZONE {prev} complete")
-        self._advance_phase_or_end()
+        if self.tray_shape > 0 and not self.end_after_quota:
+            self._enter("DRIVE_TO_STORAGE")
+        else:
+            self._enter("END")
 
     def _publish_goal(self, x: float, y: float, theta: float = 0.0) -> None:
         msg = PoseStamped()
@@ -813,18 +861,29 @@ class MissionFsmNode(Node):
         self.current_target = None
         self.set_type = 0
 
-        # Advance to Set2 phase once the Set1 quota is met, unless fruit targets are disabled.
-        if self.phase == 1 and self.tray_shape >= self.shape_target_total and self.fruit_target_total > 0:
+        if self.zone_mission_enabled:
+            # In zone mode, Set2 is handled before leaving the current zone. Quotas can still cut a
+            # sweep short: once all Set1 are picked, continue with Set2 in this same zone; once all
+            # Set2 are picked but Set1 remains globally, move on to the next zone's Set1 sweep.
+            if self.phase == 1 and not self._shape_needed() and self._fruit_needed():
+                self._advance_zone_or_phase()
+                return
+            if self.phase == 2 and not self._fruit_needed() and self._shape_needed():
+                self._advance_zone_or_phase()
+                return
+
+        # Non-zone mode keeps the original global Set1 sweep -> Set2 sweep behavior.
+        if (not self.zone_mission_enabled
+                and self.phase == 1
+                and self.tray_shape >= self.shape_target_total
+                and self.fruit_target_total > 0):
             self.phase = 2
             self._zone_idx = 0
             self._reset_zone_scan_timer()
             self.get_logger().info("Set1 quota met -> phase 2 (Set2)")
             self._decide("PHASE 1->2 (Set1 quota met)")
 
-        both_met = (
-            self.tray_shape >= self.shape_target_total
-            and self.tray_fruit >= self.fruit_target_total
-        )
+        both_met = self._both_quotas_met()
         if both_met and self.end_after_quota:
             self.get_logger().info("both quotas met (test mode) -> END")
             self._decide("END (quotas met)")
