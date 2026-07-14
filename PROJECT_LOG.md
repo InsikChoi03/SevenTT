@@ -26,10 +26,10 @@
 
 ## 2. 현재 상태 (Snapshot — 이 섹션만 최신값으로 덮어쓰기)
 
-- **현재 버전:** `v1.2.0`
-- **최종 업데이트:** 2026-07-14 17:04 (KST)
+- **현재 버전:** `v1.2.1`
+- **최종 업데이트:** 2026-07-14 23:00 (KST)
 - **최종 작업자:** `@AI`
-- **한 줄 요약:** 경기용 motion tuning 프리셋과 perception/test_field YAML을 동기화하고 관련 런타임 파라미터 지원을 묶었다.
+- **한 줄 요약:** 맵/자기위치 추정 안정성 비교를 위해 코드와 설정을 v1.0.0 경기 기준선으로 복구했다.
 
 ---
 
@@ -116,12 +116,33 @@
 - [ ] 각 zone 안에서 Set1/Set2를 모두 처리한 뒤 다음 zone으로 넘어가는 FSM 로그와 실제 동작을 확인 — `@insik`
 - [ ] Set1 목표와 fruit cube 후보를 섞어 다음 zone 방향으로 훑는 one-stroke inspection route 점수식과 YAML 파라미터를 구현·튜닝 — `@AI`
 - [ ] `motion_tuning.yaml` 수정 후 `scripts/apply_motion_tuning.py`로 `perception.yaml`/`test_field.yaml` 동기화가 의도대로 되는지 dry-run과 실제 적용을 비교 — `@AI`
+- [ ] v1.0.0 기준선 복구 상태에서 실제 경기장 맵/자기위치 추정이 이전 안정 수준으로 돌아오는지 재검증 — `@insik`
+- [ ] Set2/HSV/one-stroke inspection 기능은 v1.0.0 안정성 확인 후 별도 브랜치 또는 새 버전에서 단계적으로 재도입 여부 결정 — `@AI`
 
 ---
 
 ## 5. 변경 이력 (Changelog) — ⛔ 삭제 금지 / 최신 항목이 맨 위
 
 <!-- 새 엔트리는 바로 이 줄 아래에 추가하세요. 기존 엔트리는 건드리지 마세요. -->
+
+### `v1.2.1` — 2026-07-14 23:00 (KST) · 작업자: `@AI` · ID: `2026-07-14-03`
+- **변경 요약:** 맵/자기위치 추정 안정성 비교를 위해 tracked 코드와 설정을 `ee7dec0` v1.0.0 기준선으로 복구했다.
+- **상세:**
+  - 최근 Set2 통합, motion tuning 프리셋, lane planner 확장, pick sequencer 파라미터 확장 이후 실제 주행에서 map drift가 커졌다는 피드백에 따라 안정 기준선으로 되돌렸다.
+  - 원격 최신 기록은 보존한 채, `PROJECT_LOG.md`를 제외한 tracked 코드/설정 파일을 `ee7dec0 Release match baseline v1.0.0` 내용과 맞췄다.
+  - `motion_tuning.yaml`과 `scripts/apply_motion_tuning.py`는 v1.0.0 기준선에 없던 실험/동기화 파일이므로 이번 복구 커밋에서 제거했다.
+  - 복구 전 작업 내용은 로컬 `stash@{0}`에 `backup before restore ee7dec0` 이름으로 백업했다.
+- **변경 파일:**
+  - `ros2_ws/src/robot_bringup/config/motion_tuning.yaml` / 삭제
+  - `ros2_ws/src/robot_bringup/config/perception.yaml` / 수정
+  - `ros2_ws/src/robot_bringup/config/test_field.yaml` / 수정
+  - `ros2_ws/src/robot_control/robot_control/nodes/pick_sequencer_node.py` / 수정
+  - `ros2_ws/src/robot_planning/robot_planning/lane_planner.py` / 수정
+  - `ros2_ws/src/robot_planning/robot_planning/nodes/mission_fsm_node.py` / 수정
+  - `scripts/apply_motion_tuning.py` / 삭제
+  - `PROJECT_LOG.md` / 수정
+- **다음 할 일 반영:** v1.0.0 기준선 복구 상태에서 실제 경기장 map 안정성 재검증 TODO와 Set2/HSV/one-stroke 기능의 단계적 재도입 검토 TODO를 추가했다.
+- **버전 근거:** 새 기능 추가가 아니라 최근 통합 변경을 안정 기준선으로 되돌리는 복구성 수정이므로 `PATCH` 버전 증가로 `v1.2.1`로 올렸다.
 
 ### `v1.2.0` — 2026-07-14 17:04 (KST) · 작업자: `@AI` · ID: `2026-07-14-02`
 - **변경 요약:** 경기용 `motion_tuning.yaml` 프리셋과 적용된 ROS YAML 설정을 커밋 대상으로 정리했다.

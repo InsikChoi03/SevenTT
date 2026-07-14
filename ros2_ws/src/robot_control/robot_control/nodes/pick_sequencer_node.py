@@ -33,7 +33,6 @@ class PickSequencerNode(Node):
         self.declare_parameter("grip_closed", 50.0)
         self.declare_parameter("move_sec", 2.5)     # dwell for an arm move (>= firmware smooth time)
         self.declare_parameter("grasp_sec", 0.7)    # dwell for a gripper open/close
-        self.declare_parameter("reach_grip_open_frac", 0.25)
         self.declare_parameter("rate_hz", 20.0)
 
         self.init_pose = [float(v) for v in self.get_parameter("init_pose").value]
@@ -46,7 +45,6 @@ class PickSequencerNode(Node):
         self.stow_pose = (self.place_sw[0], self.place_sw[1], self.grip_closed)
         self.move_sec = float(self.get_parameter("move_sec").value)
         self.grasp_sec = float(self.get_parameter("grasp_sec").value)
-        self.reach_grip_open_frac = float(self.get_parameter("reach_grip_open_frac").value)
         rate = float(self.get_parameter("rate_hz").value)
 
         self.pub = self.create_publisher(Float32MultiArray, "/arm2r/target", 10)
@@ -71,8 +69,7 @@ class PickSequencerNode(Node):
         self.get_logger().info(
             f"pick_sequencer(2R) ready: init={self.init_pose} pick={self.pick_sw} "
             f"place={self.place_sw} grip(open={self.grip_open}/closed={self.grip_closed}) "
-            f"move={self.move_sec}s grasp={self.grasp_sec}s "
-            f"reach_open_frac={self.reach_grip_open_frac} -> /arm2r/target"
+            f"move={self.move_sec}s grasp={self.grasp_sec}s -> /arm2r/target"
         )
 
     def _now_s(self) -> float:
@@ -178,15 +175,6 @@ class PickSequencerNode(Node):
         step_start_t = 0.0 if idx == 0 else self.cum[idx - 1]
         progress = (el - step_start_t) / max(duration, 1e-6)
         ramped_pose = self._lerp_pose(self.seq_start_poses[idx], pose, progress)
-        if name == "REACH":
-            start = self.seq_start_poses[idx]
-            frac = max(0.05, min(1.0, self.reach_grip_open_frac))
-            grip_progress = min(1.0, max(0.0, progress / frac))
-            ramped_pose = (
-                ramped_pose[0],
-                ramped_pose[1],
-                start[2] + (pose[2] - start[2]) * grip_progress,
-            )
         if name != self._last_step:
             start = self.seq_start_poses[idx]
             self.get_logger().info(

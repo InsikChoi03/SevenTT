@@ -53,8 +53,6 @@ class LanePlanner:
         origin_mode: str = "infer",
         origin_xy: tuple[float, float] = (0.0, 0.0),
         start_connect_k: int = 4,
-        mode: str = "lane",
-        taxi_final_direct_m: float = 0.35,
     ) -> None:
         self.s = float(spacing)
         xmin, xmax, ymin, ymax = bounds
@@ -68,11 +66,6 @@ class LanePlanner:
         self.origin_mode = str(origin_mode)
         self.origin_xy = (float(origin_xy[0]), float(origin_xy[1]))
         self.k = int(start_connect_k)
-        self.mode = str(mode).strip().lower()
-        self.taxi_final_direct_m = float(taxi_final_direct_m)
-
-    def _taxi_mode(self) -> bool:
-        return self.mode in ("taxi", "taxi_hybrid", "hybrid_taxi", "manhattan")
 
     # ------------------------------------------------------------ lattice phase
     def _circ_phase(self, coords: list[float]) -> float:
@@ -216,41 +209,6 @@ class LanePlanner:
             i = j
         return out
 
-    def _simplify_taxi(self, pts):
-        """Collapse only collinear runs. Unlike string-pull, this preserves right-angle lane turns."""
-        dedup = []
-        for p in pts:
-            if not dedup or math.hypot(p[0] - dedup[-1][0], p[1] - dedup[-1][1]) > 1e-9:
-                dedup.append(p)
-        pts = dedup
-        if len(pts) <= 2:
-            return pts
-        out = [pts[0]]
-        prev_dir = None
-        for i in range(1, len(pts)):
-            ax, ay = pts[i - 1]
-            bx, by = pts[i]
-            dx = bx - ax
-            dy = by - ay
-            if abs(dx) >= abs(dy):
-                cur_dir = (1 if dx > 0 else -1 if dx < 0 else 0, 0)
-            else:
-                cur_dir = (0, 1 if dy > 0 else -1 if dy < 0 else 0)
-            if prev_dir is not None and cur_dir != prev_dir:
-                out.append(pts[i - 1])
-            prev_dir = cur_dir
-        out.append(pts[-1])
-        return out
-
-    def _nearest_clear_node_within(self, nodes, pt, obstacles, max_dist: float):
-        cand = sorted(nodes.items(), key=lambda kv: math.hypot(kv[1][0] - pt[0], kv[1][1] - pt[1]))
-        for ij, xy in cand:
-            if math.hypot(xy[0] - pt[0], xy[1] - pt[1]) > max_dist:
-                break
-            if self._seg_free(xy, pt, obstacles):
-                return ij
-        return None
-
     # ------------------------------------------------------------ public: plan
     def plan(self, start, dest, obstacles):
         """Collision-free via list from `start` to `dest` (field xy, metres). Returns a list of
@@ -262,22 +220,14 @@ class LanePlanner:
         obstacles = [(float(ox), float(oy)) for ox, oy in obstacles]
         if math.hypot(dx - sx, dy - sy) < 1e-6:
             return [(dx, dy)]
-        taxi = self._taxi_mode()
-        # Direct shot already clear? In taxi-hybrid mode keep long travel on lane centres, but allow
-        # the last short approach to the target/standoff.
-        if self._seg_free((sx, sy), (dx, dy), obstacles) and (
-                not taxi or math.hypot(dx - sx, dy - sy) <= self.taxi_final_direct_m):
+        # Direct shot already clear? then no vias needed.
+        if self._seg_free((sx, sy), (dx, dy), obstacles):
             return [(dx, dy)]
         ox0, oy0 = self.infer_origin(obstacles)
         nodes = self._lane_nodes(ox0, oy0)
         if not nodes:
             return None
-        if taxi:
-            goal_ij = self._nearest_clear_node_within(
-                nodes, (dx, dy), obstacles, max(self.taxi_final_direct_m, self.s * 0.5)
-            )
-        else:
-            goal_ij = self._nearest_clear_node(nodes, (dx, dy), obstacles)
+        goal_ij = self._nearest_clear_node(nodes, (dx, dy), obstacles)
         starts = self._nearest_clear_nodes(nodes, (sx, sy), obstacles, self.k)
         if goal_ij is None or not starts:
             return None
@@ -285,7 +235,7 @@ class LanePlanner:
         if path_ij is None:
             return None
         pts = [(sx, sy)] + [nodes[ij] for ij in path_ij] + [(dx, dy)]
-        pts = self._simplify_taxi(pts) if taxi else self._simplify(pts, obstacles)
+        pts = self._simplify(pts, obstacles)
         return pts[1:]   # drop the robot's own start point
 
     # ------------------------------------------------------------ public: coverage sweep

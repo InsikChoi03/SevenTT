@@ -115,7 +115,7 @@ yolo_detector_node:
 siglip_gate_node:
   ros__parameters:
     model_id: "google/siglip-base-patch16-224"
-    set2_label: orange                       # today's Set2 fruit target
+    set2_label: "orange"                  # today's Set2 fruit target
     fruit_labels: ["apple", "orange", "banana", "pineapple"]
     confidence_threshold: 0.5             # 이제 softmax MARGIN 임계값(best-2nd). 오픽방지 위해 다소 엄격
     device: "auto"
@@ -163,30 +163,30 @@ world_model_node:
     forget_after_sec: 120.0               # persist the whole-field map (static objects)
     # 7x6 경기장 격자 prior. 실제 field 원점/축 검증 전에는 false로 두고 테스트 때만 켠다.
     # 실행 중: ros2 param set /world_model_node grid_prior_enabled true|false
-    grid_prior_enabled: true
+    grid_prior_enabled: false
     grid_prior_debug: true
     grid_rows: 6
     grid_cols: 7
-    grid_spacing_m: 0.5
-    grid_origin_x_m: -1.5                    # 화면 기준 좌상단 첫 격자점: 좌/상 50cm, 하단 100cm 여백
-    grid_origin_y_m: -1.5
+    grid_spacing_m: 0.50
+    grid_origin_x_m: -1.50                # 화면 기준 좌상단 첫 격자점: 좌/상 50cm, 하단 100cm 여백
+    grid_origin_y_m: -1.50
     grid_initial_phase_sec: 20.0
     grid_initial_snap_radius_m: 0.15
     grid_new_snap_radius_m: 0.12
-    grid_initial_snap_alpha: 0.8
+    grid_initial_snap_alpha: 0.80
     grid_new_snap_alpha: 0.45
     grid_moved_threshold_m: 0.22
     # 위치 vs 분류 분리 + 음의 증거(FOV 안인데 미검출 시 지속 감점 → 팬텀/집어간 물체 정리)
     class_conf_threshold: 0.85            # 광각 IDENTITY 커트라인(높게): 이 이상만 클래스 투표(광각=위치 위주)
     class_conf_threshold_body: 0.50       # 본체=신원 권위자라 낮은 바에서도 투표(0.6~0.8 octa/icosa도 자기 정체성 확립→과병합 방지)
     # 카메라 커버 도형(base_link): 본체=부채꼴, 광각=전방 타원 (음의증거 판정 + 맵 표시 공용)
-    body_fov_half_deg: 30.0                  # 실측 footprint 반각 ~30°
-    body_fov_near_m: 0.25                    # 이미지 하단이 지면 0.29m → 그보다 가까우면 못 봄
-    body_fov_far_m: 0.68                     # 캘리브 신뢰 상한(마커 0.68m)
-    body_fov_apex_x: 0.065                   # 본체캠 전방 오프셋(부채꼴 꼭짓점)
-    wide_fov_forward_m: 1.1                  # 광각 타원 전방 반축(실측 footprint 앞 -0.5~+1.5)
-    wide_fov_lateral_m: 1.3                  # 광각 타원 좌우 반축(±1.3)
-    wide_fov_center_x: 0.4                   # 광각 타원 중심(로봇 앞쪽, 전방편향)
+    body_fov_half_deg: 30.0               # 실측 footprint 반각 ~30°
+    body_fov_near_m: 0.25                # 이미지 하단이 지면 0.29m → 그보다 가까우면 못 봄
+    body_fov_far_m: 0.68                 # 캘리브 신뢰 상한(마커 0.68m)
+    body_fov_apex_x: 0.065                # 본체캠 전방 오프셋(부채꼴 꼭짓점)
+    wide_fov_forward_m: 1.1               # 광각 타원 전방 반축(실측 footprint 앞 -0.5~+1.5)
+    wide_fov_lateral_m: 1.3               # 광각 타원 좌우 반축(±1.3)
+    wide_fov_center_x: 0.4                # 광각 타원 중심(로봇 앞쪽, 전방편향)
     miss_penalty_per_sec: 0.3             # FOV 안인데 안 보이면 초당 이만큼 감점
     see_window_sec: 0.6                   # 이 시간 이상 미검출이면 miss
     min_keep_conf: 0.05                   # presence 이 아래로 내려가면 트랙 제거
@@ -222,29 +222,29 @@ world_model_node:
 
 target_selector_node:
   ros__parameters:
-    set1_label: octahedron                   # today's Set1 shape target (정십이면체)
-    set2_label: orange                       # today's Set2 fruit target
+    set1_label: "dodecahedron"            # today's Set1 shape target (정십이면체)
+    set2_label: "orange"                  # today's Set2 fruit target
     rate_hz: 2.0
     explore_base: 5.0
-    set1_base: 20.0                          # Set1 outranks Set2 (approach bias; order enforced by FSM phase)
+    set1_base: 20.0                       # Set1 outranks Set2 (approach bias; order enforced by FSM phase)
     set2_base: 10.0
-    zone_filter_enabled: true                # FSM의 /planning/zone에 맞춰 선택 후보를 현재 2x2 구역으로 제한
-    zone_bounds_m: [-2.0, 0.1, -0.1, 2.0, -2.0, 0.1, -2.0, 0.1, -0.1, 2.0, -2.0, 0.1, -0.1, 2.0, -0.1, 2.0]
+    zone_filter_enabled: true             # FSM의 /planning/zone에 맞춰 선택 후보를 현재 2x2 구역으로 제한
+    zone_bounds_m: [-2.0, 0.1, -0.1, 2.0,  -2.0, 0.1, -2.0, 0.1,  -0.1, 2.0, -2.0, 0.1,  -0.1, 2.0, -0.1, 2.0]
 
 mission_fsm_node:
   ros__parameters:
-    set1_label: octahedron                   # today's Set1 shape target (정십이면체) — 4 placed
-    set2_label: orange                       # today's Set2 fruit target — 2 placed
+    set1_label: "dodecahedron"            # today's Set1 shape target (정십이면체) — 4 placed
+    set2_label: "orange"                  # today's Set2 fruit target — 2 placed
     conf_threshold: 0.7
     pick_track_conf: 0.5                   # 타겟 트랙 정체성 신뢰 하한(게이트=프레임전역 아닌 트랙기반)
-    approach_dist_m: 0.35                    # 집기 전 ALIGN 전환 거리: 35cm
+    approach_dist_m: 0.375                 # 집기 전 ALIGN 전환 거리: 37.5cm
     align_settle_sec: 1.0
     classify_timeout_sec: 3.5             # 트랙기반 게이트(set1 즉시), set2 SigLIP 여유
     pick_duration_sec: 9.0                # 물체를 쥐고 어깨가 올라간 뒤 바로 다음 주행 시작
-    shape_target_total: 4                    # 정십이면체 4개
-    fruit_target_total: 0                    # 오렌지 큐브 무시: 정십이면체만 집기
-    grab_x: 0.19                             # 집기점 전방(m). 0.21에서 2cm 더 가까이 잡도록 조정
-    grab_min_x: 0.17                         # 이보다 더 가까이 밀지 않음(전진 안전한계)
+    shape_target_total: 4                 # 정십이면체 4개
+    fruit_target_total: 0                 # 오렌지 큐브 무시: 정십이면체만 집기
+    grab_x: 0.19                          # 집기점 전방(m). 0.21에서 2cm 더 가까이 잡도록 조정
+    grab_min_x: 0.17                      # 이보다 더 가까이 밀지 않음(전진 안전한계)
     storage_x: 1.6                        # 보관함 위치 field xy (좌측하단 구석 안쪽). 실제 빈 위치로 조정
     storage_y: 1.6
     publish_rate_hz: 20.0                  # FSM tick. ALIGN 단위펄스 시간을 50ms 격자로 정밀하게(200/300ms 정확)
@@ -258,113 +258,106 @@ mission_fsm_node:
     # 경기 시작 하드코딩 개막 이동(로봇 body 기준): 전진 1초 → 오른쪽 횡이동 0.5초 → 제자리 45도 회전 → 1초 정지 → SCAN.
     # 이후 phase 1에서 Set1 정이십면체를 탐색/접근한다.
     opening_enabled: true
-    startup_warmup_sec: 15.0                 # YOLO 로드+world_model 뜰 때까지 정지 대기 후 개막(방향 잃음 방지)
-    opening_speed: 0.18                      # 주행 속도 1.3배 상향: 0.135 -> 0.1755
-    opening_forward_sec: 1.5
-    opening_strafe_speed: 0.26               # 횡이동 속도 1.5배 상향: 0.1755 -> 0.26325
+    startup_warmup_sec: 15.0              # YOLO 로드+world_model 뜰 때까지 정지 대기 후 개막(방향 잃음 방지)
+    opening_speed: 0.1755                 # 주행 속도 1.3배 상향: 0.135 -> 0.1755
+    opening_forward_sec: 2.0
+    opening_strafe_speed: 0.26325         # 횡이동 속도 1.5배 상향: 0.1755 -> 0.26325
     opening_strafe_right_sec: 1.5
     opening_turn_deg: 45.0
-    opening_turn_omega: -0.255               # 회전 속도 1.5배 상향: -0.17 -> -0.255
+    opening_turn_omega: -0.255            # 회전 속도 1.5배 상향: -0.17 -> -0.255
     opening_wait_after_turn_sec: 1.0
-    scan_search_omega: -0.255                # 탐색 회전 속도 1.5배 상향: -0.17 -> -0.255
+    scan_search_omega: -0.255             # 탐색 회전 속도 1.5배 상향: -0.17 -> -0.255
     # ★레인-그래프 waypoint 플래너★ (50cm 물체격자, 40cm 로봇). 이동목표(SCAN 스윕·APPROACH standoff·
     # 보관함)를 충돌없는 레인 중심선으로 라우팅. go_to_goal은 각 via를 car-like+반응형으로 주행.
-    planner_enabled: true                    # false면 예전 직접-goal 동작(안전 롤백)
-    planner_mode: lane                       # lane=기존 shortcut 허용, taxi_hybrid=격자 가로/세로+마지막 짧은 직선
-    taxi_final_direct_m: 0.35             # 목표/standoff 주변 이 거리 안에서만 lane을 벗어난 직선 접근 허용
-    grid_spacing_m: 0.5                      # 물체 격자 간격
-    grid_origin_mode: infer                  # infer=물체서 위상추론 / fixed=grid_origin_xy 사용
+    planner_enabled: true                 # false면 예전 직접-goal 동작(안전 롤백)
+    grid_spacing_m: 0.50                  # 물체 격자 간격
+    grid_origin_mode: "infer"             # infer=물체서 위상추론 / fixed=grid_origin_xy 사용
     grid_origin_xy: [0.0, 0.0]
-    phase_tol_m: 0.08                        # 물체가 추론격자에 이 안으로 맞아야 신뢰(아니면 fixed 폴백)
+    phase_tol_m: 0.08                     # 물체가 추론격자에 이 안으로 맞아야 신뢰(아니면 fixed 폴백)
     field_bounds_m: [-2.0, 2.0, -2.0, 2.0]   # go_to_goal과 동일(재클램프 방지)
-    robot_margin_m: 0.3
-    lane_block_radius_m: 0.24                # 물체-레인 거리 이 밑이면 간선 차단(로봇반경0.20+물체0.03+여유0.01)
-    comfort_clear_m: 0.35                    # 여유비용 포화 기준
-    clearance_weight: 2.0                    # 넓은 레인 선호(좁은 게이트는 최후수단)
+    robot_margin_m: 0.22
+    lane_block_radius_m: 0.24             # 물체-레인 거리 이 밑이면 간선 차단(로봇반경0.20+물체0.03+여유0.01)
+    comfort_clear_m: 0.35                 # 여유비용 포화 기준
+    clearance_weight: 2.0                 # 넓은 레인 선호(좁은 게이트는 최후수단)
     start_connect_k: 4
-    wp_reach_tol_m: 0.12                     # 이 안이면 다음 via로(go_to_goal pos_tol 0.05보다 느슨)
+    wp_reach_tol_m: 0.12                  # 이 안이면 다음 via로(go_to_goal pos_tol 0.05보다 느슨)
     replan_period_sec: 1.5
-    replan_goal_move_m: 0.15                 # 목적지가 이보다 움직이면 재계획
-    replan_throttle_sec: 0.5                 # A* 최소 간격(경로 안정)
-    obstacle_min_conf: 0.4                   # 장애물 팬텀 필터
+    replan_goal_move_m: 0.15              # 목적지가 이보다 움직이면 재계획
+    replan_throttle_sec: 0.5             # A* 최소 간격(경로 안정)
+    obstacle_min_conf: 0.4               # 장애물 팬텀 필터
     obstacle_min_nobs: 2
-    exclude_target_radius_m: 0.3             # 목적지 이 안 물체 제외(마지막 접근 leg 도달가능)
+    exclude_target_radius_m: 0.30        # 목적지 이 안 물체 제외(마지막 접근 leg 도달가능)
     # 탐색 = 스텝방식: 조금 돌고 → 멈춰서 식별 → 다시 돌고 (계속 돌면 모션블러로 트랙 유실)
-    search_turn_sec: 0.5                     # 한 스텝 ~20~30° 회전(각도 크면 ↓)
-    search_look_sec: 2.5                     # 한번 돌고 2~3초 대기하며 식별(자주 안 돌아도 됨)
+    search_turn_sec: 0.5                  # 한 스텝 ~20~30° 회전(각도 크면 ↓)
+    search_look_sec: 2.5                  # 한번 돌고 2~3초 대기하며 식별(자주 안 돌아도 됨)
     # 접근 = 타겟쪽으로 천천히 돌려 마주본 뒤 전진(수렴하면 멈춤, 빙글빙글 안 함)
-    approach_face_tol: 0.25                  # 이 heading오차(rad) 안이면 전진, 밖이면 제자리 회전으로 마주봄
-    approach_speed: 0.17                     # 출발/ALIGN 제외 일반 접근 속도: 0.2145의 0.8배
+    approach_face_tol: 0.25               # 이 heading오차(rad) 안이면 전진, 밖이면 제자리 회전으로 마주봄
+    approach_speed: 0.1716                # 출발/ALIGN 제외 일반 접근 속도: 0.2145의 0.8배
     approach_kp_ang: 1.0
-    approach_omega_max: 0.345                # 접근 중 회전 상한 1.5배 상향: 0.23 -> 0.345
-    approach_look_sec: 1.0                   # 접근도 스텝: 멈춰서 인식 1.0s → 짧게 이동 → 반복 (움직이며 인식 X)
-    approach_move_sec: 0.5                   # 한 스텝 이동(회전 또는 전진) 시간
-    approach_lost_grace_sec: 2.5             # 타겟 순간 사라져도 이 시간은 유지(튀는 재선택 방지)
+    approach_omega_max: 0.345             # 접근 중 회전 상한 1.5배 상향: 0.23 -> 0.345
+    approach_look_sec: 1.0                # 접근도 스텝: 멈춰서 인식 1.0s → 짧게 이동 → 반복 (움직이며 인식 X)
+    approach_move_sec: 0.5                # 한 스텝 이동(회전 또는 전진) 시간
+    approach_lost_grace_sec: 2.5          # 타겟 순간 사라져도 이 시간은 유지(튀는 재선택 방지)
     approach_standoff_tol: 0.09
-    classify_standoff_sec: 2.0               # set2: stand-off서 SigLIP이 과일 타입 정할 때까지 대기(정렬 전). 오렌지 아니면 스킵
+    classify_standoff_sec: 2.0            # set2: stand-off서 SigLIP이 과일 타입 정할 때까지 대기(정렬 전). 오렌지 아니면 스킵
     # 2x2m 구역 미션: 중앙 십자가 경계는 10cm씩 중첩해 맵 오차로 경계 물체를 놓치지 않게 한다.
     zone_mission_enabled: true
     zone_order: [1, 2, 3, 4]
-    zone_bounds_m: [-2.0, 0.1, -0.1, 2.0, -2.0, 0.1, -2.0, 0.1, -0.1, 2.0, -2.0, 0.1, -0.1, 2.0, -0.1, 2.0]
+    zone_bounds_m: [-2.0, 0.1, -0.1, 2.0,  -2.0, 0.1, -2.0, 0.1,  -0.1, 2.0, -2.0, 0.1,  -0.1, 2.0, -0.1, 2.0]
     zone_no_target_advance_sec: 6.0
     zone_center_reach_tol_m: 0.25
     # 집기 전방거리를 초음파로 직접 맞춤(본체캠 투영오차 없음). grab_range_m는 센서 연결 후 캘리브 필수:
     # 큐브를 집기점에 두고 /ultrasonic/range 읽은 값. 없으면 자동으로 본체캠 x로 폴백.
-    use_sonar_align: false                   # 초음파가 낮은 큐브를 가까이서 못 봄(빔이 위로 지나감, inf) → 본체캠 정렬
-    grab_range_m: 0.08                       # 실측: 집기점에 물체 둘 때 초음파 8cm (참고용, 현재 미사용)
+    use_sonar_align: false                # 초음파가 낮은 큐브를 가까이서 못 봄(빔이 위로 지나감, inf) → 본체캠 정렬
+    grab_range_m: 0.08                    # 실측: 집기점에 물체 둘 때 초음파 8cm (참고용, 현재 미사용)
     align_pulse_sec: 0.10                 # (legacy, 미사용)
     # ★단위-스텝 보정값★ (2026-07-08 실측, 무부스트+브레이크). 각 방향 거의 일정 이동:
-    align_step_fwd_duty: 0.27                # 전진/후진 duty. 직전 저속값 대비 1.5배
-    align_step_fwd_sec: 0.15                 # 한 번 전/후진 보정 거리: 직전값 대비 1.5배
-    align_adaptive_steps_enabled: true       # 오차가 클 때 중간 펄스 시간 사용, 가까우면 짧은 펄스 사용
-    align_mid_error_m: 0.05                  # 선택 축 오차가 이 이상이면 중간 펄스
-    align_step_fwd_mid_sec: 0.22             # 전/후진 중간 펄스 시간
-    align_step_strafe_duty: 0.315            # ALIGN 미세조정 횡이동 duty: 0.45의 0.7배
-    align_step_strafe_sec: 0.15              # 한 번 좌/우 보정 거리: 직전 0.225의 0.7배
-    align_step_strafe_mid_sec: 0.24          # 좌/우 중간 펄스 시간
-    align_body_lost_backoff_enabled: true    # ALIGN에서 wide/world에는 있는데 body에 없으면 후진 후 재탐지
-    align_body_lost_backoff_speed: 0.18      # body lost 후진 duty: 0.27의 0.7배
-    align_body_lost_backoff_sec: 0.54        # 속도 0.7배 기준 약 10cm 후진
-    align_body_lost_backoff_settle_sec: 1.0  # 후진 후 카메라 안정화 대기
-    align_settle_pulse_sec: 0.6              # 스텝 후 완전정지 대기(브레이크 있어 더 짧게)
-    align_tol_m: 0.03                        # 좌우 허용오차. 이 안이면 잡기(그리퍼가 흡수)
-    align_fwd_tol_m: 0.03                    # 앞뒤 허용오차. 이 안이면 잡기(그리퍼가 흡수)
+    align_step_fwd_duty: 0.27             # 전진/후진 duty. 직전 저속값 대비 1.5배
+    align_step_fwd_sec: 0.15              # 한 번 전/후진 보정 거리: 직전값 대비 1.5배
+    align_step_strafe_duty: 0.315         # ALIGN 미세조정 횡이동 duty: 0.45의 0.7배
+    align_step_strafe_sec: 0.1575         # 한 번 좌/우 보정 거리: 직전 0.225의 0.7배
+    align_body_lost_backoff_enabled: true # ALIGN에서 wide/world에는 있는데 body에 없으면 후진 후 재탐지
+    align_body_lost_backoff_speed: 0.189  # body lost 후진 duty: 0.27의 0.7배
+    align_body_lost_backoff_sec: 0.54     # 속도 0.7배 기준 약 10cm 후진
+    align_body_lost_backoff_settle_sec: 1.0 # 후진 후 카메라 안정화 대기
+    align_settle_pulse_sec: 0.6           # 스텝 후 완전정지 대기(브레이크 있어 더 짧게)
+    align_tol_m: 0.03                     # 좌우 허용오차. 이 안이면 잡기(그리퍼가 흡수)
+    align_fwd_tol_m: 0.03                 # 앞뒤 허용오차. 이 안이면 잡기(그리퍼가 흡수)
     align_sonar_tol_m: 0.02
     sonar_timeout_sec: 0.5
 
 pick_sequencer_node:
   ros__parameters:
     # 2026-07-08 팀원 재보정값. test_field.launch.py with_arm:=true 실행 시 이 값이 우선 적용된다.
-    init_pose: [110.0, 30.0, 50.0]           # 주행 대기: 보관함 쪽 상단, 그리퍼 닫힘
-    pick_shoulder_wrist: [25.0, 150.0]       # 집기 도달: 어깨·손목
-    place_shoulder_wrist: [110.0, 30.0]      # 놓기: 닫은 채 이동 후 이 위치에서 열기
-    grip_open: 115.0                         # 열림/놓기
-    grip_closed: 50.0                        # 닫힘/잡기
-    move_sec: 4.0                            # 팔 이동 단계 램프 시간(REACH/LIFT/TO_PLACE). 내림 속도 완화
-    grasp_sec: 1.0                           # 그리퍼 열림/닫힘 단계 램프 시간
-    reach_grip_open_frac: 0.25               # REACH 초반 이 비율 안에 그리퍼를 먼저 완전히 열기
+    init_pose: [110.0, 30.0, 50.0]        # 주행 대기: 보관함 쪽 상단, 그리퍼 닫힘
+    pick_shoulder_wrist: [25.0, 150.0]    # 집기 도달: 어깨·손목
+    place_shoulder_wrist: [110.0, 30.0]   # 놓기: 닫은 채 이동 후 이 위치에서 열기
+    grip_open: 115.0                      # 열림/놓기
+    grip_closed: 50.0                     # 닫힘/잡기
+    move_sec: 4.0                         # 팔 이동 단계 램프 시간(REACH/LIFT/TO_PLACE). 내림 속도 완화
+    grasp_sec: 1.0                        # 그리퍼 열림/닫힘 단계 램프 시간
 
 go_to_goal_node:
   ros__parameters:
     control_rate_hz: 20.0
     # ★하이브리드 주행★ (duty, m/s 아님). 실측: 전진 duty 0.10→~0.2m/s, 0.20→~0.67m/s (taper 있음).
     # 맵 안정화를 위해 cruise/floor/turn을 기존 대비 약 1/3로 낮춤.
-    kp_lin: 0.8                              # 오차 m당 cruise. 0.22m 넘으면 cruise 포화
-    max_lin_speed: 0.0936                    # 출발/ALIGN 제외 일반 목표 주행 속도: 0.117의 0.8배
-    min_lin_speed: 0.04                      # 움직이는 최소 duty(스톨하면 0.06~0.08로 올림)
-    max_ang_speed: 0.405                     # 목표 바라보는 회전속도 1.5배 상향: 0.27 -> 0.405
-    fine_radius_m: 0.15                      # 이 안=홀로노믹 미세, 밖=car-like cruise
-    face_tol_rad: 0.35                       # travel: 목표를 이 각(±20°) 안으로 바라봐야 전진 시작
+    kp_lin: 0.8                           # 오차 m당 cruise. 0.22m 넘으면 cruise 포화
+    max_lin_speed: 0.0936                 # 출발/ALIGN 제외 일반 목표 주행 속도: 0.117의 0.8배
+    min_lin_speed: 0.04                   # 움직이는 최소 duty(스톨하면 0.06~0.08로 올림)
+    max_ang_speed: 0.405                  # 목표 바라보는 회전속도 1.5배 상향: 0.27 -> 0.405
+    fine_radius_m: 0.15                   # 이 안=홀로노믹 미세, 밖=car-like cruise
+    face_tol_rad: 0.35                    # travel: 목표를 이 각(±20°) 안으로 바라봐야 전진 시작
     # 벽 충돌 방지: 로봇 40×40(반경 0.2m), 4×4 경기장(±2). 목표를 이 범위로 클램프해 벽에 안 붙게.
     field_bounds_m: [-2.0, 2.0, -2.0, 2.0]
-    robot_margin_m: 0.3                      # 로봇 반경 0.2 + 여유 → 중심이 벽서 22cm 안쪽까지만
+    robot_margin_m: 0.22                  # 로봇 반경 0.2 + 여유 → 중심이 벽서 22cm 안쪽까지만
     # 물체 회피(포텐셜필드): 몸(40×40)으로 큐브 안 건드리게 매핑된 물체서 밀어냄. 타겟은 제외.
     # 플래너가 레인 선택을 담당하므로 반응형 회피는 '부드러운 중심 정렬 안전망'으로 낮춤(게이트 양쪽 기둥
     # 0.25m를 세게 밀어 전진을 막던 것 완화). 플래너=레인, 반응형=미세 중심보정 공존.
-    avoid_radius_m: 0.3                      # 0.55→0.30 (게이트 기둥 겨우 안쪽만 반응)
-    avoid_gain: 0.1                          # 0.28→0.10 (약한 자기중심 정렬)
-    avoid_goal_skip_m: 0.3                   # 목표 근처 이 안의 물체=접근 대상이라 회피 안 함
-    front_stop_m: 0.15                       # 전방 초음파 이 거리 안에 벽 있으면 전진 정지(픽 stand-off 0.35보다 작아 방해X)
+    avoid_radius_m: 0.30                  # 0.55→0.30 (게이트 기둥 겨우 안쪽만 반응)
+    avoid_gain: 0.10                      # 0.28→0.10 (약한 자기중심 정렬)
+    avoid_goal_skip_m: 0.30              # 목표 근처 이 안의 물체=접근 대상이라 회피 안 함
+    front_stop_m: 0.15                   # 전방 초음파 이 거리 안에 벽 있으면 전진 정지(픽 stand-off 0.35보다 작아 방해X)
     sonar_timeout_sec: 0.5
 
 base_controller_node:
@@ -373,22 +366,22 @@ base_controller_node:
     ly: 0.10
     cmd_timeout_sec: 0.5
     # motion_tuning_log.csv 수렴값(전진 5cm 정확, 17:10 trial3). 무거운 베이스가 이 세기 밑이면 헛돎.
-    wheel_scales: [1.0, 1.0, 1.0, 1.0]       # 전진 트림(all-1 수렴)
+    wheel_scales: [1.0, 1.0, 1.0, 1.0]    # 전진 트림(all-1 수렴)
     # 방향별 횡이동 트림: 직진성은 휠 간 '비율'이 결정하므로 motion_tune 수렴 비율을 유지하되 max=1.0으로
     # 정규화(원값 우 0.7,0.7,0.8,0.7 / 좌 0.65,0.75,0.75,0.65의 절대감쇠는 고정속도 거리튜닝 산물이라 제거).
     # 이러면 속도밴드가 전진/횡이동에 동일 의미 → 횡이동이 약해 스톨하지 않음. 여전히 휘면 이 비율 재튜닝.
     strafe_right_scales: [0.875, 0.875, 1.0, 0.875]
     strafe_left_scales: [0.867, 1.0, 1.0, 0.867]
-    wheel_min: 0.06                          # 저속 맵핑용 floor. 직전 저속값 대비 1.5배
-    wheel_min_rot: 0.105                     # 제자리 회전 floor 1.5배 상향: 0.07 -> 0.105
-    wheel_boost: 0.3                         # 회전/횡이동 정지→출발 킥 1.5배 상향: 0.195 -> 0.2925
-    wheel_boost_ms: 100                      # boost_ms
-    wheel_slew_per_tick: 0.02                # 가감속 더더 완만(아주 부드럽게)
-    align_wheel_boost: 0.63                  # ALIGN 미세정렬 킥. 직전 저속값 대비 1.5배
-    align_brake_off: false                   # ALIGN 단위-스텝은 브레이크 ON(각 스텝 크리스프 정지 → 보정값과 동일·반복성)
+    wheel_min: 0.06                        # 저속 맵핑용 floor. 직전 저속값 대비 1.5배
+    wheel_min_rot: 0.105                   # 제자리 회전 floor 1.5배 상향: 0.07 -> 0.105
+    wheel_boost: 0.2925                    # 회전/횡이동 정지→출발 킥 1.5배 상향: 0.195 -> 0.2925
+    wheel_boost_ms: 100                    # boost_ms
+    wheel_slew_per_tick: 0.02             # 가감속 더더 완만(아주 부드럽게)
+    align_wheel_boost: 0.63               # ALIGN 미세정렬 킥. 직전 저속값 대비 1.5배
+    align_brake_off: false                # ALIGN 단위-스텝은 브레이크 ON(각 스텝 크리스프 정지 → 보정값과 동일·반복성)
     wheel_deadband: 0.02
-    wheel_brake_ms: 120                      # 이동→정지 전환마다 역펄스 제동(coast 컷). 0=끔
-    wheel_brake_scale: 0.315                 # 역펄스 세기 = 직전 0.45의 0.7배
+    wheel_brake_ms: 120                    # 이동→정지 전환마다 역펄스 제동(coast 컷). 0=끔
+    wheel_brake_scale: 0.315               # 역펄스 세기 = 직전 0.45의 0.7배
 
 explorer_node:
   ros__parameters:
@@ -418,21 +411,21 @@ recognition_viz_node:
     map_margin_px: 48                     # 4×4m 경기장 테두리가 화면 가장자리에 붙지 않도록 안쪽 여백 확보
     snapshot_interval_sec: 0.0            # 0=스냅샷/최종PNG 저장 안 함(live.png만 유지, 누적방지)
     show_window: false                    # 헤드리스/SSH: cv2 창 대신 live.png 만 기록 (창 열면 Qt xcb 크래시)
-    show_camera_panels: true                 # YOLO-annotated wide + body feeds beside the map
-    write_live_png: false                    # MJPEG stream only; skip live.png disk writes during match
+    show_camera_panels: true              # YOLO-annotated wide + body feeds beside the map
+    write_live_png: true                  # overwrite <run>/live.png each redraw (open it in the IDE)
     save_training_data: false             # 라이브 끊김 감소: 학습데이터 저장은 필요할 때만 true
     trail_min_step_m: 0.01                # 정지 중 pose 미세진동은 파란 경로에 추가하지 않음
     training_interval_sec: 1.5            # 저장 주기(초). 검출 있는 프레임만 저장
     trail_max_points: 2000
-    redraw_rate_hz: 3.0
-    show_object_grid_points: false
+    redraw_rate_hz: 5.0
+    show_object_grid_points: true
     grid_rows: 6
     grid_cols: 7
-    grid_spacing_m: 0.5
-    grid_origin_x_m: -1.5                    # world_model_node grid prior와 같은 기준
-    grid_origin_y_m: -1.5
-    show_zone_regions: false                 # FSM이 쓰는 2x2m 구역을 라이브 맵에 사각형으로 표시
-    zone_bounds_m: [-2.0, 0.1, -0.1, 2.0, -2.0, 0.1, -2.0, 0.1, -0.1, 2.0, -2.0, 0.1, -0.1, 2.0, -0.1, 2.0]
+    grid_spacing_m: 0.50
+    grid_origin_x_m: -1.50                # world_model_node grid prior와 같은 기준
+    grid_origin_y_m: -1.50
+    show_zone_regions: true               # FSM이 쓰는 2x2m 구역을 라이브 맵에 사각형으로 표시
+    zone_bounds_m: [-2.0, 0.1, -0.1, 2.0,  -2.0, 0.1, -2.0, 0.1,  -0.1, 2.0, -2.0, 0.1,  -0.1, 2.0, -0.1, 2.0]
     # 맵 FOV 표시(world_model 과 동일값): 본체=부채꼴, 광각=전방 타원
     body_fov_half_deg: 30.0
     body_fov_near_m: 0.25

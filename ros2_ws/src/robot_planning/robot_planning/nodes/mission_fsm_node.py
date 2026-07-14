@@ -96,12 +96,6 @@ class MissionFsmNode(Node):
         self.declare_parameter("align_step_fwd_sec", 0.15)
         self.declare_parameter("align_step_strafe_duty", 0.30)  # strafe: 0.30/0.30s -> ~2.5 cm (yaw ~0)
         self.declare_parameter("align_step_strafe_sec", 0.1575)
-        # Medium pulse: when the selected ALIGN axis is still far from the grab point, keep the same
-        # duty but pulse longer. Once close, fall back to the short calibrated pulse above.
-        self.declare_parameter("align_adaptive_steps_enabled", False)
-        self.declare_parameter("align_mid_error_m", 0.08)
-        self.declare_parameter("align_step_fwd_mid_sec", 0.225)
-        self.declare_parameter("align_step_strafe_mid_sec", 0.24)
         # If the target remains in the wide/world map but drops out of the body cam at ALIGN,
         # back up once so the body cam can reacquire it instead of waiting stationary for timeout.
         self.declare_parameter("align_body_lost_backoff_enabled", True)
@@ -213,10 +207,6 @@ class MissionFsmNode(Node):
         self.align_step_fwd_sec = float(self.get_parameter("align_step_fwd_sec").value)
         self.align_step_strafe_duty = float(self.get_parameter("align_step_strafe_duty").value)
         self.align_step_strafe_sec = float(self.get_parameter("align_step_strafe_sec").value)
-        self.align_adaptive_steps_enabled = bool(self.get_parameter("align_adaptive_steps_enabled").value)
-        self.align_mid_error_m = float(self.get_parameter("align_mid_error_m").value)
-        self.align_step_fwd_mid_sec = float(self.get_parameter("align_step_fwd_mid_sec").value)
-        self.align_step_strafe_mid_sec = float(self.get_parameter("align_step_strafe_mid_sec").value)
         self.align_body_lost_backoff_enabled = bool(self.get_parameter("align_body_lost_backoff_enabled").value)
         self.align_body_lost_backoff_speed = float(self.get_parameter("align_body_lost_backoff_speed").value)
         self.align_body_lost_backoff_sec = float(self.get_parameter("align_body_lost_backoff_sec").value)
@@ -290,8 +280,6 @@ class MissionFsmNode(Node):
         # Travel goals (SCAN sweep, APPROACH stand-off, DRIVE_TO_STORAGE) route through collision-free
         # lane midlines instead of a straight shot; go_to_goal still drives each via car-like + reactive.
         self.declare_parameter("planner_enabled", True)
-        self.declare_parameter("planner_mode", "lane")          # lane | taxi_hybrid
-        self.declare_parameter("taxi_final_direct_m", 0.35)     # last short leg may leave taxi lanes
         self.declare_parameter("grid_spacing_m", 0.50)
         self.declare_parameter("grid_origin_mode", "infer")     # infer | fixed
         self.declare_parameter("grid_origin_xy", [0.0, 0.0])
@@ -329,8 +317,6 @@ class MissionFsmNode(Node):
             origin_mode=str(self.get_parameter("grid_origin_mode").value),
             origin_xy=tuple(float(v) for v in self.get_parameter("grid_origin_xy").value)[:2] or (0.0, 0.0),
             start_connect_k=int(self.get_parameter("start_connect_k").value),
-            mode=str(self.get_parameter("planner_mode").value),
-            taxi_final_direct_m=float(self.get_parameter("taxi_final_direct_m").value),
         )
         self._plan: list[tuple[float, float]] | None = None   # active via list (last = dest)
         self._plan_idx = 0
@@ -366,9 +352,7 @@ class MissionFsmNode(Node):
         self._opening_turn_start_theta: float | None = None
         self._got_world = False         # set on first /world_model (perception up)
         self._node_start_s = self._now_s()
-        self.phase = 1 if self.shape_target_total > 0 else 2
-        # 1 = pursue Set1, 2 = pursue Set2. With zone_mission enabled this is zone-local:
-        # sweep Set1 in the current zone, then Set2 in the same zone, then advance zones.
+        self.phase = 1          # 1 = pursue Set1, 2 = pursue Set2 (pick ordering; mapping is continuous)
         self.tray_shape = 0
         self.tray_fruit = 0
         self.current_target: Object | None = None    # latched selected target (id, set_type, ...)
@@ -671,71 +655,25 @@ class MissionFsmNode(Node):
     def _reset_zone_scan_timer(self) -> None:
         self._zone_no_target_since = None
 
-    def _shape_needed(self) -> bool:
-        return self.shape_target_total > 0 and self.tray_shape < self.shape_target_total
-
-    def _fruit_needed(self) -> bool:
-        return self.fruit_target_total > 0 and self.tray_fruit < self.fruit_target_total
-
-    def _both_quotas_met(self) -> bool:
-        return (
-            self.tray_shape >= self.shape_target_total
-            and self.tray_fruit >= self.fruit_target_total
-        )
-
-    def _first_needed_phase(self) -> int:
-        if self._shape_needed():
-            return 1
-        if self._fruit_needed():
-            return 2
-        return 0
-
-    def _reset_zone_phase_context(self) -> None:
-        self._plan = None
-        self._coverage = None
-        self.current_target = None
-        self._reset_zone_scan_timer()
-
     def _advance_zone_or_phase(self) -> None:
         if not self.zone_mission_enabled:
-            self._advance_phase_or_end()
             return
         prev = self._active_zone_id()
-        if self.phase == 1 and self._fruit_needed():
-            self.phase = 2
-            self._reset_zone_phase_context()
-            self.get_logger().info(f"zone {prev} Set1 done -> Set2 in same zone")
-            self._decide(f"ZONE {prev} SET1->SET2")
-            self._enter("SCAN")
-            return
         if self._zone_idx + 1 < len(self.zone_order):
             self._zone_idx += 1
-            next_phase = self._first_needed_phase()
-            if next_phase == 0:
-                self._zone_idx -= 1
-                self._reset_zone_phase_context()
-                self.get_logger().info("all quotas met while advancing zones -> storage/end")
-                self._decide("END (quotas met)")
-                if self.tray_shape > 0 and not self.end_after_quota:
-                    self._enter("DRIVE_TO_STORAGE")
-                else:
-                    self._enter("END")
-                return
-            self.phase = next_phase
-            self._reset_zone_phase_context()
-            self.get_logger().info(
-                f"zone {prev} done -> zone {self._active_zone_id()} Set{self.phase}")
-            self._decide(f"ZONE {prev}->{self._active_zone_id()} SET{self.phase}")
+            self._plan = None
+            self._coverage = None
+            self.current_target = None
+            self._reset_zone_scan_timer()
+            self.get_logger().info(f"zone {prev} done -> zone {self._active_zone_id()}")
+            self._decide(f"ZONE {prev}->{self._active_zone_id()}")
             self._enter("SCAN")
             return
         self._zone_idx = 0
-        self._reset_zone_phase_context()
-        self.get_logger().info(f"zone {prev} done -> zone-local sweep complete")
+        self._reset_zone_scan_timer()
+        self.get_logger().info(f"zone {prev} done -> phase sweep complete")
         self._decide(f"ZONE {prev} complete")
-        if self.tray_shape > 0 and not self.end_after_quota:
-            self._enter("DRIVE_TO_STORAGE")
-        else:
-            self._enter("END")
+        self._advance_phase_or_end()
 
     def _publish_goal(self, x: float, y: float, theta: float = 0.0) -> None:
         msg = PoseStamped()
@@ -875,29 +813,18 @@ class MissionFsmNode(Node):
         self.current_target = None
         self.set_type = 0
 
-        if self.zone_mission_enabled:
-            # In zone mode, Set2 is handled before leaving the current zone. Quotas can still cut a
-            # sweep short: once all Set1 are picked, continue with Set2 in this same zone; once all
-            # Set2 are picked but Set1 remains globally, move on to the next zone's Set1 sweep.
-            if self.phase == 1 and not self._shape_needed() and self._fruit_needed():
-                self._advance_zone_or_phase()
-                return
-            if self.phase == 2 and not self._fruit_needed() and self._shape_needed():
-                self._advance_zone_or_phase()
-                return
-
-        # Non-zone mode keeps the original global Set1 sweep -> Set2 sweep behavior.
-        if (not self.zone_mission_enabled
-                and self.phase == 1
-                and self.tray_shape >= self.shape_target_total
-                and self.fruit_target_total > 0):
+        # Advance to Set2 phase once the Set1 quota is met, unless fruit targets are disabled.
+        if self.phase == 1 and self.tray_shape >= self.shape_target_total and self.fruit_target_total > 0:
             self.phase = 2
             self._zone_idx = 0
             self._reset_zone_scan_timer()
             self.get_logger().info("Set1 quota met -> phase 2 (Set2)")
             self._decide("PHASE 1->2 (Set1 quota met)")
 
-        both_met = self._both_quotas_met()
+        both_met = (
+            self.tray_shape >= self.shape_target_total
+            and self.tray_fruit >= self.fruit_target_total
+        )
         if both_met and self.end_after_quota:
             self.get_logger().info("both quotas met (test mode) -> END")
             self._decide("END (quotas met)")
@@ -1269,16 +1196,10 @@ class MissionFsmNode(Node):
         step_lateral = lat_out > 0.0 and (fwd_out <= 0.0 or lat_out >= fwd_out)
         if step_lateral:
             vx, vy = 0.0, math.copysign(self.align_step_strafe_duty, ey)
-            if self.align_adaptive_steps_enabled and abs(ey) >= self.align_mid_error_m:
-                self._pulse_sec = self.align_step_strafe_mid_sec
-            else:
-                self._pulse_sec = self.align_step_strafe_sec
+            self._pulse_sec = self.align_step_strafe_sec
         else:
             vx, vy = math.copysign(self.align_step_fwd_duty, ex), 0.0
-            if self.align_adaptive_steps_enabled and abs(ex) >= self.align_mid_error_m:
-                self._pulse_sec = self.align_step_fwd_mid_sec
-            else:
-                self._pulse_sec = self.align_step_fwd_sec
+            self._pulse_sec = self.align_step_fwd_sec
             # Forward safety (body-cam mode): never step PAST the blind limit. ex<0 (too near) still
             # steps back freely; sonar mode already backs off when nearer than grab_range_m.
             if not self._sonar_fresh() and obj_x <= self.grab_min_x and vx > 0.0:
