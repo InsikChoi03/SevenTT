@@ -25,8 +25,14 @@ def generate_launch_description() -> LaunchDescription:
     bringup_share = get_package_share_directory("robot_bringup")
     launch_dir = os.path.join(bringup_share, "launch")
     params = os.path.join(bringup_share, "config", "perception.yaml")
+    installed_tuning = os.path.join(bringup_share, "config", "motion_tuning.yaml")
+    source_tuning = os.path.abspath(
+        os.path.join(bringup_share, "../../../../src/robot_bringup/config/motion_tuning.yaml")
+    )
+    default_tuning = source_tuning if os.path.exists(source_tuning) else installed_tuning
 
     with_control = LaunchConfiguration("with_control")
+    motion_tuning = LaunchConfiguration("motion_tuning_file")
 
     cameras = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(os.path.join(launch_dir, "cameras.launch.py"))
@@ -35,28 +41,34 @@ def generate_launch_description() -> LaunchDescription:
         PythonLaunchDescriptionSource(os.path.join(launch_dir, "static_transforms.launch.py"))
     )
     imu = Node(package="robot_hardware", executable="imu_mpu6050_node",
-               name="imu_mpu6050_node", parameters=[params], output="screen")
+               name="imu_mpu6050_node", parameters=[params, motion_tuning], output="screen")
     perception = IncludeLaunchDescription(
-        PythonLaunchDescriptionSource(os.path.join(launch_dir, "perception.launch.py"))
+        PythonLaunchDescriptionSource(os.path.join(launch_dir, "perception.launch.py")),
+        launch_arguments={
+            "params_file": params,
+            "motion_tuning_file": motion_tuning,
+        }.items(),
     )
 
     control_layer = GroupAction(
         condition=IfCondition(with_control),
         actions=[
             Node(package="robot_control", executable="go_to_goal_node",
-                 name="go_to_goal_node", parameters=[params], output="screen"),
+                 name="go_to_goal_node", parameters=[params, motion_tuning], output="screen"),
             Node(package="robot_control", executable="base_controller_node",
-                 name="base_controller_node", parameters=[params], output="screen"),
+                 name="base_controller_node", parameters=[params, motion_tuning], output="screen"),
             Node(package="robot_control", executable="pick_sequencer_node",
-                 name="pick_sequencer_node", parameters=[params], output="screen"),
+                 name="pick_sequencer_node", parameters=[params, motion_tuning], output="screen"),
             Node(package="robot_hardware", executable="mcu_bridge_base_node",
-                 name="mcu_bridge_base_node", parameters=[params], output="screen"),
+                 name="mcu_bridge_base_node", parameters=[params, motion_tuning], output="screen"),
         ],
     )
 
     return LaunchDescription([
         DeclareLaunchArgument("with_control", default_value="true",
                               description="also start base control + 2R pick sequencer + combined MCU bridge"),
+        DeclareLaunchArgument("motion_tuning_file", default_value=default_tuning,
+                              description="match tuning override YAML loaded after perception.yaml"),
         cameras,
         static_tf,
         imu,

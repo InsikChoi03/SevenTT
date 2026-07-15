@@ -26,10 +26,10 @@
 
 ## 2. 현재 상태 (Snapshot — 이 섹션만 최신값으로 덮어쓰기)
 
-- **현재 버전:** `v1.2.1`
-- **최종 업데이트:** 2026-07-14 23:00 (KST)
+- **현재 버전:** `v1.3.0`
+- **최종 업데이트:** 2026-07-15 11:07 (KST)
 - **최종 작업자:** `@AI`
-- **한 줄 요약:** 맵/자기위치 추정 안정성 비교를 위해 코드와 설정을 v1.0.0 경기 기준선으로 복구했다.
+- **한 줄 요약:** v1.0.0 기준선 위에 경기용 motion tuning override와 큰 오차용 ALIGN adaptive step을 추가했다.
 
 ---
 
@@ -118,12 +118,32 @@
 - [ ] `motion_tuning.yaml` 수정 후 `scripts/apply_motion_tuning.py`로 `perception.yaml`/`test_field.yaml` 동기화가 의도대로 되는지 dry-run과 실제 적용을 비교 — `@AI`
 - [ ] v1.0.0 기준선 복구 상태에서 실제 경기장 맵/자기위치 추정이 이전 안정 수준으로 돌아오는지 재검증 — `@insik`
 - [ ] Set2/HSV/one-stroke inspection 기능은 v1.0.0 안정성 확인 후 별도 브랜치 또는 새 버전에서 단계적으로 재도입 여부 결정 — `@AI`
+- [ ] `motion_tuning.yaml` 값 수정 후 메인 런치 재시작만으로 perception/planning/control 파라미터 override가 적용되는지 실제 경기 실행에서 확인 — `@insik`
+- [ ] ALIGN adaptive step의 `align_mid_error_m`, `align_step_fwd_mid_sec`, `align_step_strafe_mid_sec`를 실제 물체 접근 거리별로 튜닝 — `@insik`
 
 ---
 
 ## 5. 변경 이력 (Changelog) — ⛔ 삭제 금지 / 최신 항목이 맨 위
 
 <!-- 새 엔트리는 바로 이 줄 아래에 추가하세요. 기존 엔트리는 건드리지 마세요. -->
+
+### `v1.3.0` — 2026-07-15 11:07 (KST) · 작업자: `@AI` · ID: `2026-07-15-01`
+- **변경 요약:** v1.0.0 경기 기준선 위에 `motion_tuning.yaml` override 파일을 복구하고, ALIGN 큰 오차 구간에서 더 길게 이동하는 adaptive step을 추가했다.
+- **상세:**
+  - `motion_tuning.yaml`을 ROS parameter override 형식으로 새로 만들어, `perception.yaml` 기본값 위에 경기 튜닝값만 덮어쓸 수 있게 했다.
+  - 메인 `bringup.launch.py`와 `perception.launch.py`가 `perception.yaml` 뒤에 `motion_tuning.yaml`을 함께 로드하도록 연결했다.
+  - 기본 override 경로는 source tree의 `ros2_ws/src/robot_bringup/config/motion_tuning.yaml`을 우선 사용하므로, 튜닝값 수정 후 저장하고 런치를 다시 시작하면 재빌드 없이 숫자 변경이 반영된다.
+  - 정지 중 맵 흔들림을 줄이기 위해 `suppress_object_flow_when_stationary`를 튜닝 파일에서 직접 조절할 수 있게 했다.
+  - ALIGN 단계에서 목표 물체와의 전후/좌우 오차가 `align_mid_error_m` 이상이면 긴 펄스(`align_step_fwd_mid_sec`, `align_step_strafe_mid_sec`)를 쓰고, 가까워지면 기존 짧은 펄스로 정밀 조정하도록 FSM을 확장했다.
+  - 로봇 실행 없이 `py_compile`과 YAML 파싱으로 정적 검증했다.
+- **변경 파일:**
+  - `ros2_ws/src/robot_bringup/config/motion_tuning.yaml` / 신규
+  - `ros2_ws/src/robot_bringup/launch/bringup.launch.py` / 수정
+  - `ros2_ws/src/robot_bringup/launch/perception.launch.py` / 수정
+  - `ros2_ws/src/robot_planning/robot_planning/nodes/mission_fsm_node.py` / 수정
+  - `PROJECT_LOG.md` / 수정
+- **다음 할 일 반영:** motion tuning override 실제 적용 확인 TODO와 ALIGN adaptive step 실주행 튜닝 TODO를 추가했다.
+- **버전 근거:** 새 튜닝 override 파일과 런치 연결, ALIGN adaptive step이라는 런타임 기능 확장이 추가되었으므로 `MINOR` 버전 증가로 `v1.3.0`으로 올렸다.
 
 ### `v1.2.1` — 2026-07-14 23:00 (KST) · 작업자: `@AI` · ID: `2026-07-14-03`
 - **변경 요약:** 맵/자기위치 추정 안정성 비교를 위해 tracked 코드와 설정을 `ee7dec0` v1.0.0 기준선으로 복구했다.

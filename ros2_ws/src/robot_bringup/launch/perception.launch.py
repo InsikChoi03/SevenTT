@@ -17,23 +17,35 @@ import os
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
+from launch.actions import DeclareLaunchArgument
+from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
 
 def generate_launch_description() -> LaunchDescription:
-    params = os.path.join(
-        get_package_share_directory("robot_bringup"), "config", "perception.yaml"
+    bringup_share = get_package_share_directory("robot_bringup")
+    default_params = os.path.join(bringup_share, "config", "perception.yaml")
+    installed_tuning = os.path.join(bringup_share, "config", "motion_tuning.yaml")
+    source_tuning = os.path.abspath(
+        os.path.join(bringup_share, "../../../../src/robot_bringup/config/motion_tuning.yaml")
     )
+    default_tuning = source_tuning if os.path.exists(source_tuning) else installed_tuning
+    params = LaunchConfiguration("params_file")
+    motion_tuning = LaunchConfiguration("motion_tuning_file")
 
     def perc(executable, name):
         return Node(package="robot_perception", executable=executable, name=name,
-                    parameters=[params], output="screen")
+                    parameters=[params, motion_tuning], output="screen")
 
     def plan(executable, name):
         return Node(package="robot_planning", executable=executable, name=name,
-                    parameters=[params], output="screen")
+                    parameters=[params, motion_tuning], output="screen")
 
     return LaunchDescription([
+        DeclareLaunchArgument("params_file", default_value=default_params,
+                              description="base ROS parameter YAML"),
+        DeclareLaunchArgument("motion_tuning_file", default_value=default_tuning,
+                              description="match tuning override YAML loaded after params_file"),
         perc("localizer_node", "localizer_node"),
         perc("yolo_detector_node", "yolo_detector_node"),
         perc("siglip_gate_node", "siglip_gate_node"),

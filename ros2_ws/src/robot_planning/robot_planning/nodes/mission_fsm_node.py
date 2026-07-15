@@ -96,6 +96,10 @@ class MissionFsmNode(Node):
         self.declare_parameter("align_step_fwd_sec", 0.15)
         self.declare_parameter("align_step_strafe_duty", 0.30)  # strafe: 0.30/0.30s -> ~2.5 cm (yaw ~0)
         self.declare_parameter("align_step_strafe_sec", 0.1575)
+        self.declare_parameter("align_adaptive_steps_enabled", False)
+        self.declare_parameter("align_mid_error_m", 0.06)
+        self.declare_parameter("align_step_fwd_mid_sec", 0.24)
+        self.declare_parameter("align_step_strafe_mid_sec", 0.28)
         # If the target remains in the wide/world map but drops out of the body cam at ALIGN,
         # back up once so the body cam can reacquire it instead of waiting stationary for timeout.
         self.declare_parameter("align_body_lost_backoff_enabled", True)
@@ -207,6 +211,10 @@ class MissionFsmNode(Node):
         self.align_step_fwd_sec = float(self.get_parameter("align_step_fwd_sec").value)
         self.align_step_strafe_duty = float(self.get_parameter("align_step_strafe_duty").value)
         self.align_step_strafe_sec = float(self.get_parameter("align_step_strafe_sec").value)
+        self.align_adaptive_steps_enabled = bool(self.get_parameter("align_adaptive_steps_enabled").value)
+        self.align_mid_error_m = float(self.get_parameter("align_mid_error_m").value)
+        self.align_step_fwd_mid_sec = float(self.get_parameter("align_step_fwd_mid_sec").value)
+        self.align_step_strafe_mid_sec = float(self.get_parameter("align_step_strafe_mid_sec").value)
         self.align_body_lost_backoff_enabled = bool(self.get_parameter("align_body_lost_backoff_enabled").value)
         self.align_body_lost_backoff_speed = float(self.get_parameter("align_body_lost_backoff_speed").value)
         self.align_body_lost_backoff_sec = float(self.get_parameter("align_body_lost_backoff_sec").value)
@@ -1196,10 +1204,16 @@ class MissionFsmNode(Node):
         step_lateral = lat_out > 0.0 and (fwd_out <= 0.0 or lat_out >= fwd_out)
         if step_lateral:
             vx, vy = 0.0, math.copysign(self.align_step_strafe_duty, ey)
-            self._pulse_sec = self.align_step_strafe_sec
+            if self.align_adaptive_steps_enabled and abs(ey) >= self.align_mid_error_m:
+                self._pulse_sec = self.align_step_strafe_mid_sec
+            else:
+                self._pulse_sec = self.align_step_strafe_sec
         else:
             vx, vy = math.copysign(self.align_step_fwd_duty, ex), 0.0
-            self._pulse_sec = self.align_step_fwd_sec
+            if self.align_adaptive_steps_enabled and abs(ex) >= self.align_mid_error_m:
+                self._pulse_sec = self.align_step_fwd_mid_sec
+            else:
+                self._pulse_sec = self.align_step_fwd_sec
             # Forward safety (body-cam mode): never step PAST the blind limit. ex<0 (too near) still
             # steps back freely; sonar mode already backs off when nearer than grab_range_m.
             if not self._sonar_fresh() and obj_x <= self.grab_min_x and vx > 0.0:
