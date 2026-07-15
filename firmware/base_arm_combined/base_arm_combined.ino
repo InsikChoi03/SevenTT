@@ -73,11 +73,12 @@ unsigned long lastUpd = 0, lastAck = 0;
 char buf[80];
 uint8_t idx = 0;
 bool inFrame = false;
-const int LED = 13;
+// D13 is wired to the lift MOSFET, so do not use it as a heartbeat LED.
+const int LED = -1;
 
-// ---- 광각 리프트 모터 MOSFET (핀 9, on/off 스위치) ----
-// D9는 QGPMaker 기본 Encoder1 B상과 충돌한다. 엔코더 테스트 중에는 리프트를 비활성화한다.
-const int LIFT_PIN = -1;
+// ---- 광각 리프트 모터 MOSFET (D13, on/off 스위치) ----
+// D13 is not used by the encoder pin map below; keep LED heartbeat disabled while lift is on D13.
+const int LIFT_PIN = 13;
 const unsigned long MAX_LIFT_MS = 10000;   // 스톨 번아웃 방지: 최대 on 시간 후 자동 off
 bool liftOn = false;
 unsigned long liftOffAt = 0;
@@ -277,7 +278,7 @@ void parseFrame() {
       Serial.print("<ARMACK,"); Serial.print((int)tgtA[0]); Serial.print(',');
       Serial.print((int)tgtA[1]); Serial.print(','); Serial.print((int)tgtA[2]); Serial.println(">");
     }
-  } else if (strncmp(buf, "LIFT,", 5) == 0) {   // 광각 리프트 모터 MOSFET (핀9)
+  } else if (strncmp(buf, "LIFT,", 5) == 0) {   // 광각 리프트 모터 MOSFET (D13)
     long ms = atol(buf + 5);
     if (ms <= 0) {                               // <LIFT,0> = 즉시 off
       setLift(false); liftOn = false;
@@ -297,7 +298,7 @@ void parseFrame() {
 }
 
 void setup() {
-  pinMode(LED, OUTPUT);
+  if (LED >= 0) pinMode(LED, OUTPUT);
   if (LIFT_PIN >= 0) { pinMode(LIFT_PIN, OUTPUT); setLift(false); }   // 부팅 시 리프트 모터 off
   Serial.begin(115200);
   Wire.begin();
@@ -359,7 +360,7 @@ void loop() {
   // 베이스 HB 5Hz
   if (now - lastHb >= 200) {
     lastHb = now;
-    digitalWrite(LED, !digitalRead(LED));
+    if (LED >= 0) digitalWrite(LED, !digitalRead(LED));
     Serial.print("<HB,");
     Serial.print(wheelCmd[0], 3); Serial.print(',');
     Serial.print(wheelCmd[1], 3); Serial.print(',');

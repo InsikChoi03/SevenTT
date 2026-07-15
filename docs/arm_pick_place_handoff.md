@@ -121,7 +121,7 @@ python3 scripts/pick_verify.py --no-place         # 집기 판정만
 
 ## 6. 참고 — 시리얼 / 하드웨어 메모
 - 포트 **`/dev/ttyUSB0`** (CH340). 팔·베이스·리프트 전부 이 한 포트.
-- **리프트 모터**(광각 마스트 올리는 MOSFET, 핀9): `<LIFT,ms>` = ms 동안 ON 후 자동 OFF(최대 10초),
+- **리프트 모터**(광각 마스트 올리는 MOSFET, D13): `<LIFT,ms>` = ms 동안 ON 후 자동 OFF(최대 10초),
   `<LIFT,0>`=즉시 OFF. `<LIFTACK,ms>` 즉시 → `ms` 뒤 `<LIFT,done>`. **오늘 0.9/1.5/2.0/3.0초 다 정상 확인.**
 - 카메라: cv2에 GStreamer 없어 **gi/appsink**(`scripts/csi_capture.py`). 본체=WB 고정게인 적용, 광각=보정 없음.
   광각(sensor1)은 부팅 probe가 가끔 -121 → rebind/재부팅 필요할 수 있음(오늘은 정상 오픈됨).

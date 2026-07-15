@@ -26,10 +26,10 @@
 
 ## 2. 현재 상태 (Snapshot — 이 섹션만 최신값으로 덮어쓰기)
 
-- **현재 버전:** `v1.3.0`
-- **최종 업데이트:** 2026-07-15 11:07 (KST)
+- **현재 버전:** `v1.4.0`
+- **최종 업데이트:** 2026-07-15 23:43 (KST)
 - **최종 작업자:** `@AI`
-- **한 줄 요약:** v1.0.0 기준선 위에 경기용 motion tuning override와 큰 오차용 ALIGN adaptive step을 추가했다.
+- **한 줄 요약:** Set2 FruitSlot 기반 과일 큐브 처리, grid-locked 슬롯, 회피 장애물 공유, body-lost 재시도 복구를 메인 경기 흐름에 통합했다.
 
 ---
 
@@ -120,12 +120,49 @@
 - [ ] Set2/HSV/one-stroke inspection 기능은 v1.0.0 안정성 확인 후 별도 브랜치 또는 새 버전에서 단계적으로 재도입 여부 결정 — `@AI`
 - [ ] `motion_tuning.yaml` 값 수정 후 메인 런치 재시작만으로 perception/planning/control 파라미터 override가 적용되는지 실제 경기 실행에서 확인 — `@insik`
 - [ ] ALIGN adaptive step의 `align_mid_error_m`, `align_step_fwd_mid_sec`, `align_step_strafe_mid_sec`를 실제 물체 접근 거리별로 튜닝 — `@insik`
+- [ ] Set2 FruitSlot 생성 기준(`set2_slot_birth_min_obs_wide`, `set2_slot_grid_lock_radius_m`)을 실제 경기장 오인식/누락 기준으로 재튜닝 — `@insik`
+- [ ] `/planning/obstacles` 공유 후 물체 사이 APPROACH에서 좌우 떨림과 멈춤이 줄었는지 실주행으로 확인 — `@insik`
+- [ ] body lost 후 같은 슬롯 재접근과 `align_retry_heading_timeout_sec`가 PICK 성공률을 높이는지 decisions 로그로 확인 — `@insik`
+- [ ] checkpoint/anchor waypoint 테스트 경로와 실제 메인 경기 zone 순회 경로를 비교해 유지할 테스트 route를 확정 — `@AI`
 
 ---
 
 ## 5. 변경 이력 (Changelog) — ⛔ 삭제 금지 / 최신 항목이 맨 위
 
 <!-- 새 엔트리는 바로 이 줄 아래에 추가하세요. 기존 엔트리는 건드리지 마세요. -->
+
+### `v1.4.0` — 2026-07-15 23:43 (KST) · 작업자: `@AI` · ID: `2026-07-15-02`
+- **변경 요약:** Set2 과일 큐브를 FruitSlot/grid 기반으로 안정화하고, 회피·재접근·시각화·테스트 경로를 경기 실행 흐름에 통합했다.
+- **상세:**
+  - Set2 과일 큐브 후보를 short-lived track ID가 아니라 고정 grid slot으로 관리하는 `SlotInventory`를 추가했다.
+  - `fruit_photo_cube` 근거가 cube/shape vote에 눌리지 않도록 sticky 판단을 보강하고, wide-only 1회 오인식은 슬롯으로 바로 고정되지 않도록 누적 기준을 적용했다.
+  - 슬롯 좌표를 7x6 경기장 격자에 lock하고, 현재 zone 안의 슬롯만 생성/선택하도록 FSM과 target selector를 맞췄다.
+  - zone 순서는 1→2→3→4로 유지하되 anchor 강제 이동/정지 안정화는 끄고, 현재 위치에서 zone-local 후보를 처리하도록 튜닝했다.
+  - body lost 후 같은 슬롯으로 재접근하고, 재접근 시 heading을 더 정확히 맞추되 timeout 후 ALIGN으로 빠져나오도록 해 APPROACH 무한 대기를 줄였다.
+  - LanePlanner가 실제로 사용한 장애물 목록을 `/planning/obstacles`로 발행하고 `go_to_goal_node`가 이를 우선 사용하게 해 planner와 local avoidance의 판단 기준을 통일했다.
+  - 라이브 맵에 Set2 slot, 간단 라벨 모드, checkpoint route overlay를 추가하고, anchor/checkpoint waypoint 테스트 스크립트를 작성했다.
+  - 광각 마스트 lift MOSFET 핀을 D13 기준으로 정리하고, MCU bridge에서 startup lift command를 보낼 수 있게 했다.
+  - `py_compile`, YAML 파싱, `git diff --check`, 관련 ROS 패키지 빌드로 정적 검증했다.
+- **변경 파일:**
+  - `docs/arm_pick_place_handoff.md` / 수정
+  - `firmware/base_arm_combined/base_arm_combined.ino` / 수정
+  - `ros2_ws/src/robot_bringup/config/motion_tuning.yaml` / 수정
+  - `ros2_ws/src/robot_bringup/config/perception.yaml` / 수정
+  - `ros2_ws/src/robot_bringup/config/test_field.yaml` / 수정
+  - `ros2_ws/src/robot_bringup/launch/bringup.launch.py` / 수정
+  - `ros2_ws/src/robot_bringup/launch/test_field.launch.py` / 수정
+  - `ros2_ws/src/robot_control/robot_control/nodes/go_to_goal_node.py` / 수정
+  - `ros2_ws/src/robot_hardware/robot_hardware/nodes/mcu_bridge_base_node.py` / 수정
+  - `ros2_ws/src/robot_perception/robot_perception/nodes/recognition_viz_node.py` / 수정
+  - `ros2_ws/src/robot_perception/robot_perception/nodes/world_model_node.py` / 수정
+  - `ros2_ws/src/robot_planning/robot_planning/nodes/mission_fsm_node.py` / 수정
+  - `ros2_ws/src/robot_planning/robot_planning/nodes/target_selector_node.py` / 수정
+  - `ros2_ws/src/robot_planning/robot_planning/object_slot_inventory.py` / 신규
+  - `ros2_ws/src/robot_planning/test/test_object_slot_inventory.py` / 신규
+  - `scripts/anchor_waypoint_test.py` / 신규
+  - `PROJECT_LOG.md` / 수정
+- **다음 할 일 반영:** FruitSlot 생성 기준 튜닝, `/planning/obstacles` 기반 회피 검증, body-lost 재접근 timeout 검증, waypoint 테스트 route 확정 TODO를 추가했다.
+- **버전 근거:** Set2 slot inventory, planner/local avoidance 공유 토픽, 재접근 복구 로직, waypoint 테스트/시각화가 새 기능으로 추가되었으므로 `MINOR` 버전 증가로 `v1.4.0`으로 올렸다.
 
 ### `v1.3.0` — 2026-07-15 11:07 (KST) · 작업자: `@AI` · ID: `2026-07-15-01`
 - **변경 요약:** v1.0.0 경기 기준선 위에 `motion_tuning.yaml` override 파일을 복구하고, ALIGN 큰 오차 구간에서 더 길게 이동하는 adaptive step을 추가했다.

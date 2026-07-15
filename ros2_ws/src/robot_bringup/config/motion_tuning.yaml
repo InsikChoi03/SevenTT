@@ -24,18 +24,19 @@ localizer_node:
     use_wheel_odom: false                 # 엔코더 odom을 localizer 위치 보정에 사용할지 여부.
     use_object_flow: true                 # wide 카메라 물체점 흐름으로 회전/이동 추정을 보정할지 여부.
     object_flow_trans: true               # object-flow에서 병진 이동 보정까지 사용할지 여부.
-    use_object_landmarks: true            # 이미 맵에 고정된 물체를 랜드마크처럼 보고 pose drift를 보정할지 여부.
+    use_object_landmarks: true            # 이미 맵에 고정된 물체를 랜드마크처럼 보고 pose x/y drift를 보정할지 여부.
     suppress_object_flow_when_stationary: true  # 정지 판정 중 object-flow 이동 보정을 막아 맵 흔들림을 줄인다.
-    landmark_gain: 0.8                    # 물체 랜드마크 위치 보정 강도.
-    landmark_theta_gain: 0.7              # 물체 랜드마크 heading 보정 강도.
+    landmark_gain: 0.5                    # 물체 랜드마크 위치 보정 강도. heading은 IMU만 사용하므로 낮게 둔다.
+    landmark_theta_gain: 0.0              # heading은 IMU만 반영하고 물체 landmark heading 보정은 끈다.
     landmark_max_step_m: 0.2              # 한 번에 pose 위치를 보정할 수 있는 최대 거리.
-    landmark_max_step_rad: 0.5            # 한 번에 heading을 보정할 수 있는 최대 각도.
+    landmark_max_step_rad: 0.0            # 물체 landmark가 heading을 바꾸지 못하게 한다.
     freeze_pose_when_stationary: true     # 정지 중 pose가 미세하게 흔들리는 것을 줄일지 여부.
     use_imu_heading: true                 # IMU heading 보정을 사용할지 여부.
     wall_anchor_gain: 0.50                # wall anchor 보정 강도. anchor가 꺼져 있으면 실질 영향 작음.
+    wall_anchor_max_step_rad: 0.0         # 벽 anchor는 위치만 보정하고 heading은 IMU만 사용한다.
     wall_field_gain: 0.35                 # 벽 선분 기반 field 보정 강도.
     wall_field_max_step_m: 0.05           # 벽 보정이 한 번에 위치를 움직일 수 있는 최대 거리.
-    wall_field_max_step_rad: 0.04         # 벽 보정이 한 번에 heading을 움직일 수 있는 최대 각도.
+    wall_field_max_step_rad: 0.0          # 벽 field 보정은 heading을 바꾸지 않도록 한다.
 
 wall_localizer_node:
   ros__parameters:
@@ -50,21 +51,44 @@ wall_localizer_node:
 target_selector_node:
   ros__parameters:
     set1_label: "dodecahedron"            # Set1에서 잡을 도형 라벨. cube/octahedron/dodecahedron/icosahedron.
-    set2_label: "orange"                  # Set2에서 잡을 과일 라벨. apple/orange/banana/pineapple.
+    set2_label: "banana"                  # Set2에서 잡을 과일 라벨. apple/orange/banana/pineapple.
     rate_hz: 2.0                          # 목표 후보 선택 노드 실행 주기.
     explore_base: 5.0                     # 탐색 후보 기본 점수.
-    set1_base: 20.0                       # Set1 목표 후보 기본 점수. 클수록 우선 선택된다.
-    set2_base: 10.0                       # Set2 목표 후보 기본 점수.
-    zone_filter_enabled: true             # 현재 zone 안의 물체만 목표 후보로 볼지 여부.
-    zone_bounds_m: [-2.0, 0.1, -0.1, 2.0, -2.0, 0.1, -2.0, 0.1, -0.1, 2.0, -2.0, 0.1, -0.1, 2.0, -0.1, 2.0]  # zone 1~4의 [xmin,xmax,ymin,ymax].
+    set1_base: 10.0                       # Set1 목표 후보 기본 점수. 클수록 우선 선택된다.
+    set2_base: 20.0                       # Set2 목표 후보 기본 점수.
+    zone_filter_enabled: true             # 현재 처리 구역 안의 물체만 목표 후보로 본다.
+    zone_bounds_m: [-2.0, 0.1, -0.25, 2.0, -2.0, 0.1, -2.0, -0.25, -0.1, 2.0, -2.0, -0.25, -0.1, 2.0, -0.25, 2.0]  # zone 1~4의 [xmin,xmax,ymin,ymax]. x=0만 ±10cm 중첩, y는 격자 사이 분리.
 
 mission_fsm_node:
   ros__parameters:
     # 목표/단계 설정
     set1_label: "dodecahedron"            # FSM이 Set1에서 실제로 집을 도형 라벨.
-    set2_label: "orange"                  # FSM이 Set2에서 실제로 집을 과일 라벨.
-    shape_target_total: 4                 # 집을 Set1 도형 개수.
-    fruit_target_total: 0                 # 집을 Set2 과일 개수. 0이면 v1.0.0처럼 과일 단계 사실상 비활성.
+    set2_label: "banana"                  # FSM이 Set2에서 실제로 집을 과일 라벨.
+    start_phase: 2                        # 과일 큐브 집기 테스트: 바로 Set2 단계에서 시작.
+    shape_target_total: 4                 # 과일 큐브 집기 테스트 중에는 Set1 도형 quota를 끈다.
+    fruit_target_total: 3                # 집을 Set2 과일 큐브 개수. 배치 개수에 맞춰 조정.
+    set2_require_fruit_label: true       # 테스트용: SigLIP 과일 종류 판별 없이 fruit_photo_cube면 집는다.
+    set2_slot_enabled: true               # Set2는 track ID 대신 고정된 FruitSlot ID를 선택/추적한다.
+    set2_slot_merge_radius_m: 0.22        # 이 거리 안에서 track ID가 바뀌면 같은 슬롯으로 병합한다.
+    set2_slot_attach_radius_m: 0.18       # body/SigLIP 결과를 현재 슬롯에 붙일 최대 위치 잔차.
+    set2_slot_confirm_min_obs: 1          # world_model 확정 track은 첫 입력부터 슬롯 present로 인정한다.
+    set2_slot_retry_limit: 2              # 이 횟수 이상 실패한 슬롯은 lost_suspect로 표시하되 삭제하지 않는다.
+    set2_slot_retry_cooldown_sec: 2.0     # 불확실한 슬롯을 바로 반복하지 않고 다른 슬롯 뒤에 재시도한다.
+    set2_slot_body_max_age_sec: 1.5       # current slot에 붙일 body/SigLIP 관측의 최대 나이.
+    set2_slot_birth_min_confidence: 0.75  # 이 confidence 이상인 Set2 관측만 새 슬롯을 만든다.
+    set2_slot_birth_min_obs_wide: 5       # wide-only 관측은 누적 3회 이상일 때 새 슬롯을 만든다.
+    set2_slot_birth_min_obs_body: 1       # 위치가 정확한 body 관측은 1회부터 새 슬롯을 허용한다.
+    set2_slot_birth_current_zone_only: true  # 현재 처리 구역 안의 Set2 후보만 슬롯으로 만든다.
+    set2_slot_birth_after_stabilize_only: false  # anchor 정지 안정화 없이 새 슬롯 생성을 허용한다.
+    set2_slot_birth_labels: ["fruit_photo_cube", "apple", "orange", "banana", "pineapple"]  # 과일 근거가 있는 라벨만 슬롯 생성 허용.
+    set2_slot_grid_lock_enabled: true     # Set2 슬롯 좌표를 관측 평균이 아니라 가장 가까운 격자점에 고정한다.
+    set2_slot_grid_lock_radius_m: 0.20    # 관측이 이 반경 안의 격자점에 있을 때만 새 슬롯을 만든다.
+    set2_slot_grid_rows: 6                # Set2 슬롯용 경기장 격자 행 개수.
+    set2_slot_grid_cols: 7                # Set2 슬롯용 경기장 격자 열 개수.
+    set2_slot_grid_spacing_m: 0.50        # Set2 슬롯용 격자 간격.
+    set2_slot_grid_origin_x_m: -1.50      # Set2 슬롯용 첫 격자점 x좌표.
+    set2_slot_grid_origin_y_m: -1.50      # Set2 슬롯용 첫 격자점 y좌표.
+    set2_slot_follow_map_transform: false # grid-locked 슬롯은 벽/맵 보정 transform으로 움직이지 않는다.
     conf_threshold: 0.7                   # 후보를 목표로 인정할 기본 confidence 하한.
     pick_track_conf: 0.5                  # 실제 PICK으로 넘길 track confidence 하한.
     classify_timeout_sec: 3.5             # CLASSIFY 단계 최대 대기 시간.
@@ -76,30 +100,35 @@ mission_fsm_node:
     # 개막 동작
     opening_enabled: true                 # 경기 시작 직후 고정 개막 이동 사용 여부.
     startup_warmup_sec: 15.0              # 카메라/YOLO/world_model 준비 대기 시간.
-    opening_speed: 0.1755                 # 개막 전진 명령 세기.
-    opening_forward_sec: 1.5              # 개막 전진 시간.
-    opening_strafe_speed: 0.26325         # 개막 오른쪽 횡이동 명령 세기.
-    opening_strafe_right_sec: 1.5         # 개막 오른쪽 횡이동 시간.
+    opening_speed: 0.1                   # 개막 전진 명령 세기.
+    opening_forward_sec: 1.5             # 개막 전진 시간.
+    opening_strafe_speed: 0.18           # 개막 오른쪽 횡이동 명령 세기.
+    opening_strafe_right_sec: 1.0         # 개막 오른쪽 횡이동 시간.
     opening_turn_deg: 45.0                # 개막 제자리 회전 목표 각도.
     opening_turn_omega: -0.255            # 개막 회전 명령. 음수는 시계방향.
     opening_wait_after_turn_sec: 1.0      # 개막 회전 후 정지 대기 시간.
 
     # SCAN
-    scan_search_omega: -0.255             # SCAN에서 제자리 탐색 회전 명령.
+    scan_search_omega: -0.1             # SCAN에서 제자리 탐색 회전 명령.
     search_turn_sec: 0.5                  # 한 번에 회전하는 시간.
     search_look_sec: 2.5                  # 회전 후 멈춰서 인식하는 시간.
 
     # APPROACH
     approach_dist_m: 0.375                # 목표와 이 거리 이내면 APPROACH를 끝내고 ALIGN으로 넘어간다.
     approach_face_tol: 0.25               # 목표 방향과 로봇 방향 차이가 이 rad 안이면 전진한다.
-    approach_speed: 0.14                  # APPROACH 전진 명령 세기.
+    approach_speed: 0.08                   # APPROACH 전진 명령 세기.
     approach_kp_ang: 1.0                  # 목표 방향으로 돌 때 heading 오차에 곱하는 비례 게인.
-    approach_omega_max: 0.32              # APPROACH 회전 명령 최대값.
+    approach_omega_max: 0.2              # APPROACH 회전 명령 최대값.
     approach_look_sec: 1.0                # APPROACH 중 멈춰서 목표를 다시 보는 시간.
     approach_move_sec: 0.5                # APPROACH에서 한 번 회전/전진하는 시간.
     approach_lost_grace_sec: 2.5          # 목표가 잠깐 사라져도 같은 목표를 유지하는 유예 시간.
     approach_standoff_tol: 0.09           # 계획된 접근 지점에 도착했다고 보는 위치 허용오차.
     classify_standoff_sec: 2.0            # Set2 과일 판별용 standoff 대기 시간. fruit_target_total=0이면 거의 미사용.
+    opportunistic_set2_enabled: true       # Set1 진행 중 근처 목표 과일 큐브가 확정되면 잠깐 집고 Set1으로 복귀.
+    opportunistic_set2_max_picks: 2        # 중간에 주울 Set2 목표 과일 최대 개수. 0이면 제한 없음.
+    opportunistic_set2_max_dist_m: 0.70    # 로봇 현재 위치에서 이 거리 안의 확정 과일만 경로상 후보로 본다.
+    opportunistic_set2_min_conf: 0.75      # opportunistic Set2 후보 최소 track confidence.
+    opportunistic_set2_min_nobs: 3         # opportunistic Set2 후보 최소 누적 관측 수.
 
     # ALIGN / GRAB
     align_settle_sec: 1.0                 # ALIGN 진입 직후 안정화 시간.
@@ -110,7 +139,7 @@ mission_fsm_node:
     align_step_fwd_duty: 0.27             # 전후진 미세조정 명령 세기.
     align_step_fwd_sec: 0.15              # 한 번 전후진 미세조정 시간.
     align_step_strafe_duty: 0.315         # 좌우 횡이동 미세조정 명령 세기.
-    align_step_strafe_sec: 0.15         # 한 번 좌우 횡이동 미세조정 시간.
+    align_step_strafe_sec: 0.15          # 한 번 좌우 횡이동 미세조정 시간.
     align_adaptive_steps_enabled: true    # true면 물체까지 오차가 클 때 아래 긴 펄스를 사용한다.
     align_mid_error_m: 0.06               # 선택된 축 오차가 이 값 이상이면 "멀다"고 보고 긴 펄스를 쓴다.
     align_step_fwd_mid_sec: 0.25          # 전후 오차가 클 때 쓰는 긴 전후진 펄스 시간.
@@ -119,6 +148,10 @@ mission_fsm_node:
     align_body_lost_backoff_speed: 0.189  # body 목표 상실 복구 후진 명령 세기.
     align_body_lost_backoff_sec: 0.54     # body 목표 상실 복구 후진 시간.
     align_body_lost_backoff_settle_sec: 1.0  # 후진 복구 후 카메라 안정화 대기.
+    align_body_lost_same_slot_retry_enabled: true  # body lost 후 다른 슬롯으로 넘기기 전 같은 슬롯을 다시 접근한다.
+    align_body_lost_same_slot_retries: 2  # 같은 슬롯에 대해 body lost 재접근을 허용할 횟수.
+    align_retry_heading_tol_rad: 0.10     # body lost 재접근 후 ALIGN으로 넘기기 전 요구하는 heading 오차.
+    align_retry_heading_timeout_sec: 2.0  # 이 시간 안에 heading이 안 맞으면 멈춰있지 않고 ALIGN으로 진입한다.
     align_settle_pulse_sec: 0.6           # ALIGN 구동 한 번 후 멈춰서 다시 측정하기까지 대기.
     align_tol_m: 0.03                     # 집기 허용 좌우 오차.
     align_fwd_tol_m: 0.03                 # 집기 허용 전후 오차.
@@ -126,11 +159,16 @@ mission_fsm_node:
     sonar_timeout_sec: 0.5                # sonar 값이 이 시간보다 오래되면 무시한다.
 
     # Zone mission
-    zone_mission_enabled: true            # zone 1->2->3->4 순회 미션 사용 여부.
+    zone_mission_enabled: true            # zone 1->2->3->4 순서로 후보/슬롯을 처리한다.
     zone_order: [1, 2, 3, 4]              # zone 방문 순서.
-    zone_bounds_m: [-2.0, 0.1, -0.1, 2.0, -2.0, 0.1, -2.0, 0.1, -0.1, 2.0, -2.0, 0.1, -0.1, 2.0, -0.1, 2.0]  # zone 1~4 경계.
+    zone_bounds_m: [-2.0, 0.1, -0.25, 2.0, -2.0, 0.1, -2.0, -0.25, -0.1, 2.0, -2.0, -0.25, -0.1, 2.0, -0.25, 2.0]  # zone 1~4 경계. x=0만 ±10cm 중첩, y는 격자 사이 분리.
+    zone_anchor_xy: [-0.75, 0.75, -0.75, -1.0, 0.75, -1.0, 0.75, 0.75]  # 구역별 중앙 근처 스캔 위치 Z1~Z4.
     zone_no_target_advance_sec: 6.0       # 현재 zone 중심에서 목표가 없을 때 다음 zone으로 넘어가기 전 대기.
     zone_center_reach_tol_m: 0.25         # zone 중심에 도착했다고 보는 거리 허용오차.
+    zone_anchor_nav_enabled: false        # zone anchor로 강제 이동하지 않고 현재 위치에서 해당 zone 후보를 처리한다.
+    zone_stabilize_enabled: false         # zone anchor 정지 안정화 과정을 생략한다.
+    zone_stabilize_sec: 3.0               # zone 진입 안정화 정지 시간. 맵이 더 흔들리면 5.0까지 올려 테스트.
+    zone_stabilize_require_fresh_seen: false  # anchor fresh-seen 조건을 쓰지 않는다.
 
     # Lane planner
     planner_enabled: true                 # 레인 플래너 사용 여부. false면 직접 목표 이동에 가깝게 동작.
@@ -140,8 +178,8 @@ mission_fsm_node:
     phase_tol_m: 0.08                     # 물체가 추정 격자 위상에 맞는지 판단하는 허용오차.
     field_bounds_m: [-2.0, 2.0, -2.0, 2.0]  # 경기장 경계 [xmin,xmax,ymin,ymax].
     robot_margin_m: 0.22                  # 벽에서 로봇 중심이 최소로 떨어져야 하는 여유 거리.
-    lane_block_radius_m: 0.24             # 물체가 레인에 이 거리보다 가까우면 그 레인을 막힌 것으로 본다.
-    comfort_clear_m: 0.35                 # 장애물과 이 거리 이상 떨어진 레인을 편한 레인으로 본다.
+    lane_block_radius_m: 0.18             # 물체가 레인에 이 거리보다 가까우면 그 레인을 막힌 것으로 본다.
+    comfort_clear_m: 0.25                 # 장애물과 이 거리 이상 떨어진 레인을 편한 레인으로 본다.
     clearance_weight: 2.0                 # 장애물에서 먼 레인을 선호하는 비용 가중치.
     start_connect_k: 4                    # 현재 위치를 연결할 후보 레인 노드 개수.
     wp_reach_tol_m: 0.12                  # 현재 waypoint에 도착했다고 보고 다음 waypoint로 넘기는 거리.
@@ -171,7 +209,7 @@ world_model_node:
     new_track_min_hits: 3                 # 새 물체 확정에 필요한 재관측 횟수.
     candidate_ttl_sec: 0.8                # 후보가 이 시간 안에 재관측 안 되면 폐기된다.
     forget_after_sec: 120.0               # track을 유지하는 시간. 길수록 전체 맵이 오래 남는다.
-    grid_prior_enabled: false             # 물체 위치를 7x6 격자점 쪽으로 보정할지 여부. v1.0.0 기본은 false.
+    grid_prior_enabled: true              # 물체 위치를 7x6 격자점 쪽으로 보정할지 여부. anchor 전략에서는 기본 ON.
     grid_prior_debug: true                # 격자 보정 디버그 정보/표시 사용 여부.
     grid_rows: 6                          # 격자 행 개수.
     grid_cols: 7                          # 격자 열 개수.
@@ -183,7 +221,18 @@ world_model_node:
     grid_new_snap_radius_m: 0.12          # 초반 이후 새 track을 격자점으로 끌어당기는 최대 거리.
     grid_initial_snap_alpha: 0.80         # 초반 격자 보정 강도. 1에 가까울수록 격자점에 더 붙는다.
     grid_new_snap_alpha: 0.45             # 초반 이후 격자 보정 강도.
+    grid_anchor_snap_radius_m: 0.22       # zone anchor 근처에서는 격자 신뢰를 더 강하게 적용한다.
+    grid_anchor_snap_alpha: 0.90
+    grid_anchor_pose_radius_m: 0.35       # 로봇 pose가 anchor 이 반경 안이면 anchor grid mode.
+    grid_track_lock_enabled: true         # 주행 테스트 중 확인된 물체 track을 격자점에 고정해 좌표 흔들림을 줄인다.
+    grid_track_lock_radius_m: 0.26        # 이 반경 안의 track만 가장 가까운 격자점에 고정한다.
+    grid_track_lock_alpha: 1.0            # 1.0이면 표시/선택 좌표를 격자점으로 완전히 고정한다.
+    zone_anchor_xy: [-0.75, 0.75, -0.75, -1.0, 0.75, -1.0, 0.75, 0.75]
     grid_moved_threshold_m: 0.22          # 물체가 격자 시작 위치에서 이 이상 벗어나면 이동한 물체로 본다.
+    fruit_cube_sticky_enabled: true       # fruit_photo_cube 근거가 충분하면 shape vote에 눌리지 않게 Set2로 고정.
+    fruit_cube_sticky_conf_wide: 0.75     # wide fruit_photo_cube 누적 근거로 인정할 최소 confidence.
+    fruit_cube_sticky_conf_body: 0.50     # body fruit_photo_cube는 이 confidence 이상이면 1회부터 sticky 허용.
+    fruit_cube_sticky_min_wide_hits: 3    # wide-only fruit_photo_cube는 이 횟수 이상 누적돼야 sticky Set2가 된다.
     body_fov_half_deg: 30.0               # body 카메라 시야각 반각.
     body_fov_near_m: 0.25                 # body 카메라가 볼 수 있다고 보는 최소 거리.
     body_fov_far_m: 0.68                  # body 카메라가 볼 수 있다고 보는 최대 거리.
@@ -211,9 +260,11 @@ go_to_goal_node:
     face_tol_rad: 0.35                    # 목표 방향을 이 각도 안으로 바라봐야 전진한다.
     field_bounds_m: [-2.0, 2.0, -2.0, 2.0]  # 목표 위치 클램프용 경기장 경계.
     robot_margin_m: 0.22                  # 벽에서 로봇 중심이 최소로 떨어져야 하는 여유 거리.
-    avoid_radius_m: 0.30                  # 반응형 물체 회피가 작동하는 장애물 반경.
-    avoid_gain: 0.10                      # 장애물에서 밀어내는 반응형 회피 세기.
+    avoid_radius_m: 0.24                  # 반응형 물체 회피가 작동하는 장애물 반경. LanePlanner 보조용으로 작게 둔다.
+    avoid_gain: 0.05                      # 장애물에서 밀어내는 반응형 회피 세기. 경로 선택은 LanePlanner가 주도한다.
     avoid_goal_skip_m: 0.30               # 목표 근처 이 거리 안의 물체는 회피하지 않는다.
+    use_planning_obstacles: true          # go_to_goal 회피도 LanePlanner가 쓴 필터링된 장애물 목록을 우선 사용한다.
+    planning_obstacle_timeout_sec: 1.0    # planning obstacle이 이 시간보다 오래되면 world_model 장애물로 fallback한다.
     front_stop_m: 0.15                    # 전방 초음파가 이 거리보다 가까우면 전진을 멈춘다.
     sonar_timeout_sec: 0.5                # 초음파 값이 이 시간보다 오래되면 무시한다.
 
@@ -255,11 +306,26 @@ recognition_viz_node:
     show_camera_panels: true              # 8080 라이브 화면에 wide/body 카메라 패널을 같이 표시할지 여부.
     write_live_png: false                 # live.png를 디스크에 계속 덮어쓸지 여부.
     redraw_rate_hz: 5.0                   # 라이브 맵 다시 그리기 주기.
+    simple_object_labels: true            # true면 맵 물체 라벨을 이름만 간단히 표시.
+    show_set2_slots: true                 # Set2 슬롯을 F1, F2... 고정 링으로 라이브 맵에 표시.
     show_object_grid_points: true         # 라이브 맵에 7x6 격자점을 표시할지 여부.
     show_zone_regions: true               # 라이브 맵에 zone 1~4 사각형을 표시할지 여부.
+    show_zone_anchors: false               # 라이브 맵에 A1~A4 anchor 십자 표시.
     grid_rows: 6                          # 표시용 격자 행 개수.
     grid_cols: 7                          # 표시용 격자 열 개수.
     grid_spacing_m: 0.50                  # 표시용 격자 간격.
     grid_origin_x_m: -1.50                # 표시용 첫 격자점 x.
     grid_origin_y_m: -1.50                # 표시용 첫 격자점 y.
-    zone_bounds_m: [-2.0, 0.1, -0.1, 2.0, -2.0, 0.1, -2.0, 0.1, -0.1, 2.0, -2.0, 0.1, -0.1, 2.0, -0.1, 2.0]  # 표시용 zone 경계.
+    zone_bounds_m: [-2.0, 0.1, -0.25, 2.0, -2.0, 0.1, -2.0, -0.25, -0.1, 2.0, -2.0, -0.25, -0.1, 2.0, -0.25, 2.0]  # 표시용 zone 경계.
+    zone_anchor_xy: [-0.75, 0.75, -0.75, -1.0, 0.75, -1.0, 0.75, 0.75]
+    show_checkpoint_route: false          # 체크포인트 테스트 경로를 라이브 맵에 표시.
+    checkpoint_route_xy: [-1.8, 1.6, -1.8, -1.75, -0.75, -1.75, -0.75, 1.6, 0.25, 1.6, 0.25, -1.75, 1.25, -1.75, 1.25, 1.6]
+    checkpoint_route_heading_rad: [-1.5708, 0.0, 1.5708, 0.0, -1.5708, 0.0, 1.5708, 0.0]
+
+anchor_waypoint_test:
+  ros__parameters:
+    # scripts/anchor_waypoint_test.py --route checkpoint_sweep 가 기본으로 읽는 경로.
+    # 좌표는 [P1.x, P1.y, P2.x, P2.y, ...] 순서다.
+    checkpoint_route_xy: [-1.8, 1.6, -1.8, -1.65, -0.75, -1.65, -0.75, 1.6, 0.25, 1.6, 0.25, -1.65, 1.25, -1.65, 1.25, 1.6]
+    # 각 체크포인트에서 정지 후 바라볼 heading(rad). 맵 기준: up=-1.5708, left=0.0, down=1.5708.
+    checkpoint_route_heading_rad: [-1.5708, 0.0, 1.5708, 0.0, -1.5708, 0.0, 1.5708, 0.0]

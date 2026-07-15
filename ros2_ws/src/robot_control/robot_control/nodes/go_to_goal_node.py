@@ -19,7 +19,7 @@ from __future__ import annotations
 import math
 
 import rclpy
-from geometry_msgs.msg import PoseStamped
+from geometry_msgs.msg import PoseArray, PoseStamped
 from rclpy.node import Node
 from robot_interfaces.msg import BaseCommand, MissionState, WorldModel
 from sensor_msgs.msg import Range
@@ -86,10 +86,18 @@ class GoToGoalNode(Node):
         self.declare_parameter("avoid_radius_m", 0.34)
         self.declare_parameter("avoid_gain", 0.14)
         self.declare_parameter("avoid_goal_skip_m", 0.30)
+        self.declare_parameter("use_planning_obstacles", True)
+        self.declare_parameter("planning_obstacle_timeout_sec", 1.0)
         self.avoid_radius = float(self.get_parameter("avoid_radius_m").value)
         self.avoid_gain = float(self.get_parameter("avoid_gain").value)
         self.avoid_goal_skip = float(self.get_parameter("avoid_goal_skip_m").value)
+        self.use_planning_obstacles = bool(self.get_parameter("use_planning_obstacles").value)
+        self.planning_obstacle_timeout = float(
+            self.get_parameter("planning_obstacle_timeout_sec").value
+        )
         self._obstacles: list[tuple[float, float]] = []   # mapped object centres (field xy)
+        self._planning_obstacles: list[tuple[float, float]] = []
+        self._planning_obstacles_t: float | None = None
         # Front HC-SR04 hard stop: never drive FORWARD into a wall. Threshold is well inside the pick
         # stand-off (~0.35 m) and grab (~0.28 m) so it never blocks a pick — only a true wall/obstacle.
         self.declare_parameter("front_stop_m", 0.15)
@@ -116,6 +124,7 @@ class GoToGoalNode(Node):
         self.create_subscription(MissionState, "/mission_state", self.on_mission_state, 10)
         # Always subscribe: world model gives the fallback pose AND the obstacle list for avoidance.
         self.create_subscription(WorldModel, "/world_model", self.on_world, 10)
+        self.create_subscription(PoseArray, "/planning/obstacles", self.on_planning_obstacles, 10)
         self.create_subscription(Range, "/ultrasonic/range", self.on_range, 10)   # front wall stop
 
         self.pub = self.create_publisher(BaseCommand, "/base_command", 10)
@@ -179,6 +188,19 @@ class GoToGoalNode(Node):
         # Obstacle list = every mapped object centre (even blacklisted ones are physically there).
         self._obstacles = [(o.x, o.y) for o in msg.objects]
 
+    def on_planning_obstacles(self, msg: PoseArray) -> None:
+        self._planning_obstacles = [(p.position.x, p.position.y) for p in msg.poses]
+        self._planning_obstacles_t = self._now_s()
+
+    def _avoidance_obstacles(self) -> list[tuple[float, float]]:
+        if (
+            self.use_planning_obstacles
+            and self._planning_obstacles_t is not None
+            and (self._now_s() - self._planning_obstacles_t) <= self.planning_obstacle_timeout
+        ):
+            return self._planning_obstacles
+        return self._obstacles
+
     def on_range(self, msg: Range) -> None:
         self._front_range = float(msg.range)
         self._front_range_t = self._now_s()
@@ -232,8 +254,9 @@ class GoToGoalNode(Node):
             # straight (~18deg back-diagonal + ~20deg yaw), so no vy while travelling. Obstacle
             # repulsion bends the travel AIM (steer around) instead of adding a sideways command. ----
             ux, uy = ex, ey
-            if self.avoid_radius > 0.0 and self._obstacles:
-                for (ox, oy) in self._obstacles:
+            obstacles = self._avoidance_obstacles()
+            if self.avoid_radius > 0.0 and obstacles:
+                for (ox, oy) in obstacles:
                     if math.hypot(ox - gx, oy - gy) < self.avoid_goal_skip:
                         continue                                 # (near) the target -> don't repel
                     odx, ody = ox - rx, oy - ry

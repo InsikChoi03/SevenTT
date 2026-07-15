@@ -84,6 +84,10 @@ class Track:
     seen_body: bool = False       # a body-cam (reliable) detection has updated this track
     fruit_label: str = ""         # concrete fruit from SigLIP once a face was read
     fruit_confidence: float = 0.0
+    fruit_cube_seen: bool = False  # sticky Set2 evidence from a confident fruit_photo_cube box
+    fruit_cube_confidence: float = 0.0
+    fruit_cube_wide_hits: int = 0
+    fruit_cube_body_hits: int = 0
     last_body_sec: float = 0.0     # last time a body detection updated this track
     last_wide_sec: float = 0.0     # last time a wide detection updated this track (for miss penalty)
     n_obs: int = 0                # total detections fused (evidence count)
@@ -101,8 +105,8 @@ class Track:
     anchor_y: float = 0.0
     outlier_count: int = 0        # consecutive frames this anchor disagreed with the consensus
                                   # drift (i.e. the object itself moved) -> triggers an unlock
-    # Optional field-grid prior. A grid id is assigned only when a NEW confirmed track is close
-    # enough to a free grid point; subsequent observations always own the live position.
+    # Optional field-grid prior. A grid id is assigned when a confirmed track is close enough to
+    # a free grid point. In grid-track-lock mode, later observations keep that track on-grid.
     spawn_grid_id: int = -1
     current_grid_id: int = -1
     grid_state: str = "off_grid"  # "grid_spawned", "moved", or "off_grid"
@@ -238,6 +242,16 @@ class WorldModelNode(Node):
         self.declare_parameter("grid_new_snap_radius_m", 0.12)
         self.declare_parameter("grid_initial_snap_alpha", 0.80)
         self.declare_parameter("grid_new_snap_alpha", 0.45)
+        self.declare_parameter("grid_anchor_snap_radius_m", 0.22)
+        self.declare_parameter("grid_anchor_snap_alpha", 0.90)
+        self.declare_parameter("grid_anchor_pose_radius_m", 0.35)
+        self.declare_parameter("grid_track_lock_enabled", False)
+        self.declare_parameter("grid_track_lock_radius_m", 0.26)
+        self.declare_parameter("grid_track_lock_alpha", 1.0)
+        self.declare_parameter(
+            "zone_anchor_xy",
+            [-0.75, 0.75, -0.75, -1.0, 0.75, -1.0, 0.75, 0.75],
+        )
         self.declare_parameter("grid_moved_threshold_m", 0.22)
 
         # --- Position vs identity: DIFFERENT confidence cut-offs ---
@@ -250,6 +264,10 @@ class WorldModelNode(Node):
         # LOWER bar than the wide cam — otherwise a real 0.6–0.8 body octa/icosa never establishes an
         # identity, gets no protection, and is swallowed by a neighbouring high-conf cube track.
         self.declare_parameter("class_conf_threshold_body", 0.50)
+        self.declare_parameter("fruit_cube_sticky_enabled", True)
+        self.declare_parameter("fruit_cube_sticky_conf_wide", 0.75)
+        self.declare_parameter("fruit_cube_sticky_conf_body", 0.50)
+        self.declare_parameter("fruit_cube_sticky_min_wide_hits", 3)
         # --- Negative evidence: an in-FOV object that is NOT seen loses presence ---
         # Camera coverage SHAPES (base_link, used for BOTH the negative-evidence "should be visible"
         # test and the map drawing): body = forward SECTOR (부채꼴) apex at the body cam; wide =
@@ -302,9 +320,25 @@ class WorldModelNode(Node):
         self.grid_new_radius = max(0.0, float(self.get_parameter("grid_new_snap_radius_m").value))
         self.grid_initial_alpha = min(1.0, max(0.0, float(self.get_parameter("grid_initial_snap_alpha").value)))
         self.grid_new_alpha = min(1.0, max(0.0, float(self.get_parameter("grid_new_snap_alpha").value)))
+        self.grid_anchor_radius = max(0.0, float(self.get_parameter("grid_anchor_snap_radius_m").value))
+        self.grid_anchor_alpha = min(1.0, max(0.0, float(self.get_parameter("grid_anchor_snap_alpha").value)))
+        self.grid_anchor_pose_radius = max(0.0, float(self.get_parameter("grid_anchor_pose_radius_m").value))
+        self.grid_track_lock_enabled = bool(self.get_parameter("grid_track_lock_enabled").value)
+        self.grid_track_lock_radius = max(0.0, float(self.get_parameter("grid_track_lock_radius_m").value))
+        self.grid_track_lock_alpha = min(
+            1.0, max(0.0, float(self.get_parameter("grid_track_lock_alpha").value))
+        )
+        za = [float(v) for v in self.get_parameter("zone_anchor_xy").value]
+        self.zone_anchors = [(za[i], za[i + 1]) for i in range(0, min(len(za), 8), 2)]
         self.grid_moved_threshold = max(0.0, float(self.get_parameter("grid_moved_threshold_m").value))
         self.class_conf_threshold = float(self.get_parameter("class_conf_threshold").value)
         self.class_conf_threshold_body = float(self.get_parameter("class_conf_threshold_body").value)
+        self.fruit_cube_sticky_enabled = bool(self.get_parameter("fruit_cube_sticky_enabled").value)
+        self.fruit_cube_sticky_conf_wide = float(self.get_parameter("fruit_cube_sticky_conf_wide").value)
+        self.fruit_cube_sticky_conf_body = float(self.get_parameter("fruit_cube_sticky_conf_body").value)
+        self.fruit_cube_sticky_min_wide_hits = int(
+            self.get_parameter("fruit_cube_sticky_min_wide_hits").value
+        )
         self.body_fov_half = math.radians(float(self.get_parameter("body_fov_half_deg").value))
         self.body_fov_near = float(self.get_parameter("body_fov_near_m").value)
         self.body_fov_far = float(self.get_parameter("body_fov_far_m").value)
@@ -548,6 +582,20 @@ class WorldModelNode(Node):
                 self.grid_prior_enabled = bool(param.value)
             elif param.name == "grid_prior_debug":
                 self.grid_prior_debug = bool(param.value)
+            elif param.name == "grid_track_lock_enabled":
+                self.grid_track_lock_enabled = bool(param.value)
+            elif param.name == "grid_track_lock_radius_m":
+                self.grid_track_lock_radius = max(0.0, float(param.value))
+            elif param.name == "grid_track_lock_alpha":
+                self.grid_track_lock_alpha = min(1.0, max(0.0, float(param.value)))
+            elif param.name == "fruit_cube_sticky_enabled":
+                self.fruit_cube_sticky_enabled = bool(param.value)
+            elif param.name == "fruit_cube_sticky_conf_wide":
+                self.fruit_cube_sticky_conf_wide = float(param.value)
+            elif param.name == "fruit_cube_sticky_conf_body":
+                self.fruit_cube_sticky_conf_body = float(param.value)
+            elif param.name == "fruit_cube_sticky_min_wide_hits":
+                self.fruit_cube_sticky_min_wide_hits = int(param.value)
         return SetParametersResult(successful=True)
 
     @staticmethod
@@ -920,6 +968,12 @@ class WorldModelNode(Node):
                 and not tr.blacklisted)
         }
 
+    def _near_zone_anchor(self) -> bool:
+        return any(
+            math.hypot(self.robot_x - ax, self.robot_y - ay) <= self.grid_anchor_pose_radius
+            for ax, ay in self.zone_anchors
+        )
+
     def _apply_grid_prior(
         self, x: float, y: float, set_type: int, now: float
     ) -> tuple[float, float, int, bool, float]:
@@ -937,8 +991,12 @@ class WorldModelNode(Node):
         )
         distance = math.hypot(gx - x, gy - y)
         initial = (now - self._grid_start_sec) <= self.grid_initial_phase
-        radius = self.grid_initial_radius if initial else self.grid_new_radius
-        alpha = self.grid_initial_alpha if initial else self.grid_new_alpha
+        if self._near_zone_anchor():
+            radius = max(self.grid_new_radius, self.grid_anchor_radius)
+            alpha = max(self.grid_new_alpha, self.grid_anchor_alpha)
+        else:
+            radius = self.grid_initial_radius if initial else self.grid_new_radius
+            alpha = self.grid_initial_alpha if initial else self.grid_new_alpha
         if distance > radius or gid in self._occupied_grid_ids():
             return x, y, -1, False, distance
         return (
@@ -965,6 +1023,47 @@ class WorldModelNode(Node):
                 f"grid moved: track={tr.id} spawn_grid={tr.spawn_grid_id} distance={distance:.3f}m"
             )
 
+    def _lock_track_to_grid(self, tr: Track, set_type: int) -> bool:
+        """Keep a live game-object track at its claimed grid point during sweep tests.
+
+        This stabilizes the object map when robot pose jitter would otherwise drag static objects
+        around. It is intentionally separate from landmark correction: the robot pose can still
+        move, but the object layer stays grid-centered.
+        """
+        if not self.grid_prior_enabled or not self.grid_track_lock_enabled:
+            return False
+        if set_type not in (1, 2) or not self._grid_points:
+            return False
+        occupied = self._occupied_grid_ids()
+        gid = tr.spawn_grid_id if tr.spawn_grid_id >= 0 and tr.grid_state == "grid_spawned" else -1
+        if gid < 0:
+            gid, (gx, gy) = min(
+                enumerate(self._grid_points),
+                key=lambda item: math.hypot(item[1][0] - tr.x, item[1][1] - tr.y),
+            )
+            if math.hypot(gx - tr.x, gy - tr.y) > self.grid_track_lock_radius:
+                return False
+            if gid in occupied:
+                return False
+            tr.spawn_grid_id = gid
+            tr.grid_state = "grid_spawned"
+            tr.grid_snapped = True
+        else:
+            gx, gy = self._grid_points[gid]
+        occupied.discard(tr.spawn_grid_id)
+        if gid in occupied:
+            return False
+        alpha = self.grid_track_lock_alpha
+        tr.x = (1.0 - alpha) * tr.x + alpha * gx
+        tr.y = (1.0 - alpha) * tr.y + alpha * gy
+        tr.current_grid_id = gid
+        tr.grid_state = "grid_spawned"
+        tr.grid_snapped = True
+        if tr.locked:
+            tr.anchor_x = tr.x
+            tr.anchor_y = tr.y
+        return True
+
     def _candidate_hit(self, x: float, y: float, conf: float, label: str, set_type: int,
                        now: float, is_body: bool, vote_thresh: float) -> int:
         """A detection with no matching track: hold it as a CANDIDATE and only spawn a real track once
@@ -979,8 +1078,21 @@ class WorldModelNode(Node):
                 bd = d
                 best = c
         if best is None:
+            fruit_hit = self._is_fruit_cube_evidence(label, conf, is_body)
+            fruit_body_hits = 1 if fruit_hit and is_body else 0
+            fruit_wide_hits = 1 if fruit_hit and not is_body else 0
+            fruit_seen = self._fruit_cube_sticky_from_hits(
+                body_hits=fruit_body_hits,
+                wide_hits=fruit_wide_hits,
+            )
             self._candidates.append({"x": x, "y": y, "n": 1, "t": now, "conf": conf,
-                                     "label": label, "set": set_type, "body": is_body})
+                                     "label": label,
+                                     "set": (2 if fruit_seen else set_type),
+                                     "body": is_body,
+                                     "fruit_cube_seen": fruit_seen,
+                                     "fruit_cube_conf": conf if fruit_hit else 0.0,
+                                     "fruit_cube_wide_hits": fruit_wide_hits,
+                                     "fruit_cube_body_hits": fruit_body_hits})
             return 0
         best["x"] = 0.5 * best["x"] + 0.5 * x
         best["y"] = 0.5 * best["y"] + 0.5 * y
@@ -988,6 +1100,17 @@ class WorldModelNode(Node):
         best["t"] = now
         best["conf"] = max(best["conf"], conf)
         best["body"] = best["body"] or is_body
+        if self._is_fruit_cube_evidence(label, conf, is_body):
+            if is_body:
+                best["fruit_cube_body_hits"] = int(best.get("fruit_cube_body_hits", 0)) + 1
+            else:
+                best["fruit_cube_wide_hits"] = int(best.get("fruit_cube_wide_hits", 0)) + 1
+            best["fruit_cube_conf"] = max(float(best.get("fruit_cube_conf", 0.0)), conf)
+            if self._fruit_cube_sticky_from_hits(
+                    body_hits=int(best.get("fruit_cube_body_hits", 0)),
+                    wide_hits=int(best.get("fruit_cube_wide_hits", 0))):
+                best["fruit_cube_seen"] = True
+                best["set"] = 2
         if best["n"] < self.new_track_min_hits:
             return 0
         # Confirmed -> promote to a real track.
@@ -1005,7 +1128,13 @@ class WorldModelNode(Node):
             n_obs=best["n"], n_body=(best["n"] if body else 0),
             spawn_grid_id=grid_id, current_grid_id=grid_id,
             grid_state=("grid_spawned" if snapped else "off_grid"), grid_snapped=snapped,
+            fruit_cube_seen=bool(best.get("fruit_cube_seen", False)),
+            fruit_cube_confidence=float(best.get("fruit_cube_conf", 0.0)),
+            fruit_cube_wide_hits=int(best.get("fruit_cube_wide_hits", 0)),
+            fruit_cube_body_hits=int(best.get("fruit_cube_body_hits", 0)),
         )
+        if tr.fruit_cube_seen:
+            tr.set_type = 2
         if conf >= vote_thresh:
             self._vote(tr, label, conf, is_body)
         self._refresh_identity(tr)
@@ -1053,7 +1182,20 @@ class WorldModelNode(Node):
 
         # Fuse into the matched track.
         tr = self.tracks[best_id]
-        self._update_grid_state(tr, x, y)
+        if self._is_fruit_cube_evidence(label, conf, is_body):
+            if is_body:
+                tr.fruit_cube_body_hits += 1
+            else:
+                tr.fruit_cube_wide_hits += 1
+            tr.fruit_cube_confidence = max(tr.fruit_cube_confidence, conf)
+            if self._fruit_cube_sticky_from_hits(
+                    body_hits=tr.fruit_cube_body_hits,
+                    wide_hits=tr.fruit_cube_wide_hits):
+                tr.fruit_cube_seen = True
+                tr.set_type = 2
+        self._lock_track_to_grid(tr, set_type)
+        if not self.grid_track_lock_enabled:
+            self._update_grid_state(tr, x, y)
         if tr.locked and self.landmark_correction:
             # Frozen landmark: don't move it — record (track id, fresh obs, anchor) so the batch
             # solve can recover the robot-pose drift AND spot anchors that moved (object picked up).
@@ -1062,6 +1204,23 @@ class WorldModelNode(Node):
             pos_a = 0.7 if is_body else self.conf_ema     # body pulls position harder
             tr.x = (1.0 - pos_a) * tr.x + pos_a * x
             tr.y = (1.0 - pos_a) * tr.y + pos_a * y
+            if self.grid_prior_enabled and self._near_zone_anchor() and set_type in (1, 2) and self._grid_points:
+                gid, (gx, gy) = min(
+                    enumerate(self._grid_points),
+                    key=lambda item: math.hypot(item[1][0] - tr.x, item[1][1] - tr.y),
+                )
+                dist = math.hypot(gx - tr.x, gy - tr.y)
+                occupied = self._occupied_grid_ids()
+                occupied.discard(tr.spawn_grid_id)
+                if dist <= self.grid_anchor_radius and gid not in occupied:
+                    tr.x = (1.0 - self.grid_anchor_alpha) * tr.x + self.grid_anchor_alpha * gx
+                    tr.y = (1.0 - self.grid_anchor_alpha) * tr.y + self.grid_anchor_alpha * gy
+                    tr.current_grid_id = gid
+                    if tr.spawn_grid_id < 0:
+                        tr.spawn_grid_id = gid
+                        tr.grid_state = "grid_spawned"
+                        tr.grid_snapped = True
+            self._lock_track_to_grid(tr, set_type)
         new_conf = (1.0 - self.conf_ema) * tr.confidence + self.conf_ema * conf
         if is_body:
             tr.confidence = max(tr.confidence, conf)  # body = quality authority: sticky to its confident look
@@ -1103,6 +1262,19 @@ class WorldModelNode(Node):
         pool = tr.body_votes if is_body else tr.wide_votes
         pool[label] = pool.get(label, 0.0) + max(0.05, conf)
 
+    def _is_fruit_cube_evidence(self, label: str, conf: float, is_body: bool) -> bool:
+        if not self.fruit_cube_sticky_enabled or label != "fruit_photo_cube":
+            return False
+        thresh = self.fruit_cube_sticky_conf_body if is_body else self.fruit_cube_sticky_conf_wide
+        return conf >= thresh
+
+    def _fruit_cube_sticky_from_hits(self, *, body_hits: int, wide_hits: int) -> bool:
+        return bool(
+            self.fruit_cube_sticky_enabled
+            and (int(body_hits) > 0
+                 or int(wide_hits) >= max(1, self.fruit_cube_sticky_min_wide_hits))
+        )
+
     @staticmethod
     def _refresh_identity(tr: Track) -> None:
         """Best-estimate identity. SigLIP fruit wins for Set2; otherwise the BODY cam's vote
@@ -1119,19 +1291,9 @@ class WorldModelNode(Node):
             tr.class_label = "arrival"
             tr.set_type = 3
             return
-        # fruit_photo_cube (nested printed-fruit patch, even inside a plain 'cube' box) means this is
-        # a Set2 FRUIT cube, not a Set1 shape. But a SINGLE spurious fpc detection on a white
-        # polyhedron must NOT irreversibly flip a real Set1 target to Set2 (the target then vanishes
-        # from the selector forever). So require the accumulated fpc evidence to be a MEANINGFUL
-        # fraction of the shape evidence — a genuine fruit cube keeps accumulating fpc and clears
-        # this easily, whereas a one-frame misread is out-voted by the shape stream.
-        fpc = tr.body_votes.get("fruit_photo_cube", 0.0) + tr.wide_votes.get("fruit_photo_cube", 0.0)
-        shape_max = max(
-            [v for k, v in tr.body_votes.items() if k not in ("fruit_photo_cube", "arrival")]
-            + [v for k, v in tr.wide_votes.items() if k not in ("fruit_photo_cube", "arrival")],
-            default=0.0,
-        )
-        if fpc > 0.0 and fpc >= 0.5 * shape_max:
+        # Fruit-photo evidence is sticky: once a track has one sufficiently confident
+        # fruit_photo_cube box, later plain cube votes must not demote it back to Set1.
+        if tr.fruit_cube_seen:
             tr.class_label = "fruit_photo_cube"
             tr.set_type = 2
             return
@@ -1420,7 +1582,8 @@ class WorldModelNode(Node):
                 if math.hypot(ta.x - tb.x, ta.y - tb.y) > self.reassoc_radius:
                     continue   # generous gate: collapse jitter-split duplicates (still < grid spacing)
                 if (ta.locked and tb.locked and ta.class_label and tb.class_label
-                        and ta.class_label != tb.class_label):
+                        and ta.class_label != tb.class_label
+                        and not (ta.fruit_cube_seen or tb.fruit_cube_seen)):
                     continue   # two confirmed, differently-classified anchors -> keep distinct
                 for pa, pb in ((ta.wide_votes, tb.wide_votes),
                                (ta.body_votes, tb.body_votes),
@@ -1429,6 +1592,14 @@ class WorldModelNode(Node):
                         pa[k] = pa.get(k, 0.0) + v
                 ta.confidence = max(ta.confidence, tb.confidence)
                 ta.fruit_confidence = max(ta.fruit_confidence, tb.fruit_confidence)
+                ta.fruit_cube_wide_hits += tb.fruit_cube_wide_hits
+                ta.fruit_cube_body_hits += tb.fruit_cube_body_hits
+                ta.fruit_cube_seen = ta.fruit_cube_seen or tb.fruit_cube_seen
+                if self._fruit_cube_sticky_from_hits(
+                        body_hits=ta.fruit_cube_body_hits,
+                        wide_hits=ta.fruit_cube_wide_hits):
+                    ta.fruit_cube_seen = True
+                ta.fruit_cube_confidence = max(ta.fruit_cube_confidence, tb.fruit_cube_confidence)
                 ta.n_obs += tb.n_obs
                 ta.n_body += tb.n_body
                 ta.seen_body = ta.seen_body or tb.seen_body

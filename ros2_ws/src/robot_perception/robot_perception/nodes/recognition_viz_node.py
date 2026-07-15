@@ -20,6 +20,7 @@ Subscribes:
   /mission_state            robot_interfaces/MissionState   — state/tray counts/current target
   /planning/phase           std_msgs/Int8                   — Set1/Set2 pick phase (HUD)
   /planning/zone            std_msgs/Int8                   — active 2x2m mission zone (HUD/map)
+  /planning/object_slots    std_msgs/String                 — persistent Set2 slot inventory (JSON)
 
 Artefacts under output_dir/<YYYYmmdd_HHMMSS>/:
   events.csv / events.jsonl   — one row per first-seen object, per pick, and per state change
@@ -36,6 +37,7 @@ import time
 from collections import deque
 
 import rclpy
+from rcl_interfaces.msg import SetParametersResult
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 
@@ -114,7 +116,12 @@ _COL_ROBOT = (255, 90, 40)     # robot -> blue
 _COL_TRAIL = (200, 130, 60)    # trajectory
 _COL_GRID = (60, 60, 60)
 _COL_OBJECT_GRID = (115, 115, 115)
+_COL_ROUTE = (245, 245, 245)
+_COL_ROUTE_HEADING = (0, 230, 255)
 _COL_TEXT = (235, 235, 235)
+_COL_SLOT = (205, 90, 200)
+_COL_SLOT_RETRY = (0, 165, 255)
+_COL_SLOT_DONE = (100, 100, 100)
 _ZONE_COLORS = {
     1: (70, 120, 220),
     2: (60, 170, 120),
@@ -196,6 +203,8 @@ class RecognitionVizNode(Node):
         # body cam saw it, or a wide-only track reached this many observations (rules out a flicker).
         # Below that it is PROVISIONAL (drawn hollow) — seen, but not yet map-certain.
         self.declare_parameter("confirm_min_obs", 6)
+        self.declare_parameter("simple_object_labels", False)
+        self.declare_parameter("show_set2_slots", True)
         # Camera coverage drawn on the map (base_link, follows the robot). Body = forward SECTOR
         # (부채꼴), wide = forward-biased ELLIPSE. Keep in sync with the same-named world_model params.
         self.declare_parameter("body_fov_half_deg", 34.0)
@@ -213,13 +222,13 @@ class RecognitionVizNode(Node):
         self.declare_parameter("grid_spacing_m", 0.50)
         self.declare_parameter("grid_origin_x_m", 0.50)
         self.declare_parameter("grid_origin_y_m", 0.50)
-        # Visualise the 2x2m mission zones used by mission_fsm_node:
-        # 1=start(bottom-right on rotated live map), 2=above, 3=upper-left, 4=storage side.
+        # Visualise the grid-aligned mission zones used by mission_fsm_node.
+        # The center x=0 grid column is slightly overlapped; the y split is between grid rows.
         self.declare_parameter("show_zone_regions", True)
         self.declare_parameter(
             "zone_bounds_m",
-            [-2.0, 0.0, 0.0, 2.0, -2.0, 0.0, -2.0, 0.0,
-             0.0, 2.0, -2.0, 0.0, 0.0, 2.0, 0.0, 2.0],
+            [-2.0, 0.1, -0.25, 2.0, -2.0, 0.1, -2.0, -0.25,
+             -0.1, 2.0, -2.0, -0.25, -0.1, 2.0, -0.25, 2.0],
         )
 
         ext = [float(v) for v in self.get_parameter("field_extent_m").value]
@@ -245,6 +254,8 @@ class RecognitionVizNode(Node):
         ]
         self._train_cls_idx = {c: i for i, c in enumerate(self._train_classes)}
         self.confirm_min_obs = int(self.get_parameter("confirm_min_obs").value)
+        self.simple_object_labels = bool(self.get_parameter("simple_object_labels").value)
+        self.show_set2_slots = bool(self.get_parameter("show_set2_slots").value)
         self.body_fov_half = math.radians(float(self.get_parameter("body_fov_half_deg").value))
         self.body_fov_near = float(self.get_parameter("body_fov_near_m").value)
         self.body_fov_far = float(self.get_parameter("body_fov_far_m").value)
@@ -264,6 +275,36 @@ class RecognitionVizNode(Node):
         for i in range(0, min(len(zb), 16), 4):
             zid = i // 4 + 1
             self.zone_bounds[zid] = (zb[i], zb[i + 1], zb[i + 2], zb[i + 3])
+        self.declare_parameter("show_zone_anchors", True)
+        self.declare_parameter(
+            "zone_anchor_xy",
+            [-0.75, 0.75, -0.75, -1.0, 0.75, -1.0, 0.75, 0.75],
+        )
+        self.show_zone_anchors = bool(self.get_parameter("show_zone_anchors").value)
+        za = [float(v) for v in self.get_parameter("zone_anchor_xy").value]
+        self.zone_anchors: dict[int, tuple[float, float]] = {}
+        for i in range(0, min(len(za), 8), 2):
+            self.zone_anchors[i // 2 + 1] = (za[i], za[i + 1])
+        self.declare_parameter("show_checkpoint_route", True)
+        self.declare_parameter(
+            "checkpoint_route_xy",
+            [-1.8, 1.6, -1.8, -1.6, -0.75, -1.6, -0.75, 1.6,
+             0.25, 1.6, 0.25, -1.6, 1.25, -1.6, 1.25, 1.6],
+        )
+        self.declare_parameter(
+            "checkpoint_route_heading_rad",
+            [-math.pi / 2.0, 0.0, math.pi / 2.0, 0.0,
+             -math.pi / 2.0, 0.0, math.pi / 2.0, 0.0],
+        )
+        self.show_checkpoint_route = bool(self.get_parameter("show_checkpoint_route").value)
+        rxy = [float(v) for v in self.get_parameter("checkpoint_route_xy").value]
+        self.checkpoint_route: list[tuple[float, float]] = [
+            (rxy[i], rxy[i + 1]) for i in range(0, len(rxy) - 1, 2)
+        ]
+        self.checkpoint_headings = [
+            float(v) for v in self.get_parameter("checkpoint_route_heading_rad").value
+        ]
+        self.add_on_set_parameters_callback(self._on_parameters_changed)
         self.bridge = CvBridge() if _BRIDGE_AVAILABLE else None
 
         # Run directory (wallclock timestamp -> unique per run).
@@ -309,6 +350,8 @@ class RecognitionVizNode(Node):
         self.selected_id = 0
         self.phase = 0
         self.zone = 0
+        self.object_slots: list[dict] = []
+        self.current_slot_id = 0
         self.siglip: Classification | None = None
         self.shape: Classification | None = None
         # Latest raw camera image msgs + their detections (converted at draw time, ~redraw rate).
@@ -370,6 +413,7 @@ class RecognitionVizNode(Node):
         self.create_subscription(Int8, "/planning/phase", self.on_phase, 10)
         self.create_subscription(Int8, "/planning/zone", self.on_zone, 10)
         self.create_subscription(String, "/planning/decision", self.on_decision, 10)
+        self.create_subscription(String, "/planning/object_slots", self.on_object_slots, 10)
         self.create_subscription(Float32MultiArray, "/world_model/projected_dets", self.on_proj, 10)
         self.create_subscription(Float32MultiArray, "/localization/wall_segments",
                                  self.on_wall_segments, 10)
@@ -499,6 +543,17 @@ class RecognitionVizNode(Node):
     def on_decision(self, msg: String) -> None:
         self.decisions.append(f"[{time.time() - self._t0:5.0f}s] {msg.data}")
 
+    def on_object_slots(self, msg: String) -> None:
+        try:
+            payload = json.loads(msg.data)
+            slots = payload.get("slots", [])
+            if not isinstance(slots, list):
+                return
+            self.object_slots = [slot for slot in slots if isinstance(slot, dict)]
+            self.current_slot_id = int(payload.get("current_slot_id", 0))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return
+
     def on_proj(self, msg: Float32MultiArray) -> None:
         d = list(msg.data)
         self.proj_dets = [
@@ -507,6 +562,14 @@ class RecognitionVizNode(Node):
         ]
 
     # ------------------------------------------------------------------ helpers
+    def _on_parameters_changed(self, params) -> SetParametersResult:
+        for param in params:
+            if param.name == "simple_object_labels":
+                self.simple_object_labels = bool(param.value)
+            elif param.name == "show_set2_slots":
+                self.show_set2_slots = bool(param.value)
+        return SetParametersResult(successful=True)
+
     def _apply_wall_map_transform(self, x: float, y: float) -> tuple[float, float]:
         ct, st = math.cos(self._wall_tf_th), math.sin(self._wall_tf_th)
         return ct * x - st * y + self._wall_tf_tx, st * x + ct * y + self._wall_tf_ty
@@ -566,10 +629,17 @@ class RecognitionVizNode(Node):
 
     def _current_extent(self):
         """Square extent covering all objects + robot + trail (+margin), or the fixed extent."""
-        if not self.auto_extent or self.world is None or not self.world.objects:
+        if not self.auto_extent:
             return list(self.extent)
-        xs = [o.x for o in self.world.objects] + [self.world.robot_x] + [p[0] for p in self.trail]
-        ys = [o.y for o in self.world.objects] + [self.world.robot_y] + [p[1] for p in self.trail]
+        xs = [float(slot.get("x", 0.0)) for slot in self.object_slots]
+        ys = [float(slot.get("y", 0.0)) for slot in self.object_slots]
+        if self.world is not None:
+            xs += [o.x for o in self.world.objects] + [self.world.robot_x]
+            ys += [o.y for o in self.world.objects] + [self.world.robot_y]
+        xs += [p[0] for p in self.trail]
+        ys += [p[1] for p in self.trail]
+        if not xs or not ys:
+            return list(self.extent)
         m = 0.6
         xmin, xmax, ymin, ymax = min(xs) - m, max(xs) + m, min(ys) - m, max(ys) + m
         span = max(xmax - xmin, ymax - ymin, 1.5)   # keep it square, min 1.5 m across
@@ -743,6 +813,8 @@ class RecognitionVizNode(Node):
         self._draw_grid(canvas)
         self._draw_zone_regions(canvas)
         self._draw_object_grid_points(canvas)
+        self._draw_zone_anchors(canvas)
+        self._draw_checkpoint_route(canvas)
         self._draw_wall_raw_segments(canvas)
         self._draw_wall_segments(canvas)
         self._draw_fov(canvas)                       # camera coverage under the objects
@@ -750,7 +822,10 @@ class RecognitionVizNode(Node):
         if self.world is not None:
             for obj in self.world.objects:
                 self._draw_object(canvas, obj)
+            self._draw_slots(canvas)
             self._draw_robot(canvas, self.world.robot_x, self.world.robot_y, self.world.robot_theta)
+        else:
+            self._draw_slots(canvas)
         self._draw_proj(canvas)   # raw per-camera homography projections on top
         self._draw_hud(canvas)
         self._draw_decisions(canvas)
@@ -935,6 +1010,34 @@ class RecognitionVizNode(Node):
                 cv2.circle(canvas, (px, py), r + 1, (20, 20, 20), 1, cv2.LINE_AA)
                 cv2.circle(canvas, (px, py), r, _COL_OBJECT_GRID, -1, cv2.LINE_AA)
 
+    def _draw_zone_anchors(self, canvas) -> None:
+        if not self.show_zone_anchors or not self.zone_anchors:
+            return
+        for zid, (ax, ay) in sorted(self.zone_anchors.items()):
+            px, py = self._w2p(ax, ay)
+            col = _ZONE_COLORS.get(zid, (230, 230, 230))
+            cv2.drawMarker(canvas, (px, py), col, cv2.MARKER_CROSS, 18, 2, cv2.LINE_AA)
+            cv2.circle(canvas, (px, py), 9, col, 1, cv2.LINE_AA)
+            cv2.putText(canvas, f"A{zid}", (px + 10, py - 8),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.42, (245, 245, 245), 1, cv2.LINE_AA)
+
+    def _draw_checkpoint_route(self, canvas) -> None:
+        if not self.show_checkpoint_route or not self.checkpoint_route:
+            return
+        pts = [self._w2p(x, y) for (x, y) in self.checkpoint_route]
+        for i in range(1, len(pts)):
+            cv2.line(canvas, pts[i - 1], pts[i], _COL_ROUTE, 2, cv2.LINE_AA)
+        for i, ((x, y), (px, py)) in enumerate(zip(self.checkpoint_route, pts), start=1):
+            cv2.circle(canvas, (px, py), 10, _COL_ROUTE, 2, cv2.LINE_AA)
+            cv2.circle(canvas, (px, py), 3, _COL_ROUTE_HEADING, -1, cv2.LINE_AA)
+            if i - 1 < len(self.checkpoint_headings):
+                th = self.checkpoint_headings[i - 1]
+                hx, hy = self._w2p(x + 0.28 * math.cos(th), y + 0.28 * math.sin(th))
+                cv2.arrowedLine(canvas, (px, py), (hx, hy), _COL_ROUTE_HEADING, 2,
+                                cv2.LINE_AA, tipLength=0.35)
+            cv2.putText(canvas, f"P{i}", (px + 11, py - 9),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.42, _COL_ROUTE, 1, cv2.LINE_AA)
+
     def _draw_trail(self, canvas) -> None:
         pts = [self._w2p(x, y) for (x, y) in self.trail]
         for i in range(1, len(pts)):
@@ -1003,9 +1106,34 @@ class RecognitionVizNode(Node):
         # text: identified -> class name; wide-only -> "?(wideguess)" (position sure, class tentative)
         pres = "" if confirmed else "?"
         name = (label or "?") if identity_known else (f"?({label})" if label else "?")
-        txt = f"#{obj.id}{pres} {name} {obj.confidence:.2f} x{n_obs} [{stag}]"
+        txt = name if self.simple_object_labels else f"#{obj.id}{pres} {name} {obj.confidence:.2f} x{n_obs} [{stag}]"
         cv2.putText(canvas, txt, (px + 13, py + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.4, _COL_TEXT, 1,
                     cv2.LINE_AA)
+
+    def _draw_slots(self, canvas) -> None:
+        """Draw persistent Set2 inspection IDs as compact rings around their fixed positions."""
+        if not self.show_set2_slots:
+            return
+        for slot in self.object_slots:
+            try:
+                slot_id = int(slot.get("id", 0))
+                px, py = self._w2p(float(slot["x"]), float(slot["y"]))
+            except (KeyError, TypeError, ValueError):
+                continue
+            state = str(slot.get("state", "candidate"))
+            if bool(slot.get("picked")) or bool(slot.get("non_target")):
+                col = _COL_SLOT_DONE
+            elif state == "lost_suspect" or int(slot.get("retries", 0)) > 0:
+                col = _COL_SLOT_RETRY
+            else:
+                col = _COL_SLOT
+            active = slot_id != 0 and slot_id == self.current_slot_id
+            cv2.circle(canvas, (px, py), 16 if active else 14, _COL_TARGET if active else col,
+                       3 if active else 2, cv2.LINE_AA)
+            if bool(slot.get("picked")):
+                cv2.drawMarker(canvas, (px, py), col, cv2.MARKER_TILTED_CROSS, 15, 2, cv2.LINE_AA)
+            cv2.putText(canvas, f"F{slot_id}", (px - 12, py - 18), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.38, _COL_TARGET if active else col, 1, cv2.LINE_AA)
 
     def _draw_robot(self, canvas, x: float, y: float, theta: float) -> None:
         px, py = self._w2p(x, y)
@@ -1023,6 +1151,14 @@ class RecognitionVizNode(Node):
             f"objects={n_obj} (picked/bl={n_bl})  tray shape={self.tray_shape} fruit={self.tray_fruit}",
             f"det wide={len(self.top_dets)} body={len(self.body_dets)}",
         ]
+        if self.show_set2_slots and self.object_slots:
+            unresolved = sum(
+                1 for slot in self.object_slots
+                if not bool(slot.get("picked")) and not bool(slot.get("non_target"))
+            )
+            lines.append(
+                f"set2 slots={len(self.object_slots)} unresolved={unresolved} current=F{self.current_slot_id}"
+            )
         if self.world is not None:
             objs = self.world.objects
             wb = sum(1 for o in objs if "body" in (o.source or "") and "wide" in (o.source or ""))

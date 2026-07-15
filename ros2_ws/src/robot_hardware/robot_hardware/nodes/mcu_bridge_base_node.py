@@ -17,6 +17,7 @@ Set publish_heartbeat_as_odom=true only for deliberate open-loop fallback tests.
 from __future__ import annotations
 
 import threading
+import time
 
 import rclpy
 import serial
@@ -38,6 +39,7 @@ class McuBridgeBaseNode(Node):
         self.declare_parameter("odom_deadband_mps", 0.005)
         self.declare_parameter("odom_scale", 1.0)
         self.declare_parameter("odom_wheel_scales", [1.0, 1.0, 1.0, 1.0])
+        self.declare_parameter("startup_lift_ms", 0)
 
         self.port = str(self.get_parameter("port").value)
         self.baud = int(self.get_parameter("baud").value)
@@ -48,6 +50,10 @@ class McuBridgeBaseNode(Node):
         self.odom_scale = float(self.get_parameter("odom_scale").value)
         wheel_scales = [float(v) for v in self.get_parameter("odom_wheel_scales").value]
         self.odom_wheel_scales = wheel_scales if len(wheel_scales) == 4 else [1.0, 1.0, 1.0, 1.0]
+        self.startup_lift_ms = max(0, min(10000, int(self.get_parameter("startup_lift_ms").value)))
+        self._startup_lift_sent = False
+        self._startup_lift_timer = None
+        self._serial_opened_at = 0.0
 
         self.ser: serial.Serial | None = None
         self.ser_lock = threading.Lock()
@@ -68,11 +74,14 @@ class McuBridgeBaseNode(Node):
         self.read_thread = threading.Thread(target=self._read_loop, daemon=True)
         self.read_thread.start()
         self.add_on_set_parameters_callback(self._on_params)
+        if self.startup_lift_ms > 0:
+            self._startup_lift_timer = self.create_timer(0.2, self._startup_lift_tick)
 
         self.get_logger().info(
             f"port={self.port} baud={self.baud} encoder_odom={self.publish_encoder_odom} "
             f"hb_as_odom={self.publish_heartbeat_as_odom} deadband={self.odom_deadband:.4f}m/s "
-            f"odom_scale={self.odom_scale:.4f} wheel_scales={self.odom_wheel_scales}"
+            f"odom_scale={self.odom_scale:.4f} wheel_scales={self.odom_wheel_scales} "
+            f"startup_lift_ms={self.startup_lift_ms}"
         )
 
     def _on_params(self, params) -> SetParametersResult:
@@ -98,10 +107,40 @@ class McuBridgeBaseNode(Node):
     def _open_serial(self) -> None:
         try:
             self.ser = serial.Serial(self.port, self.baud, timeout=0.1)
+            self._serial_opened_at = time.monotonic()
             self.get_logger().info(f"serial opened: {self.port}")
         except (serial.SerialException, OSError) as e:
             self.ser = None
             self.get_logger().warn(f"serial open failed ({e}); will retry on next command", throttle_duration_sec=5.0)
+
+    def _startup_lift_tick(self) -> None:
+        if self._startup_lift_sent or self.startup_lift_ms <= 0:
+            if self._startup_lift_timer is not None:
+                self._startup_lift_timer.cancel()
+            return
+        with self.ser_lock:
+            if self.ser is None:
+                self._open_serial()
+            self._send_startup_lift_locked()
+        if self._startup_lift_sent and self._startup_lift_timer is not None:
+            self._startup_lift_timer.cancel()
+
+    def _send_startup_lift_locked(self) -> None:
+        if self._startup_lift_sent or self.startup_lift_ms <= 0 or self.ser is None:
+            return
+        if time.monotonic() - self._serial_opened_at < 2.0:
+            return
+        line = f"<LIFT,{self.startup_lift_ms}>\n"
+        try:
+            self.ser.write(line.encode("ascii"))
+            self._startup_lift_sent = True
+            self.get_logger().info(f"startup lift command sent: {self.startup_lift_ms} ms")
+        except (serial.SerialException, OSError) as e:
+            self.get_logger().warn(f"startup lift write failed ({e}); closing")
+            try:
+                self.ser.close()
+            finally:
+                self.ser = None
 
     def on_wheel_speeds(self, msg: Float32MultiArray) -> None:
         if len(msg.data) != 4:
@@ -112,6 +151,9 @@ class McuBridgeBaseNode(Node):
         with self.ser_lock:
             if self.ser is None:
                 self._open_serial()
+            if self.ser is None:
+                return
+            self._send_startup_lift_locked()
             if self.ser is None:
                 return
             try:
@@ -132,6 +174,9 @@ class McuBridgeBaseNode(Node):
         with self.ser_lock:
             if self.ser is None:
                 self._open_serial()
+            if self.ser is None:
+                return
+            self._send_startup_lift_locked()
             if self.ser is None:
                 return
             try:

@@ -24,11 +24,11 @@ localizer_node:
     publish_rate_hz: 20.0
     use_visual_odometry: true
     use_landmark_correction: false        # no arena walls -> disable cardinal yaw-snap
-    use_object_landmarks: true            # correct x/y/theta drift from re-observed mapped objects
-    landmark_gain: 0.8                     # 위치 보정 게인↑: 1280 광각 맵이 cm급 정밀 → 절대위치로 드리프트 강하게 상쇄
-    landmark_theta_gain: 0.7               # HEADING authority for a confident landmark fix (x conf) — 랜드마크=절대 heading
+    use_object_landmarks: true            # correct x/y drift from re-observed mapped objects; theta stays IMU-only
+    landmark_gain: 0.5                     # 위치 보정만 중간 강도로 사용
+    landmark_theta_gain: 0.0               # HEADING은 IMU만 사용하고 landmark heading 보정은 끔
     landmark_max_step_m: 0.2               # 한 번에 허용하는 위치 보정폭↑(드리프트 즉시 회수)
-    landmark_max_step_rad: 0.5             # allow a confident heading fix to correct promptly (still clamped)
+    landmark_max_step_rad: 0.0             # landmark가 heading을 바꾸지 못하게 함
     broadcast_tf: true
     use_wheel_odom: false             # 엔코더 기반 위치/회전 보정 사용 안 함
     # OBJECT-FLOW = 주(主) 회전 소스: 광각 물체점 프레임간 매칭(world_model). LK 옵티컬플로는 진동을
@@ -48,11 +48,11 @@ localizer_node:
     freeze_pose_when_stationary: true
     wall_anchor_gain: 0.50
     wall_anchor_max_step_m: 0.03
-    wall_anchor_max_step_rad: 0.03
+    wall_anchor_max_step_rad: 0.0          # 벽 anchor는 위치만 보정, heading은 IMU만 사용
     wall_anchor_deadband_m: 0.005
     wall_field_gain: 0.35
     wall_field_max_step_m: 0.05
-    wall_field_max_step_rad: 0.04
+    wall_field_max_step_rad: 0.0           # 벽 field 보정은 heading을 바꾸지 않음
     wall_field_deadband_m: 0.005
     wall_correction_stale_sec: 1.5
     use_imu_heading: true                 # IMU heading 보정 ON: 벽 보정 OFF 조건 비교 테스트
@@ -163,7 +163,7 @@ world_model_node:
     forget_after_sec: 120.0               # persist the whole-field map (static objects)
     # 7x6 경기장 격자 prior. 실제 field 원점/축 검증 전에는 false로 두고 테스트 때만 켠다.
     # 실행 중: ros2 param set /world_model_node grid_prior_enabled true|false
-    grid_prior_enabled: false
+    grid_prior_enabled: true
     grid_prior_debug: true
     grid_rows: 6
     grid_cols: 7
@@ -175,10 +175,20 @@ world_model_node:
     grid_new_snap_radius_m: 0.12
     grid_initial_snap_alpha: 0.80
     grid_new_snap_alpha: 0.45
+    grid_anchor_snap_radius_m: 0.22
+    grid_anchor_snap_alpha: 0.90
+    grid_anchor_pose_radius_m: 0.35
+    grid_track_lock_enabled: true         # 주행 테스트 중 확인된 물체 track을 격자점에 고정한다.
+    grid_track_lock_radius_m: 0.26
+    grid_track_lock_alpha: 1.0
+    zone_anchor_xy: [-0.75, 0.75, -0.75, -1.0, 0.75, -1.0, 0.75, 0.75]
     grid_moved_threshold_m: 0.22
     # 위치 vs 분류 분리 + 음의 증거(FOV 안인데 미검출 시 지속 감점 → 팬텀/집어간 물체 정리)
     class_conf_threshold: 0.85            # 광각 IDENTITY 커트라인(높게): 이 이상만 클래스 투표(광각=위치 위주)
     class_conf_threshold_body: 0.50       # 본체=신원 권위자라 낮은 바에서도 투표(0.6~0.8 octa/icosa도 자기 정체성 확립→과병합 방지)
+    fruit_cube_sticky_enabled: true       # fruit_photo_cube가 한 번 확실히 보이면 shape vote에 눌리지 않게 Set2로 고정
+    fruit_cube_sticky_conf_wide: 0.75
+    fruit_cube_sticky_conf_body: 0.50
     # 카메라 커버 도형(base_link): 본체=부채꼴, 광각=전방 타원 (음의증거 판정 + 맵 표시 공용)
     body_fov_half_deg: 30.0               # 실측 footprint 반각 ~30°
     body_fov_near_m: 0.25                # 이미지 하단이 지면 0.29m → 그보다 가까우면 못 봄
@@ -229,12 +239,13 @@ target_selector_node:
     set1_base: 20.0                       # Set1 outranks Set2 (approach bias; order enforced by FSM phase)
     set2_base: 10.0
     zone_filter_enabled: true             # FSM의 /planning/zone에 맞춰 선택 후보를 현재 2x2 구역으로 제한
-    zone_bounds_m: [-2.0, 0.1, -0.1, 2.0,  -2.0, 0.1, -2.0, 0.1,  -0.1, 2.0, -2.0, 0.1,  -0.1, 2.0, -0.1, 2.0]
+    zone_bounds_m: [-2.0, 0.1, -0.25, 2.0,  -2.0, 0.1, -2.0, -0.25,  -0.1, 2.0, -2.0, -0.25,  -0.1, 2.0, -0.25, 2.0]
 
 mission_fsm_node:
   ros__parameters:
     set1_label: "dodecahedron"            # today's Set1 shape target (정십이면체) — 4 placed
     set2_label: "orange"                  # today's Set2 fruit target — 2 placed
+    start_phase: 1
     conf_threshold: 0.7
     pick_track_conf: 0.5                   # 타겟 트랙 정체성 신뢰 하한(게이트=프레임전역 아닌 트랙기반)
     approach_dist_m: 0.375                 # 집기 전 ALIGN 전환 거리: 37.5cm
@@ -243,6 +254,7 @@ mission_fsm_node:
     pick_duration_sec: 9.0                # 물체를 쥐고 어깨가 올라간 뒤 바로 다음 주행 시작
     shape_target_total: 4                 # 정십이면체 4개
     fruit_target_total: 0                 # 오렌지 큐브 무시: 정십이면체만 집기
+    set2_require_fruit_label: true
     grab_x: 0.19                          # 집기점 전방(m). 0.21에서 2cm 더 가까이 잡도록 조정
     grab_min_x: 0.17                      # 이보다 더 가까이 밀지 않음(전진 안전한계)
     storage_x: 1.6                        # 보관함 위치 field xy (좌측하단 구석 안쪽). 실제 빈 위치로 조정
@@ -300,12 +312,21 @@ mission_fsm_node:
     approach_lost_grace_sec: 2.5          # 타겟 순간 사라져도 이 시간은 유지(튀는 재선택 방지)
     approach_standoff_tol: 0.09
     classify_standoff_sec: 2.0            # set2: stand-off서 SigLIP이 과일 타입 정할 때까지 대기(정렬 전). 오렌지 아니면 스킵
-    # 2x2m 구역 미션: 중앙 십자가 경계는 10cm씩 중첩해 맵 오차로 경계 물체를 놓치지 않게 한다.
+    opportunistic_set2_enabled: true
+    opportunistic_set2_max_picks: 2
+    opportunistic_set2_max_dist_m: 0.70
+    opportunistic_set2_min_conf: 0.75
+    opportunistic_set2_min_nobs: 3
+    # 격자 기준 구역 미션: x=0 가운데 열만 ±10cm 중첩, y는 -0.25m 격자 사이에서 중첩 없이 분리한다.
     zone_mission_enabled: true
     zone_order: [1, 2, 3, 4]
-    zone_bounds_m: [-2.0, 0.1, -0.1, 2.0,  -2.0, 0.1, -2.0, 0.1,  -0.1, 2.0, -2.0, 0.1,  -0.1, 2.0, -0.1, 2.0]
+    zone_bounds_m: [-2.0, 0.1, -0.25, 2.0,  -2.0, 0.1, -2.0, -0.25,  -0.1, 2.0, -2.0, -0.25,  -0.1, 2.0, -0.25, 2.0]
+    zone_anchor_xy: [-0.75, 0.75, -0.75, -1.0, 0.75, -1.0, 0.75, 0.75]
     zone_no_target_advance_sec: 6.0
     zone_center_reach_tol_m: 0.25
+    zone_stabilize_enabled: true
+    zone_stabilize_sec: 3.0
+    zone_stabilize_require_fresh_seen: true
     # 집기 전방거리를 초음파로 직접 맞춤(본체캠 투영오차 없음). grab_range_m는 센서 연결 후 캘리브 필수:
     # 큐브를 집기점에 두고 /ultrasonic/range 읽은 값. 없으면 자동으로 본체캠 x로 폴백.
     use_sonar_align: false                # 초음파가 낮은 큐브를 가까이서 못 봄(빔이 위로 지나감, inf) → 본체캠 정렬
@@ -418,14 +439,17 @@ recognition_viz_node:
     training_interval_sec: 1.5            # 저장 주기(초). 검출 있는 프레임만 저장
     trail_max_points: 2000
     redraw_rate_hz: 5.0
+    simple_object_labels: true            # true면 맵 물체 라벨을 이름만 간단히 표시
     show_object_grid_points: true
     grid_rows: 6
     grid_cols: 7
     grid_spacing_m: 0.50
     grid_origin_x_m: -1.50                # world_model_node grid prior와 같은 기준
     grid_origin_y_m: -1.50
-    show_zone_regions: true               # FSM이 쓰는 2x2m 구역을 라이브 맵에 사각형으로 표시
-    zone_bounds_m: [-2.0, 0.1, -0.1, 2.0,  -2.0, 0.1, -2.0, 0.1,  -0.1, 2.0, -2.0, 0.1,  -0.1, 2.0, -0.1, 2.0]
+    show_zone_regions: true               # FSM이 쓰는 격자 기준 구역을 라이브 맵에 사각형으로 표시
+    zone_bounds_m: [-2.0, 0.1, -0.25, 2.0,  -2.0, 0.1, -2.0, -0.25,  -0.1, 2.0, -2.0, -0.25,  -0.1, 2.0, -0.25, 2.0]
+    show_zone_anchors: true
+    zone_anchor_xy: [-0.75, 0.75, -0.75, -1.0, 0.75, -1.0, 0.75, 0.75]
     # 맵 FOV 표시(world_model 과 동일값): 본체=부채꼴, 광각=전방 타원
     body_fov_half_deg: 30.0
     body_fov_near_m: 0.25
