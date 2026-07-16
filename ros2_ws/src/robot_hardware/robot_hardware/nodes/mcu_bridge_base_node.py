@@ -23,7 +23,6 @@ import rclpy
 import serial
 from rcl_interfaces.msg import SetParametersResult
 from rclpy.node import Node
-from sensor_msgs.msg import Range
 from std_msgs.msg import Float32MultiArray
 
 
@@ -68,7 +67,6 @@ class McuBridgeBaseNode(Node):
             Float32MultiArray, "/arm2r/target", self.on_arm_target, 10
         )
         self.pub_odom = self.create_publisher(Float32MultiArray, "/base/wheel_odom", 10)
-        self.pub_range = self.create_publisher(Range, "/ultrasonic/range", 10)   # front HC-SR04
 
         self._open_serial()
         self.read_thread = threading.Thread(target=self._read_loop, daemon=True)
@@ -211,22 +209,6 @@ class McuBridgeBaseNode(Node):
 
     def _handle_line(self, line: str) -> None:
         if not line.endswith(">"):
-            return
-        # <US,cm> front HC-SR04 (cm; -1 = no echo / beyond range) -> sensor_msgs/Range (metres).
-        if line.startswith("<US,"):
-            try:
-                cm = int(line[4:-1])
-            except ValueError:
-                return
-            r = Range()
-            r.header.stamp = self.get_clock().now().to_msg()
-            r.header.frame_id = "ultrasonic_front"
-            r.radiation_type = Range.ULTRASOUND
-            r.field_of_view = 0.26           # ~15 deg HC-SR04 beam
-            r.min_range = 0.02
-            r.max_range = 2.0
-            r.range = float("inf") if cm < 0 else cm / 100.0
-            self.pub_range.publish(r)
             return
         # <ODOM,fl,fr,rl,rr,t_ms> is encoder measurement. <HB,...> is command echo.
         if line.startswith("<ODOM,"):

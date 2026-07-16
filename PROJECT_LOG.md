@@ -26,10 +26,10 @@
 
 ## 2. 현재 상태 (Snapshot — 이 섹션만 최신값으로 덮어쓰기)
 
-- **현재 버전:** `v1.4.0`
-- **최종 업데이트:** 2026-07-15 23:43 (KST)
+- **현재 버전:** `v1.5.0`
+- **최종 업데이트:** 2026-07-17 06:55 (KST)
 - **최종 작업자:** `@AI`
-- **한 줄 요약:** Set2 FruitSlot 기반 과일 큐브 처리, grid-locked 슬롯, 회피 장애물 공유, body-lost 재시도 복구를 메인 경기 흐름에 통합했다.
+- **한 줄 요약:** 경기 실주행 중 위치추정 흔들림을 줄이기 위해 엔코더 기반 motion constraint, 벽 보정 안전 모드, opening mapping gate, 회피/정렬 튜닝을 통합했다.
 
 ---
 
@@ -124,12 +124,56 @@
 - [ ] `/planning/obstacles` 공유 후 물체 사이 APPROACH에서 좌우 떨림과 멈춤이 줄었는지 실주행으로 확인 — `@insik`
 - [ ] body lost 후 같은 슬롯 재접근과 `align_retry_heading_timeout_sec`가 PICK 성공률을 높이는지 decisions 로그로 확인 — `@insik`
 - [ ] checkpoint/anchor waypoint 테스트 경로와 실제 메인 경기 zone 순회 경로를 비교해 유지할 테스트 route를 확정 — `@AI`
+- [ ] 새 wall segmentation 라벨은 벽면 전체 또는 floor-side edge 기준으로 다시 정하고, raw 주황선과 파란 base_link 상대거리가 맞는지 먼저 검증 — `@insik`
+- [ ] 벽 보정 gain을 다시 켜기 전 `/localization/wall_map_transform`이 0 적용 상태에서 pose drift가 사라지는지 경기장 정지/주행 테스트로 확인 — `@insik`
+- [ ] 엔코더 motion constraint 적용 후 `/localization/motion_mode`, `/localization/is_stationary`, `/base/wheel_odom`을 정지/스톨/전진/횡이동 상황에서 비교 기록 — `@insik`
+- [ ] body 카메라 저조도 원인을 `scripts/lighting_compare.py`로 exposure/gain/조명 조건별 비교 후 카메라 파라미터를 확정 — `@insik`
+- [ ] parking 테스트 패키지(`robot_parking_test`)를 실제 arrival 표식 촬영 데이터와 연결해 독립 검증할지 결정 — `@AI`
 
 ---
 
 ## 5. 변경 이력 (Changelog) — ⛔ 삭제 금지 / 최신 항목이 맨 위
 
 <!-- 새 엔트리는 바로 이 줄 아래에 추가하세요. 기존 엔트리는 건드리지 마세요. -->
+
+### `v1.5.0` — 2026-07-17 06:55 (KST) · 작업자: `@AI` · ID: `2026-07-17-01`
+- **변경 요약:** 경기 실주행 중 pose drift와 벽 raw 오차 문제를 격리하고, 엔코더 기반 motion constraint와 메인 경기 안정화 튜닝을 통합했다.
+- **상세:**
+  - localizer에 엔코더 실제 움직임 기반 motion mode 분류를 추가해, command만 나가고 로봇이 물리적으로 멈춘 상황에서 object-flow/visual 보정이 pose를 계속 미는 문제를 줄였다.
+  - `/localization/motion_mode`, `/localization/is_stationary`, `/localization/wall_map_transform` 등 위치추정 진단 토픽을 유지해 정지/스톨/전진/횡이동 상태를 분리해서 볼 수 있게 했다.
+  - wall field correction은 현재 raw 주황선과 base_link 상대거리가 틀어지는 현상이 확인되어, 새 wall 모델/라벨 검증 전까지 pose 적용 gain과 step을 0으로 두는 안전 모드로 전환했다.
+  - wall segmentation은 계속 실행·표시하되 pose를 끌지 못하게 해, 경기 진행 중 벽 raw 오류가 파란 로봇 pose와 물체/슬롯 맵 전체를 밀어내는 현상을 차단했다.
+  - opening 이동 후 mapping gate를 유지해, 개막 전진/횡이동/회전과 4초 settle 전에는 world_model 물체/slot birth가 바로 생기지 않도록 했다.
+  - 초음파 기반 align/hard stop 의존을 제거하고, body camera/월드모델 기반 접근·정렬 흐름으로 정리했다.
+  - APPROACH 중 `/base_command` 주도권을 `go_to_goal_node`로 정리하고, 회피 상황에서는 회전 대신 횡이동 중심으로 피하도록 `go_to_goal_node` 회피 로직과 튜닝을 조정했다.
+  - Set1/Set2 ALIGN에서 body lost 시 backoff 대신 10도 내외 yaw scan으로 목표를 다시 찾도록 하고, slot retry/track 없는 slot 처리 기준을 보수적으로 다듬었다.
+  - base controller에 일반/개막/ALIGN 구동별 wheel minimum과 boost 튜닝을 분리해, opening 속도와 일반 주행/회피/정렬 속도를 독립적으로 조정할 수 있게 했다.
+  - SigLIP fruit prompt pooling, body 카메라 조명 비교 스크립트, camera CSI 캡처 튜닝을 추가해 과일 큐브 오인식과 body 화면 저조도 문제를 진단할 수 있게 했다.
+  - 독립 arrival parking 검증용 `robot_parking_test` 패키지와 웹/테스트 스캐폴딩을 추가했다.
+  - YAML 파싱, `git diff --check`, 관련 Python 모듈 compile/build 테스트로 주요 정적 검증을 수행했다.
+- **변경 파일:**
+  - `firmware/base_arm_combined/base_arm_combined.ino` / 수정
+  - `ros2_ws/src/robot_bringup/config/motion_tuning.yaml` / 수정
+  - `ros2_ws/src/robot_bringup/config/perception.yaml` / 수정
+  - `ros2_ws/src/robot_bringup/config/test_field.yaml` / 수정
+  - `ros2_ws/src/robot_bringup/launch/cameras.launch.py` / 수정
+  - `ros2_ws/src/robot_control/robot_control/nodes/base_controller_node.py` / 수정
+  - `ros2_ws/src/robot_control/robot_control/nodes/go_to_goal_node.py` / 수정
+  - `ros2_ws/src/robot_control/robot_control/nodes/pick_sequencer_node.py` / 수정
+  - `ros2_ws/src/robot_hardware/robot_hardware/nodes/camera_csi_node.py` / 수정
+  - `ros2_ws/src/robot_hardware/robot_hardware/nodes/mcu_bridge_base_node.py` / 수정
+  - `ros2_ws/src/robot_perception/robot_perception/nodes/localizer_node.py` / 수정
+  - `ros2_ws/src/robot_perception/robot_perception/nodes/siglip_gate_node.py` / 수정
+  - `ros2_ws/src/robot_perception/robot_perception/nodes/wall_localizer_node.py` / 수정
+  - `ros2_ws/src/robot_perception/robot_perception/nodes/world_model_node.py` / 수정
+  - `ros2_ws/src/robot_planning/robot_planning/nodes/mission_fsm_node.py` / 수정
+  - `scripts/csi_capture.py` / 수정
+  - `scripts/lighting_compare.py` / 신규
+  - `ros2_ws/scripts/lighting_compare.py` / 신규
+  - `ros2_ws/src/robot_parking_test/` / 신규
+  - `PROJECT_LOG.md` / 수정
+- **다음 할 일 반영:** wall segmentation 라벨/상대거리 재검증, wall gain 0 상태 pose drift 확인, 엔코더 motion mode 실측, body 카메라 저조도 비교, parking 테스트 패키지 활용 여부 확인 TODO를 추가했다.
+- **버전 근거:** 위치추정 motion constraint, 벽 보정 안전 모드, 회피/정렬/구동 튜닝, 조명 진단 스크립트, parking 테스트 패키지 등 메인 경기 안정화를 위한 기능 추가와 구조적 튜닝이 포함되어 `MINOR` 버전 증가로 `v1.5.0`으로 올렸다.
 
 ### `v1.4.0` — 2026-07-15 23:43 (KST) · 작업자: `@AI` · ID: `2026-07-15-02`
 - **변경 요약:** Set2 과일 큐브를 FruitSlot/grid 기반으로 안정화하고, 회피·재접근·시각화·테스트 경로를 경기 실행 흐름에 통합했다.

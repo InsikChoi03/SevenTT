@@ -28,10 +28,32 @@ DEFAULT_WB_GAINS = camera_config.WB_GAINS[camera_config.BODY]
 _UNSET = object()
 
 
-def make_pipeline(sensor_id, sensor_mode=3, width=1640, height=1232, fps=30, flip=0, wbmode=8):
+def _nvargus_source_props(exposuretimerange="", gainrange="", aelock=False, awblock=False,
+                          nvargus_extra=""):
+    props = []
+    if exposuretimerange:
+        props.append(f'exposuretimerange="{exposuretimerange}"')
+    if gainrange:
+        props.append(f'gainrange="{gainrange}"')
+    if aelock:
+        props.append("aelock=true")
+    if awblock:
+        props.append("awblock=true")
+    if nvargus_extra:
+        props.append(nvargus_extra.strip())
+    return (" " + " ".join(props)) if props else ""
+
+
+def make_pipeline(sensor_id, sensor_mode=3, width=1640, height=1232, fps=30, flip=0, wbmode=8,
+                  exposuretimerange="", gainrange="", aelock=False, awblock=False,
+                  nvargus_extra=""):
     # wbmode 8=shade — 본체 cam에서 R/B가 가장 덜 튀는 모드 (나머지 잔차는 wb_gains가 처리).
+    source_props = _nvargus_source_props(
+        exposuretimerange, gainrange, aelock, awblock, nvargus_extra
+    )
     return (
-        f"nvarguscamerasrc sensor-id={sensor_id} sensor-mode={sensor_mode} wbmode={wbmode} "
+        f"nvarguscamerasrc sensor-id={sensor_id} sensor-mode={sensor_mode} wbmode={wbmode}"
+        f"{source_props} "
         f"! video/x-raw(memory:NVMM), width={width}, height={height}, framerate={fps}/1, format=NV12 "
         f"! nvvidconv flip-method={flip} ! video/x-raw, format=BGRx ! videoconvert "
         f"! video/x-raw, format=BGR ! appsink name=sink emit-signals=false max-buffers=1 drop=true sync=false"

@@ -7,7 +7,7 @@ pick_verify). Replaces the old arm_ik / 6-DOF path (arm_controller_node + mcu_br
 does not match the physical 2R arm. Each step is host-ramped so the main field launch shows the
 same stage order and does not drop the gripper too quickly.
 
-    trigger True  -> GRASP: reach to PICK pose (open) -> close -> lift while holding
+    trigger True  -> GRASP: open gripper at stow -> reach to PICK pose (open) -> close -> lift while holding
                      -> move to PLACE while holding -> open at PLACE -> stow closed.
     trigger False -> RELEASE: move to PLACE while holding -> open at PLACE -> stow closed.
 
@@ -33,6 +33,7 @@ class PickSequencerNode(Node):
         self.declare_parameter("grip_closed", 50.0)
         self.declare_parameter("move_sec", 2.5)     # dwell for an arm move (>= firmware smooth time)
         self.declare_parameter("grasp_sec", 0.7)    # dwell for a gripper open/close
+        self.declare_parameter("preopen_sec", 0.25)  # open gripper before lowering so it won't snag
         self.declare_parameter("rate_hz", 20.0)
 
         self.init_pose = [float(v) for v in self.get_parameter("init_pose").value]
@@ -45,6 +46,7 @@ class PickSequencerNode(Node):
         self.stow_pose = (self.place_sw[0], self.place_sw[1], self.grip_closed)
         self.move_sec = float(self.get_parameter("move_sec").value)
         self.grasp_sec = float(self.get_parameter("grasp_sec").value)
+        self.preopen_sec = float(self.get_parameter("preopen_sec").value)
         rate = float(self.get_parameter("rate_hz").value)
 
         self.pub = self.create_publisher(Float32MultiArray, "/arm2r/target", 10)
@@ -69,7 +71,7 @@ class PickSequencerNode(Node):
         self.get_logger().info(
             f"pick_sequencer(2R) ready: init={self.init_pose} pick={self.pick_sw} "
             f"place={self.place_sw} grip(open={self.grip_open}/closed={self.grip_closed}) "
-            f"move={self.move_sec}s grasp={self.grasp_sec}s -> /arm2r/target"
+            f"move={self.move_sec}s grasp={self.grasp_sec}s preopen={self.preopen_sec}s -> /arm2r/target"
         )
 
     def _now_s(self) -> float:
@@ -113,6 +115,7 @@ class PickSequencerNode(Node):
         ish, iwr, _ig = self.init_pose
         plsh, plwr = self.place_sw
         self.seq = [
+            ("PREOPEN",  self.preopen_sec, (ish, iwr, self.grip_open)),      # open before lowering
             ("REACH",    self.move_sec,  (psh, pwr, self.grip_open)),      # down to pick pose, open
             ("GRASP",    self.grasp_sec, (psh, pwr, self.grip_closed)),    # close (grab)
             ("LIFT",     self.move_sec,  (ish, iwr, self.grip_closed)),    # lift to init, holding

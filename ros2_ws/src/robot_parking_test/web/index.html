@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Arrival Parking Test</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <section class="topbar">
+        <div>
+          <h1>Arrival Parking Test</h1>
+          <p id="state-line">waiting for state...</p>
+        </div>
+        <div class="status">
+          <span id="fsm" class="pill">IDLE</span>
+          <span id="fresh" class="pill muted">freshness</span>
+        </div>
+      </section>
+
+      <section class="grid">
+        <article class="panel">
+          <header>Wide Camera</header>
+          <img id="wide" data-stream="/wide.mjpg" alt="wide camera stream" />
+        </article>
+        <article class="panel">
+          <header>Body Camera</header>
+          <img id="body" data-stream="/body.mjpg" alt="body camera stream" />
+        </article>
+      </section>
+
+      <section class="metrics">
+        <div><span>vx</span><strong id="vx">0.000</strong></div>
+        <div><span>vy</span><strong id="vy">0.000</strong></div>
+        <div><span>omega</span><strong id="omega">0.000</strong></div>
+        <div><span>pos err</span><strong id="pos">0.000</strong></div>
+        <div><span>yaw err</span><strong id="yaw">0.0 deg</strong></div>
+        <div><span>pair score</span><strong id="score">0.000</strong></div>
+      </section>
+
+      <section class="warn">
+        No rear distance sensor is available. Keep physical access to abort power.
+      </section>
+    </main>
+    <script src="/app.js"></script>
+  </body>
+</html>

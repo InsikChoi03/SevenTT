@@ -37,7 +37,7 @@ from geometry_msgs.msg import PoseStamped, Vector3
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import Image, Imu
-from std_msgs.msg import Bool, Float32MultiArray
+from std_msgs.msg import Bool, Float32MultiArray, String
 
 # tf2 broadcasting is optional: guard the import so the node runs without tf2_ros.
 try:
@@ -110,6 +110,32 @@ class LocalizerNode(Node):
         self.declare_parameter("wheel_odom_enabled_wheels", [True, True, True, True])
         self.declare_parameter("wheel_odom_deadband_mps", 0.005)
         self.declare_parameter("wheel_odom_max_dt_sec", 0.4)
+        # Encoder motion constraint is deliberately separate from wheel-odom integration. It uses
+        # actual measured wheel motion to classify the current motion, with commands only as a sanity
+        # check. It never integrates encoder distance into x/y/theta while use_wheel_odom is false.
+        self.declare_parameter("encoder_motion_constraint_enabled", False)
+        self.declare_parameter("encoder_motion_constraint_publish_debug", True)
+        self.declare_parameter("encoder_constraint_cmd_stale_sec", 0.30)
+        self.declare_parameter("encoder_constraint_odom_stale_sec", 0.40)
+        self.declare_parameter("encoder_constraint_linear_eps_mps", 0.025)
+        self.declare_parameter("encoder_constraint_angular_eps_rps", 0.12)
+        self.declare_parameter("encoder_constraint_axis_ratio", 2.0)
+        self.declare_parameter("encoder_constraint_stop_translation_gain", 0.0)
+        self.declare_parameter("encoder_constraint_stop_yaw_gain", 0.05)
+        self.declare_parameter("encoder_constraint_forward_gain", 1.0)
+        self.declare_parameter("encoder_constraint_forward_lateral_gain", 0.12)
+        self.declare_parameter("encoder_constraint_forward_yaw_gain", 0.50)
+        self.declare_parameter("encoder_constraint_lateral_gain", 1.0)
+        self.declare_parameter("encoder_constraint_lateral_forward_gain", 0.12)
+        self.declare_parameter("encoder_constraint_lateral_yaw_gain", 0.50)
+        self.declare_parameter("encoder_constraint_rotate_translation_gain", 0.08)
+        self.declare_parameter("encoder_constraint_rotate_yaw_gain", 1.0)
+        self.declare_parameter("encoder_constraint_mixed_translation_gain", 0.60)
+        self.declare_parameter("encoder_constraint_mixed_yaw_gain", 0.80)
+        # Wall corrections remain an absolute drift trim even when the base is stationary. Floors
+        # prevent the motion constraint from fully discarding a confident wall-based correction.
+        self.declare_parameter("encoder_constraint_wall_translation_floor", 0.35)
+        self.declare_parameter("encoder_constraint_wall_yaw_floor", 0.35)
         self.declare_parameter("stationary_wheel_eps_mps", 0.008)
         self.declare_parameter("stationary_cmd_eps", 0.03)
         self.declare_parameter("stationary_cmd_stale_sec", 0.7)
@@ -121,14 +147,82 @@ class LocalizerNode(Node):
         self.declare_parameter("wall_anchor_max_step_rad", 0.03)
         self.declare_parameter("wall_anchor_deadband_m", 0.005)
         self.declare_parameter("wall_field_gain", 0.35)
+        self.declare_parameter("wall_field_theta_gain", 0.35)
+        self.declare_parameter("wall_field_fast_gain", 1.0)
+        self.declare_parameter("wall_field_fast_theta_gain", 1.0)
         self.declare_parameter("wall_field_max_step_m", 0.05)
+        self.declare_parameter("wall_field_fast_max_step_m", 0.12)
         self.declare_parameter("wall_field_max_step_rad", 0.04)
+        self.declare_parameter("wall_field_fast_max_step_rad", 0.0)
         self.declare_parameter("wall_field_deadband_m", 0.005)
         self.declare_parameter("wall_correction_stale_sec", 1.5)
         enabled = [bool(v) for v in self.get_parameter("wheel_odom_enabled_wheels").value]
         self.wheel_odom_enabled = enabled if len(enabled) == 4 else [True, True, True, True]
         self.wheel_odom_deadband = float(self.get_parameter("wheel_odom_deadband_mps").value)
         self.wheel_odom_max_dt = float(self.get_parameter("wheel_odom_max_dt_sec").value)
+        self.encoder_motion_constraint_enabled = bool(
+            self.get_parameter("encoder_motion_constraint_enabled").value
+        )
+        self.encoder_motion_constraint_publish_debug = bool(
+            self.get_parameter("encoder_motion_constraint_publish_debug").value
+        )
+        self.encoder_constraint_cmd_stale_sec = float(
+            self.get_parameter("encoder_constraint_cmd_stale_sec").value
+        )
+        self.encoder_constraint_odom_stale_sec = float(
+            self.get_parameter("encoder_constraint_odom_stale_sec").value
+        )
+        self.encoder_constraint_linear_eps = float(
+            self.get_parameter("encoder_constraint_linear_eps_mps").value
+        )
+        self.encoder_constraint_angular_eps = float(
+            self.get_parameter("encoder_constraint_angular_eps_rps").value
+        )
+        self.encoder_constraint_axis_ratio = max(
+            1.0, float(self.get_parameter("encoder_constraint_axis_ratio").value)
+        )
+        self.encoder_constraint_stop_translation_gain = float(
+            self.get_parameter("encoder_constraint_stop_translation_gain").value
+        )
+        self.encoder_constraint_stop_yaw_gain = float(
+            self.get_parameter("encoder_constraint_stop_yaw_gain").value
+        )
+        self.encoder_constraint_forward_gain = float(
+            self.get_parameter("encoder_constraint_forward_gain").value
+        )
+        self.encoder_constraint_forward_lateral_gain = float(
+            self.get_parameter("encoder_constraint_forward_lateral_gain").value
+        )
+        self.encoder_constraint_forward_yaw_gain = float(
+            self.get_parameter("encoder_constraint_forward_yaw_gain").value
+        )
+        self.encoder_constraint_lateral_gain = float(
+            self.get_parameter("encoder_constraint_lateral_gain").value
+        )
+        self.encoder_constraint_lateral_forward_gain = float(
+            self.get_parameter("encoder_constraint_lateral_forward_gain").value
+        )
+        self.encoder_constraint_lateral_yaw_gain = float(
+            self.get_parameter("encoder_constraint_lateral_yaw_gain").value
+        )
+        self.encoder_constraint_rotate_translation_gain = float(
+            self.get_parameter("encoder_constraint_rotate_translation_gain").value
+        )
+        self.encoder_constraint_rotate_yaw_gain = float(
+            self.get_parameter("encoder_constraint_rotate_yaw_gain").value
+        )
+        self.encoder_constraint_mixed_translation_gain = float(
+            self.get_parameter("encoder_constraint_mixed_translation_gain").value
+        )
+        self.encoder_constraint_mixed_yaw_gain = float(
+            self.get_parameter("encoder_constraint_mixed_yaw_gain").value
+        )
+        self.encoder_constraint_wall_translation_floor = float(
+            self.get_parameter("encoder_constraint_wall_translation_floor").value
+        )
+        self.encoder_constraint_wall_yaw_floor = float(
+            self.get_parameter("encoder_constraint_wall_yaw_floor").value
+        )
         self.stationary_wheel_eps = float(self.get_parameter("stationary_wheel_eps_mps").value)
         self.stationary_cmd_eps = float(self.get_parameter("stationary_cmd_eps").value)
         self.stationary_cmd_stale_sec = float(self.get_parameter("stationary_cmd_stale_sec").value)
@@ -145,8 +239,19 @@ class LocalizerNode(Node):
         self.wall_anchor_max_step_rad = float(self.get_parameter("wall_anchor_max_step_rad").value)
         self.wall_anchor_deadband_m = float(self.get_parameter("wall_anchor_deadband_m").value)
         self.wall_field_gain = float(self.get_parameter("wall_field_gain").value)
+        self.wall_field_theta_gain = float(self.get_parameter("wall_field_theta_gain").value)
+        self.wall_field_fast_gain = float(self.get_parameter("wall_field_fast_gain").value)
+        self.wall_field_fast_theta_gain = float(
+            self.get_parameter("wall_field_fast_theta_gain").value
+        )
         self.wall_field_max_step_m = float(self.get_parameter("wall_field_max_step_m").value)
+        self.wall_field_fast_max_step_m = float(
+            self.get_parameter("wall_field_fast_max_step_m").value
+        )
         self.wall_field_max_step_rad = float(self.get_parameter("wall_field_max_step_rad").value)
+        self.wall_field_fast_max_step_rad = float(
+            self.get_parameter("wall_field_fast_max_step_rad").value
+        )
         self.wall_field_deadband_m = float(self.get_parameter("wall_field_deadband_m").value)
         self.wall_correction_stale_sec = float(
             self.get_parameter("wall_correction_stale_sec").value
@@ -215,6 +320,7 @@ class LocalizerNode(Node):
         self.imu_gyro_deadband = float(self.get_parameter("imu_gyro_deadband_rad").value)
         self.last_imu_time = None
         self.last_wall_correction_time = None
+        self.wall_fast_correction = False
 
         self.fx = float(self.get_parameter("top_fx").value)
         self.fy = float(self.get_parameter("top_fy").value)
@@ -245,6 +351,8 @@ class LocalizerNode(Node):
         self.last_odom_time: Optional[float] = None  # wall-clock seconds of last wheel msg
         self.last_wheel_cmd_time: Optional[float] = None
         self.last_wheel_cmd = [0.0, 0.0, 0.0, 0.0]
+        self.last_wheel_cmd_body: Optional[np.ndarray] = None
+        self.last_wheel_odom_body: Optional[np.ndarray] = None
         self.stationary_since: Optional[float] = None
         self.is_stationary = False
 
@@ -260,7 +368,7 @@ class LocalizerNode(Node):
         elif self.broadcast_tf and not TF2_AVAILABLE:
             self.get_logger().error("broadcast_tf requested but tf2_ros unavailable; tf disabled")
 
-        if self.use_wheel_odom:
+        if self.use_wheel_odom or self.encoder_motion_constraint_enabled:
             self.create_subscription(Float32MultiArray, "/base/wheel_odom", self.on_wheel_odom, 10)
         self.create_subscription(Float32MultiArray, "/base/wheel_speeds", self.on_wheel_cmd, 10)
         if self.use_imu:
@@ -277,10 +385,14 @@ class LocalizerNode(Node):
             Float32MultiArray, "/localization/wall_field_correction", self.on_wall_field_correction, 10
         )
         self.create_subscription(
+            Bool, "/localization/wall_fast_correction", self.on_wall_fast_correction, 10
+        )
+        self.create_subscription(
             Float32MultiArray, "/localization/object_odom", self.on_object_odom, 10
         )
         self.pub = self.create_publisher(PoseStamped, "/localization/pose", 10)
         self.pub_stationary = self.create_publisher(Bool, "/localization/is_stationary", 10)
+        self.pub_motion_mode = self.create_publisher(String, "/localization/motion_mode", 10)
         self.pub_wall_map_transform = self.create_publisher(
             Float32MultiArray, "/localization/wall_map_transform", 10
         )
@@ -291,6 +403,7 @@ class LocalizerNode(Node):
             f"lx={self.lx} ly={self.ly} vo={self.use_vo} landmark={self.use_landmark_correction} "
             f"obj_landmarks={self.use_object_landmarks} tf={self.tf_broadcaster is not None} "
             f"wheel_odom_enabled={self.wheel_odom_enabled} "
+            f"encoder_constraint={self.encoder_motion_constraint_enabled} "
             f"intrinsics={'set' if self.have_intrinsics else 'unset'} "
             f"fisheye={self.use_fisheye} rate={rate}Hz"
         )
@@ -300,16 +413,22 @@ class LocalizerNode(Node):
         if len(msg.data) >= 4:
             now = self.get_clock().now().nanoseconds * 1e-9
             self.last_wheel_cmd = [float(v) for v in msg.data[:4]]
+            self.last_wheel_cmd_body = self._wheel_body_velocity(
+                np.asarray(self.last_wheel_cmd, dtype=np.float64), measured=False
+            )
             self.last_wheel_cmd_time = now
             odom_stale = (
                 self.last_odom_time is None
                 or (now - self.last_odom_time) > self.stationary_cmd_stale_sec
             )
             if odom_stale:
-                self._update_stationary(now, np.zeros(4, dtype=np.float64))
+                if self._command_active(now):
+                    self._mark_not_stationary()
+                else:
+                    self._update_stationary(now, np.zeros(4, dtype=np.float64))
 
     def on_wheel_odom(self, msg: Float32MultiArray) -> None:
-        """Integrate mecanum dead reckoning in the field frame."""
+        """Record encoder motion, optionally integrating it only when wheel odom is enabled."""
         if len(msg.data) < 4:
             self.get_logger().warn(
                 f"wheel_odom expected 4 values, got {len(msg.data)}", throttle_duration_sec=5.0
@@ -321,6 +440,9 @@ class LocalizerNode(Node):
         if self.wheel_odom_deadband > 0.0:
             wheels[np.abs(wheels) < self.wheel_odom_deadband] = 0.0
         self._update_stationary(now, wheels)
+        if int(self._wheel_mask.sum()) < 3:
+            return
+        self.last_wheel_odom_body = self._wheel_body_velocity(wheels, measured=True)
         if self.last_odom_time is None:
             # First sample only establishes a timestamp; no integration yet.
             self.last_odom_time = now
@@ -331,13 +453,14 @@ class LocalizerNode(Node):
         dt = max(0.0, min(self.wheel_odom_max_dt, dt))
         if dt <= 0.0:
             return
-
-        if int(self._wheel_mask.sum()) < 3:
+        # When encoder odometry is disabled the encoder message is still intentionally consumed for
+        # the motion constraint above, but it contributes no position integration here.
+        if not self.use_wheel_odom:
             return
 
         # Mecanum forward kinematics. With all 4 wheels this is the exact inverse of
         # base_controller IK; with one disabled encoder it becomes a 3-equation least-squares solve.
-        vx, vy, w = np.linalg.lstsq(self._wheel_rows, wheels[self._wheel_mask], rcond=None)[0]
+        vx, vy, w = self.last_wheel_odom_body
 
         # Body velocity -> field velocity using the current heading.
         ct, st = math.cos(self.theta), math.sin(self.theta)
@@ -367,21 +490,151 @@ class LocalizerNode(Node):
                                          or (now - self.last_vo_time) > self.vo_stale_sec):
             self.theta = wrap_angle(self.theta + w * dt)
 
+    def _wheel_body_velocity(self, wheels: np.ndarray, *, measured: bool) -> np.ndarray:
+        """Solve mecanum body velocity from commanded or measured wheel linear speeds."""
+        rows = self._wheel_rows if measured else self._wheel_rows_all
+        values = wheels[self._wheel_mask] if measured else wheels
+        return np.linalg.lstsq(rows, values, rcond=None)[0]
+
+    def _classify_motion(self, body: np.ndarray) -> str:
+        """Classify a body velocity as STOP/FORWARD/LATERAL/ROTATE/MIXED."""
+        vx, vy, wz = (float(v) for v in body)
+        linear = math.hypot(vx, vy)
+        angular_tangent = abs(wz) * self.k
+        if linear < self.encoder_constraint_linear_eps and abs(wz) < self.encoder_constraint_angular_eps:
+            return "STOP"
+        if angular_tangent >= self.encoder_constraint_axis_ratio * max(linear, 1e-6):
+            return "ROTATE"
+        if abs(vx) >= self.encoder_constraint_axis_ratio * max(abs(vy), 1e-6):
+            return "FORWARD"
+        if abs(vy) >= self.encoder_constraint_axis_ratio * max(abs(vx), 1e-6):
+            return "LATERAL"
+        return "MIXED"
+
+    def _motion_vectors_agree(self, command: np.ndarray, measured: np.ndarray) -> bool:
+        """Return true only when command and encoder motion point in the same body direction."""
+        cmd = np.array([command[0], command[1], command[2] * self.k], dtype=np.float64)
+        odom = np.array([measured[0], measured[1], measured[2] * self.k], dtype=np.float64)
+        cmd_norm = float(np.linalg.norm(cmd))
+        odom_norm = float(np.linalg.norm(odom))
+        if cmd_norm < 1e-6 or odom_norm < 1e-6:
+            return cmd_norm < 1e-6 and odom_norm < 1e-6
+        return float(np.dot(cmd, odom)) > 0.0
+
+    def _motion_mode(self, now: float) -> str:
+        """Use fresh encoder motion as truth; commands alone never prove the robot moved."""
+        command = None
+        if (
+            self.last_wheel_cmd_body is not None
+            and self.last_wheel_cmd_time is not None
+            and (now - self.last_wheel_cmd_time) <= self.encoder_constraint_cmd_stale_sec
+        ):
+            command = self.last_wheel_cmd_body
+        measured = None
+        if (
+            self.last_wheel_odom_body is not None
+            and self.last_odom_time is not None
+            and (now - self.last_odom_time) <= self.encoder_constraint_odom_stale_sec
+        ):
+            measured = self.last_wheel_odom_body
+
+        if command is None and measured is None:
+            return "UNKNOWN"
+        if command is None:
+            return self._classify_motion(measured)
+        if measured is None:
+            return "UNKNOWN"
+
+        command_mode = self._classify_motion(command)
+        measured_mode = self._classify_motion(measured)
+        if measured_mode == "STOP":
+            return "STOP"
+        if (
+            command_mode == measured_mode
+            and command_mode != "MIXED"
+            and self._motion_vectors_agree(command, measured)
+        ):
+            return measured_mode
+        # Command/encoder disagreement usually means slip or a stalled base. Trust the encoder so
+        # command-only lateral avoidance cannot drag the map while the chassis is physically stuck.
+        return measured_mode
+
+    @staticmethod
+    def _bounded_gain(value: float) -> float:
+        return max(0.0, min(1.0, value))
+
+    def _motion_constraint_gains(self, source: str) -> Tuple[float, float, float]:
+        """Return robot-frame forward/lateral/yaw gains for the present motion mode."""
+        if not self.encoder_motion_constraint_enabled:
+            return 1.0, 1.0, 1.0
+
+        now = self.get_clock().now().nanoseconds * 1e-9
+        mode = self._motion_mode(now)
+        if mode == "STOP":
+            forward = lateral = self.encoder_constraint_stop_translation_gain
+            yaw = self.encoder_constraint_stop_yaw_gain
+        elif mode == "FORWARD":
+            forward = self.encoder_constraint_forward_gain
+            lateral = self.encoder_constraint_forward_lateral_gain
+            yaw = self.encoder_constraint_forward_yaw_gain
+        elif mode == "LATERAL":
+            forward = self.encoder_constraint_lateral_forward_gain
+            lateral = self.encoder_constraint_lateral_gain
+            yaw = self.encoder_constraint_lateral_yaw_gain
+        elif mode == "ROTATE":
+            forward = lateral = self.encoder_constraint_rotate_translation_gain
+            yaw = self.encoder_constraint_rotate_yaw_gain
+        elif mode == "MIXED":
+            forward = lateral = self.encoder_constraint_mixed_translation_gain
+            yaw = self.encoder_constraint_mixed_yaw_gain
+        else:
+            # Missing/stale encoder is not the same as a measured stop. If a fresh drive command is
+            # active, fail open to the legacy visual/landmark behavior so the map does not freeze
+            # while the robot is physically moving. A fresh encoder sample of zero still returns STOP.
+            if self._command_active(now):
+                forward = lateral = yaw = 1.0
+            else:
+                forward = lateral = self.encoder_constraint_stop_translation_gain
+                yaw = self.encoder_constraint_stop_yaw_gain
+
+        # The wall is an independent absolute reference. Keep a limited correction path open even
+        # while the drive mode is STOP, otherwise the pose can never settle against a good wall fix.
+        if source.startswith("wall"):
+            forward = max(forward, self.encoder_constraint_wall_translation_floor)
+            lateral = max(lateral, self.encoder_constraint_wall_translation_floor)
+            yaw = max(yaw, self.encoder_constraint_wall_yaw_floor)
+        return (
+            self._bounded_gain(forward),
+            self._bounded_gain(lateral),
+            self._bounded_gain(yaw),
+        )
+
+    def _constrain_robot_delta(
+        self, dfwd: float, dleft: float, dtheta: float, source: str
+    ) -> Tuple[float, float, float]:
+        """Attenuate a robot-frame pose delta according to encoder-derived motion mode."""
+        forward_gain, lateral_gain, yaw_gain = self._motion_constraint_gains(source)
+        return dfwd * forward_gain, dleft * lateral_gain, dtheta * yaw_gain
+
+    def _constrain_world_delta(
+        self, dx: float, dy: float, dtheta: float, source: str
+    ) -> Tuple[float, float, float]:
+        """Apply the same constraint to a field-frame correction via the current robot heading."""
+        ct, st = math.cos(self.theta), math.sin(self.theta)
+        dfwd = dx * ct + dy * st
+        dleft = -dx * st + dy * ct
+        dfwd, dleft, dtheta = self._constrain_robot_delta(dfwd, dleft, dtheta, source)
+        return dfwd * ct - dleft * st, dfwd * st + dleft * ct, dtheta
+
     def _update_stationary(self, now: float, wheels: np.ndarray) -> None:
         enabled_wheels = wheels[self._wheel_mask] if int(self._wheel_mask.sum()) else wheels
         wheel_still = bool(
             enabled_wheels.size == 0
             or np.max(np.abs(enabled_wheels)) <= self.stationary_wheel_eps
         )
-        if self.last_wheel_cmd_time is None:
-            cmd_still = True
-        else:
-            cmd_stale = (now - self.last_wheel_cmd_time) > self.stationary_cmd_stale_sec
-            cmd_still = (
-                cmd_stale
-                or max(abs(v) for v in self.last_wheel_cmd) <= self.stationary_cmd_eps
-            )
-        currently_still = wheel_still and cmd_still
+        # Stationary is based on actual encoder motion. A nonzero command with zero/stale encoder
+        # means the base is stalled, so visual pose corrections should still be treated as stationary.
+        currently_still = wheel_still
         if currently_still:
             if self.stationary_since is None:
                 self.stationary_since = now
@@ -389,6 +642,18 @@ class LocalizerNode(Node):
         else:
             self.stationary_since = None
             self.is_stationary = False
+
+    def _command_active(self, now: float) -> bool:
+        if self.last_wheel_cmd_body is None or self.last_wheel_cmd_time is None:
+            return False
+        if (now - self.last_wheel_cmd_time) > self.stationary_cmd_stale_sec:
+            return False
+        vx, vy, wz = (float(v) for v in self.last_wheel_cmd_body)
+        return max(math.hypot(vx, vy), abs(wz) * self.k) > self.stationary_cmd_eps
+
+    def _mark_not_stationary(self) -> None:
+        self.stationary_since = None
+        self.is_stationary = False
 
     # --------------------------------------------------------------------- IMU heading
     def _imu_fresh(self, now: float) -> bool:
@@ -404,7 +669,8 @@ class LocalizerNode(Node):
         if self.last_imu_time is not None:
             dt = now - self.last_imu_time
             if 0.0 < dt < 0.2 and abs(wz) >= self.imu_gyro_deadband:   # deadband kills stationary walk
-                self.theta = wrap_angle(self.theta + wz * dt)
+                _, _, dtheta = self._constrain_robot_delta(0.0, 0.0, wz * dt, "imu")
+                self.theta = wrap_angle(self.theta + dtheta)
         self.last_imu_time = now
 
     # ------------------------------------------------------------- object-flow odometry
@@ -422,21 +688,18 @@ class LocalizerNode(Node):
         if conf < self.object_flow_min_conf:
             return
         now = self.get_clock().now().nanoseconds * 1e-9
-        # Object-flow remains the fast motion source even while a yellow wall is available.
-        # Wall correction is a slower absolute drift trim; it must not block live translation.
-        # If no wall correction is available, stationary suppression still protects against
-        # object-flow noise when the robot is genuinely still.
-        wall_fresh = self._wall_correction_fresh(now)
-        if self.suppress_object_flow_when_stationary and self.is_stationary and not wall_fresh:
+        if self.suppress_object_flow_when_stationary and self.is_stationary:
             self.last_objflow_time = now
             self.last_vo_time = now
             # Keep a credible rotation measurement even while translation is frozen. IMU has
             # priority when fresh, so this is only a fallback for robots without IMU data.
             if not self._imu_fresh(now) and abs(dtheta) >= self.vo_deadband:
+                _, _, dtheta = self._constrain_robot_delta(0.0, 0.0, dtheta, "object_flow")
                 self.theta = wrap_angle(self.theta + dtheta)
             return
         self.last_objflow_time = now
         self.last_vo_time = now      # object-flow owns rotation -> keep wheel-yaw AND LK-VO suppressed
+        dfwd, dleft, dtheta = self._constrain_robot_delta(dfwd, dleft, dtheta, "object_flow")
         if not self._imu_fresh(now):  # IMU gyro outranks object-flow for yaw (steadier)
             self.theta = wrap_angle(self.theta + dtheta)
         if self.object_flow_trans:
@@ -467,10 +730,16 @@ class LocalizerNode(Node):
         # is an ABSOLUTE position fix. Apply most of it (confidence-scaled) to null out odometry
         # drift rather than crawl — the wide map is the trusted ground truth for where we are.
         g_xy = self.landmark_gain * cf
-        self.x += max(-mx, min(mx, g_xy * dx))
-        self.y += max(-mx, min(mx, g_xy * dy))
+        applied_dx = max(-mx, min(mx, g_xy * dx))
+        applied_dy = max(-mx, min(mx, g_xy * dy))
         g_th = self.landmark_theta_gain * cf                        # confidence-scaled heading authority
-        self.theta = wrap_angle(self.theta + max(-mr, min(mr, g_th * dth)))
+        applied_dth = max(-mr, min(mr, g_th * dth))
+        applied_dx, applied_dy, applied_dth = self._constrain_world_delta(
+            applied_dx, applied_dy, applied_dth, "object_landmark"
+        )
+        self.x += applied_dx
+        self.y += applied_dy
+        self.theta = wrap_angle(self.theta + applied_dth)
 
     def on_wall_anchor_correction(self, msg: Float32MultiArray) -> None:
         """Pull a stationary pose back toward the initial yellow-wall anchor."""
@@ -481,11 +750,27 @@ class LocalizerNode(Node):
         if math.hypot(dx, dy) < self.wall_anchor_deadband_m and abs(dth) < math.radians(0.3):
             return
         gain = max(0.0, self.wall_anchor_gain) * conf
-        self.x -= max(-self.wall_anchor_max_step_m, min(self.wall_anchor_max_step_m, gain * dx))
-        self.y -= max(-self.wall_anchor_max_step_m, min(self.wall_anchor_max_step_m, gain * dy))
-        self.theta = wrap_angle(
-            self.theta - max(-self.wall_anchor_max_step_rad, min(self.wall_anchor_max_step_rad, gain * dth))
+        applied_dx = -max(
+            -self.wall_anchor_max_step_m,
+            min(self.wall_anchor_max_step_m, gain * dx),
         )
+        applied_dy = -max(
+            -self.wall_anchor_max_step_m,
+            min(self.wall_anchor_max_step_m, gain * dy),
+        )
+        applied_dth = -max(
+            -self.wall_anchor_max_step_rad,
+            min(self.wall_anchor_max_step_rad, gain * dth),
+        )
+        applied_dx, applied_dy, applied_dth = self._constrain_world_delta(
+            applied_dx, applied_dy, applied_dth, "wall_anchor"
+        )
+        self.x += applied_dx
+        self.y += applied_dy
+        self.theta = wrap_angle(self.theta + applied_dth)
+
+    def on_wall_fast_correction(self, msg: Bool) -> None:
+        self.wall_fast_correction = bool(msg.data)
 
     def on_wall_field_correction(self, msg: Float32MultiArray) -> None:
         """Apply the wall alignment as one rigid transform to the robot/map frame."""
@@ -496,21 +781,43 @@ class LocalizerNode(Node):
         conf = max(0.0, min(1.0, float(msg.data[3]) if len(msg.data) > 3 else 1.0))
         if math.hypot(dx, dy) < self.wall_field_deadband_m and abs(dth) < math.radians(0.3):
             return
-        gain = max(0.0, self.wall_field_gain) * conf
-        tx = max(-self.wall_field_max_step_m, min(self.wall_field_max_step_m, gain * dx))
-        ty = max(-self.wall_field_max_step_m, min(self.wall_field_max_step_m, gain * dy))
+        gain_value = self.wall_field_fast_gain if self.wall_fast_correction else self.wall_field_gain
+        theta_gain_value = (
+            self.wall_field_fast_theta_gain
+            if self.wall_fast_correction
+            else self.wall_field_theta_gain
+        )
+        max_step_m = (
+            self.wall_field_fast_max_step_m
+            if self.wall_fast_correction
+            else self.wall_field_max_step_m
+        )
+        max_step_rad = (
+            self.wall_field_fast_max_step_rad
+            if self.wall_fast_correction
+            else self.wall_field_max_step_rad
+        )
+        gain = max(0.0, gain_value) * conf
+        theta_gain = max(0.0, theta_gain_value) * conf
+        tx = max(-max_step_m, min(max_step_m, gain * dx))
+        ty = max(-max_step_m, min(max_step_m, gain * dy))
         applied_dth = max(
-            -self.wall_field_max_step_rad,
-            min(self.wall_field_max_step_rad, gain * dth),
+            -max_step_rad,
+            min(max_step_rad, theta_gain * dth),
         )
         ct, st = math.cos(applied_dth), math.sin(applied_dth)
         old_x, old_y = self.x, self.y
-        self.x = ct * old_x - st * old_y + tx
-        self.y = st * old_x + ct * old_y + ty
+        raw_dx = ct * old_x - st * old_y + tx - old_x
+        raw_dy = st * old_x + ct * old_y + ty - old_y
+        raw_dx, raw_dy, applied_dth = self._constrain_world_delta(
+            raw_dx, raw_dy, applied_dth, "wall_field"
+        )
+        self.x = old_x + raw_dx
+        self.y = old_y + raw_dy
         self.theta = wrap_angle(self.theta + applied_dth)
 
         applied = Float32MultiArray()
-        applied.data = [float(tx), float(ty), float(applied_dth)]
+        applied.data = [float(raw_dx), float(raw_dy), float(applied_dth)]
         self.pub_wall_map_transform.publish(applied)
 
     def _wall_correction_fresh(self, now: float) -> bool:
@@ -566,6 +873,7 @@ class LocalizerNode(Node):
             # only when the IMU is stale/absent.
             if (abs(theta_visual) >= self.vo_deadband and not self._imu_fresh(now)
                     and not (self.freeze_pose_when_stationary and self.is_stationary)):
+                _, _, theta_visual = self._constrain_robot_delta(0.0, 0.0, theta_visual, "visual")
                 self.theta = wrap_angle(self.theta + theta_visual)
 
         # Absolute-correction hook (approximate; see _detect_landmarks docstring). Skipped
@@ -577,7 +885,8 @@ class LocalizerNode(Node):
                 # Correct ONLY theta: blend the WRAPPED angular error toward the wall-aligned
                 # heading (wrap-safe; linear angle averaging would jump near +/-pi).
                 err = wrap_angle(theta_land - self.theta)
-                self.theta = wrap_angle(self.theta + 0.05 * err)
+                _, _, dtheta = self._constrain_robot_delta(0.0, 0.0, 0.05 * err, "visual")
+                self.theta = wrap_angle(self.theta + dtheta)
 
         self.prev_gray = gray
 
@@ -692,7 +1001,10 @@ class LocalizerNode(Node):
         """Publish the current pose; with no inputs this is the initial start pose."""
         now = self.get_clock().now().nanoseconds * 1e-9
         if self.last_odom_time is None or (now - self.last_odom_time) > self.stationary_cmd_stale_sec:
-            self._update_stationary(now, np.zeros(4, dtype=np.float64))
+            if self._command_active(now):
+                self._mark_not_stationary()
+            else:
+                self._update_stationary(now, np.zeros(4, dtype=np.float64))
         stamp = self.get_clock().now().to_msg()
         qx, qy, qz, qw = yaw_to_quaternion(self.theta)
 
@@ -710,6 +1022,10 @@ class LocalizerNode(Node):
         stationary = Bool()
         stationary.data = bool(self.is_stationary)
         self.pub_stationary.publish(stationary)
+        if self.encoder_motion_constraint_enabled and self.encoder_motion_constraint_publish_debug:
+            motion_mode = String()
+            motion_mode.data = self._motion_mode(now)
+            self.pub_motion_mode.publish(motion_mode)
 
         if self.tf_broadcaster is not None:
             tf = TransformStamped()

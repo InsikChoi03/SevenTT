@@ -22,7 +22,6 @@ import rclpy
 from geometry_msgs.msg import PoseArray, PoseStamped
 from rclpy.node import Node
 from robot_interfaces.msg import BaseCommand, MissionState, WorldModel
-from sensor_msgs.msg import Range
 
 
 def yaw_from_quat(qz: float, qw: float) -> float:
@@ -46,10 +45,9 @@ class GoToGoalNode(Node):
         self.declare_parameter("min_lin_speed", 0.0)    # m/s stiction floor (0 = off)
         self.declare_parameter("pos_tol_m", 0.05)
         self.declare_parameter("yaw_tol_rad", 0.05)
-        # HYBRID drive: this mecanum base can't strafe straight (pure strafe -> ~18deg back-diagonal +
-        # ~20deg yaw), but drives forward clean. So TRAVEL car-like: rotate to face the goal, then drive
-        # forward (no strafe). Only within fine_radius do we allow holonomic strafe for the last cm of
-        # lateral micro-alignment (there the strafe drift is cm-scale and the closed loop absorbs it).
+        # HYBRID drive: this mecanum base drives forward cleanly. TRAVEL normally stays car-like:
+        # rotate to face the goal, then drive forward. When a close obstacle enters the keep-out
+        # radius, avoid with lateral-only strafe so the base does not spin while beside objects.
         self.declare_parameter("fine_radius_m", 0.15)   # <= this: holonomic fine mode; > this: car-like
         self.declare_parameter("face_tol_rad", 0.35)    # travel: only drive forward once facing within this
         # Rotation is "fast-or-stopped" too (floor clobbers small omega), so once roughly aligned STOP
@@ -88,6 +86,10 @@ class GoToGoalNode(Node):
         self.declare_parameter("avoid_goal_skip_m", 0.30)
         self.declare_parameter("use_planning_obstacles", True)
         self.declare_parameter("planning_obstacle_timeout_sec", 1.0)
+        self.declare_parameter("avoid_strafe_enabled", False)
+        self.declare_parameter("avoid_strafe_speed", 0.04)
+        self.declare_parameter("avoid_strafe_forward_scale", 0.0)
+        self.declare_parameter("avoid_strafe_latch_sec", 0.6)
         self.avoid_radius = float(self.get_parameter("avoid_radius_m").value)
         self.avoid_gain = float(self.get_parameter("avoid_gain").value)
         self.avoid_goal_skip = float(self.get_parameter("avoid_goal_skip_m").value)
@@ -95,18 +97,17 @@ class GoToGoalNode(Node):
         self.planning_obstacle_timeout = float(
             self.get_parameter("planning_obstacle_timeout_sec").value
         )
+        self.avoid_strafe_enabled = bool(self.get_parameter("avoid_strafe_enabled").value)
+        self.avoid_strafe_speed = float(self.get_parameter("avoid_strafe_speed").value)
+        self.avoid_strafe_forward_scale = float(
+            self.get_parameter("avoid_strafe_forward_scale").value
+        )
+        self.avoid_strafe_latch_sec = float(self.get_parameter("avoid_strafe_latch_sec").value)
+        self._avoid_strafe_sign = 1.0
+        self._avoid_strafe_sign_t: float | None = None
         self._obstacles: list[tuple[float, float]] = []   # mapped object centres (field xy)
         self._planning_obstacles: list[tuple[float, float]] = []
         self._planning_obstacles_t: float | None = None
-        # Front HC-SR04 hard stop: never drive FORWARD into a wall. Threshold is well inside the pick
-        # stand-off (~0.35 m) and grab (~0.28 m) so it never blocks a pick — only a true wall/obstacle.
-        self.declare_parameter("front_stop_m", 0.15)
-        self.declare_parameter("sonar_timeout_sec", 0.5)
-        self.front_stop_m = float(self.get_parameter("front_stop_m").value)
-        self.sonar_timeout = float(self.get_parameter("sonar_timeout_sec").value)
-        self._front_range = float("inf")
-        self._front_range_t = None
-
         # latest goal (field frame): (x, y, yaw)
         self.goal: tuple[float, float, float] | None = None
         self.goal_stamp_s: float | None = None
@@ -125,7 +126,6 @@ class GoToGoalNode(Node):
         # Always subscribe: world model gives the fallback pose AND the obstacle list for avoidance.
         self.create_subscription(WorldModel, "/world_model", self.on_world, 10)
         self.create_subscription(PoseArray, "/planning/obstacles", self.on_planning_obstacles, 10)
-        self.create_subscription(Range, "/ultrasonic/range", self.on_range, 10)   # front wall stop
 
         self.pub = self.create_publisher(BaseCommand, "/base_command", 10)
         self.timer = self.create_timer(1.0 / rate, self.tick)
@@ -201,16 +201,6 @@ class GoToGoalNode(Node):
             return self._planning_obstacles
         return self._obstacles
 
-    def on_range(self, msg: Range) -> None:
-        self._front_range = float(msg.range)
-        self._front_range_t = self._now_s()
-
-    def _front_blocked(self) -> bool:
-        """True when the front HC-SR04 sees a wall/obstacle within the stop distance (and is fresh)."""
-        return (self._front_range_t is not None
-                and (self._now_s() - self._front_range_t) <= self.sonar_timeout
-                and self._front_range < self.front_stop_m)
-
     # --------------------------------------------------------------------- tick
     def tick(self) -> None:
         # Yield only for the FSM's direct-drive states (opening move, ALIGN visual servo, PICK).
@@ -250,10 +240,12 @@ class GoToGoalNode(Node):
         c, s = math.cos(rtheta), math.sin(rtheta)
 
         if dist > self.fine_radius:
-            # ---- TRAVEL (car-like): face the goal, then drive FORWARD only. This base can't strafe
-            # straight (~18deg back-diagonal + ~20deg yaw), so no vy while travelling. Obstacle
-            # repulsion bends the travel AIM (steer around) instead of adding a sideways command. ----
+            # ---- TRAVEL: usually face the goal, then drive FORWARD. If obstacle repulsion bends the
+            # aim too far to drive forward, use a small strafe escape instead of rotating in place. ----
             ux, uy = ex, ey
+            avoid_active = False
+            avoid_side_hint = 0.0
+            avoid_side_hint_dist = float("inf")
             obstacles = self._avoidance_obstacles()
             if self.avoid_radius > 0.0 and obstacles:
                 for (ox, oy) in obstacles:
@@ -262,23 +254,48 @@ class GoToGoalNode(Node):
                     odx, ody = ox - rx, oy - ry
                     do = math.hypot(odx, ody)
                     if 1e-3 < do < self.avoid_radius:
+                        avoid_active = True
                         f = self.avoid_gain * (1.0 / do - 1.0 / self.avoid_radius)
                         ux -= f * odx                            # bend the aim away from the obstacle
                         uy -= f * ody
-            bearing = math.atan2(uy, ux)
-            head_err = wrap_pi(bearing - rtheta)
-            if abs(head_err) < self.travel_yaw_db:                # roughly aligned -> stop micro-rotating
+                        oby = -s * odx + c * ody
+                        if abs(oby) > 0.02 and do < avoid_side_hint_dist:
+                            avoid_side_hint = -math.copysign(1.0, oby)
+                            avoid_side_hint_dist = do
+            if self.avoid_strafe_enabled and avoid_active:
+                bx = c * ux + s * uy
+                by = -s * ux + c * uy
+                desired_sign = math.copysign(1.0, by) if abs(by) > 1e-3 else avoid_side_hint
+                now = self._now_s()
+                if desired_sign != 0.0:
+                    if (
+                        self._avoid_strafe_sign_t is None
+                        or (now - self._avoid_strafe_sign_t) >= self.avoid_strafe_latch_sec
+                    ):
+                        self._avoid_strafe_sign = desired_sign
+                        self._avoid_strafe_sign_t = now
+                strafe_speed = min(self.max_lin, max(self.min_lin, abs(self.avoid_strafe_speed)))
+                vx = 0.0
+                vy = self._avoid_strafe_sign * strafe_speed
                 omega = 0.0
+                if bx > 0.0 and self.avoid_strafe_forward_scale > 0.0:
+                    v = min(self.max_lin, max(self.min_lin, self.kp_lin * dist))
+                    vx = v * min(1.0, max(0.0, self.avoid_strafe_forward_scale))
             else:
-                omega = max(-self.max_ang, min(self.max_ang, self.kp_ang * head_err))
-            if abs(head_err) < self.face_tol:
-                v = min(self.max_lin, self.kp_lin * dist)        # cruise; eases down near fine_radius
-                v = max(v, self.min_lin)                          # keep above stiction (else it stalls)
-                vx = v * math.cos(head_err)                       # ease off forward while still turning in
-                vy = 0.0
-            else:
-                vx = 0.0                                          # rotate in place to face the goal first
-                vy = 0.0
+                bearing = math.atan2(uy, ux)
+                head_err = wrap_pi(bearing - rtheta)
+                if abs(head_err) < self.travel_yaw_db:            # roughly aligned -> stop micro-rotating
+                    omega = 0.0
+                else:
+                    omega = max(-self.max_ang, min(self.max_ang, self.kp_ang * head_err))
+                if abs(head_err) < self.face_tol:
+                    v = min(self.max_lin, self.kp_lin * dist)    # cruise; eases down near fine_radius
+                    v = max(v, self.min_lin)                      # keep above stiction (else it stalls)
+                    vx = v * math.cos(head_err)                   # ease off forward while still turning in
+                    vy = 0.0
+                else:
+                    vy = 0.0
+                    vx = 0.0                                      # rotate in place to face the goal first
         else:
             # ---- FINE (holonomic): within fine_radius, gentle creep toward the point incl. a small
             # strafe for lateral micro-alignment. cm-precision for a GRAB is ALIGN's body-cam servo,
@@ -293,13 +310,11 @@ class GoToGoalNode(Node):
                 vx = vy = 0.0
             omega = max(-self.max_ang, min(self.max_ang, self.kp_ang * yaw_err))
 
-        # translation speed cap (safety) + front-wall hard stop (kills forward only).
+        # translation speed cap (safety).
         speed = math.hypot(vx, vy)
         if speed > self.max_lin and speed > 1e-9:
             vx *= self.max_lin / speed
             vy *= self.max_lin / speed
-        if self._front_blocked() and vx > 0.0:
-            vx = 0.0
 
         self._publish(vx, vy, omega)
 

@@ -327,10 +327,6 @@ mission_fsm_node:
     zone_stabilize_enabled: true
     zone_stabilize_sec: 3.0
     zone_stabilize_require_fresh_seen: true
-    # 집기 전방거리를 초음파로 직접 맞춤(본체캠 투영오차 없음). grab_range_m는 센서 연결 후 캘리브 필수:
-    # 큐브를 집기점에 두고 /ultrasonic/range 읽은 값. 없으면 자동으로 본체캠 x로 폴백.
-    use_sonar_align: false                # 초음파가 낮은 큐브를 가까이서 못 봄(빔이 위로 지나감, inf) → 본체캠 정렬
-    grab_range_m: 0.08                    # 실측: 집기점에 물체 둘 때 초음파 8cm (참고용, 현재 미사용)
     align_pulse_sec: 0.10                 # (legacy, 미사용)
     # ★단위-스텝 보정값★ (2026-07-08 실측, 무부스트+브레이크). 각 방향 거의 일정 이동:
     align_step_fwd_duty: 0.27             # 전진/후진 duty. 직전 저속값 대비 1.5배
@@ -344,8 +340,6 @@ mission_fsm_node:
     align_settle_pulse_sec: 0.6           # 스텝 후 완전정지 대기(브레이크 있어 더 짧게)
     align_tol_m: 0.03                     # 좌우 허용오차. 이 안이면 잡기(그리퍼가 흡수)
     align_fwd_tol_m: 0.03                 # 앞뒤 허용오차. 이 안이면 잡기(그리퍼가 흡수)
-    align_sonar_tol_m: 0.02
-    sonar_timeout_sec: 0.5
 
 pick_sequencer_node:
   ros__parameters:
@@ -378,8 +372,6 @@ go_to_goal_node:
     avoid_radius_m: 0.30                  # 0.55→0.30 (게이트 기둥 겨우 안쪽만 반응)
     avoid_gain: 0.10                      # 0.28→0.10 (약한 자기중심 정렬)
     avoid_goal_skip_m: 0.30              # 목표 근처 이 안의 물체=접근 대상이라 회피 안 함
-    front_stop_m: 0.15                   # 전방 초음파 이 거리 안에 벽 있으면 전진 정지(픽 stand-off 0.35보다 작아 방해X)
-    sonar_timeout_sec: 0.5
 
 base_controller_node:
   ros__parameters:

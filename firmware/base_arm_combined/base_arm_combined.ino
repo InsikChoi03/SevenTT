@@ -53,14 +53,6 @@ volatile uint8_t encState[4] = { 0, 0, 0, 0 };
 int32_t lastOdomTicks[4] = { 0, 0, 0, 0 };
 unsigned long lastOdom = 0, lastEncDebug = 0;
 
-// ---- 전방 초음파 HC-SR04 (echo=D8, trig=D9) ----
-// 구 엔코더 E1(FL) 핀 재활용: FL 엔코더는 신호가 약해 원래도 제외 가능(위 주석). E1은 setupEncoders에서 건너뜀.
-const uint8_t SR04_ECHO = 8;
-const uint8_t SR04_TRIG = 9;
-const unsigned long SR04_MS = 66;                 // ~15Hz
-const unsigned long SR04_TIMEOUT_US = 12000UL;    // ~2 m 최대(벽 감지엔 충분, 블로킹 최소화)
-unsigned long lastSr04 = 0;
-
 // ---- 팔 (2R: ch0 어깨, ch1 손목, ch2 그리퍼) ----
 const int US_MIN = 500, US_MAX = 2500;
 const float MAX_STEP = 2.0;          // deg/update(30ms) ≈ 67 deg/s 속도제한
@@ -130,25 +122,12 @@ void enablePinChangeInterrupt(uint8_t pin) {
 
 void setupEncoders() {
   for (uint8_t e = 0; e < 4; e++) {
-    // E1 pins (D8/D9) are now the HC-SR04 -> skip so its PCINT doesn't fight pulseIn.
-    if (ENC_A[e] == SR04_ECHO || ENC_B[e] == SR04_TRIG) continue;
     pinMode(ENC_A[e], INPUT_PULLUP);
     pinMode(ENC_B[e], INPUT_PULLUP);
     encState[e] = (digitalRead(ENC_A[e]) ? 1 : 0) | (digitalRead(ENC_B[e]) ? 2 : 0);
     enablePinChangeInterrupt(ENC_A[e]);
     enablePinChangeInterrupt(ENC_B[e]);
   }
-}
-
-void publishUltrasonic(unsigned long now) {
-  if (now - lastSr04 < SR04_MS) return;
-  lastSr04 = now;
-  digitalWrite(SR04_TRIG, LOW);  delayMicroseconds(3);
-  digitalWrite(SR04_TRIG, HIGH); delayMicroseconds(10);
-  digitalWrite(SR04_TRIG, LOW);
-  unsigned long dur = pulseIn(SR04_ECHO, HIGH, SR04_TIMEOUT_US);  // blocks up to timeout
-  int cm = (dur == 0) ? -1 : (int)(dur / 58);                     // -1 = no echo / beyond range
-  Serial.print("<US,"); Serial.print(cm); Serial.println(">");
 }
 
 void copyEncoderTicks(int32_t out[4]) {
@@ -304,8 +283,6 @@ void setup() {
   Wire.begin();
   Wire.setWireTimeout(3000, true);          // I2C 행 방지 (서보 노이즈 대비)
   setupEncoders();
-  pinMode(SR04_TRIG, OUTPUT); digitalWrite(SR04_TRIG, LOW);   // 전방 초음파
-  pinMode(SR04_ECHO, INPUT);
   delay(50);
   scanI2C();                                // 부팅 시 I2C 스캔 리포트 (0x40 팔 / 0x60 베이스 감지)
   pwmBase.begin(); pwmBase.setPWMFreq(1600); // 휠 PWM (MX1508)
@@ -355,7 +332,6 @@ void loop() {
   }
 
   publishEncoderOdometry(now);
-  publishUltrasonic(now);       // 전방 초음파 <US,cm> ~15Hz
 
   // 베이스 HB 5Hz
   if (now - lastHb >= 200) {

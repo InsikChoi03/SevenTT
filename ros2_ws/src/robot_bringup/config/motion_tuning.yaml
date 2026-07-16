@@ -21,31 +21,62 @@ localizer_node:
     initial_x: -1.8                       # 시작 위치 x. 경기장 중심 원점 기준, 우측하단 시작이면 -1.8.
     initial_y: 1.8                        # 시작 위치 y. 경기장 중심 원점 기준, 우측하단 시작이면 1.8.
     initial_theta: 0.0                    # 시작 heading. 현재 맵 방향 기준 왼쪽을 보는 상태.
-    use_wheel_odom: false                 # 엔코더 odom을 localizer 위치 보정에 사용할지 여부.
+    use_wheel_odom: false                 # 엔코더 거리 적분은 끈다. 아래 constraint는 속도 패턴 판정에만 엔코더를 쓴다.
+    wheel_odom_enabled_wheels: [false, true, true, true]  # FL 엔코더 제외, FR/RL/RR 3개만 사용.
+    encoder_motion_constraint_enabled: true  # 엔코더의 실제 움직임 기준 pose 흔들림 축 감쇠를 켠다. 엔코더 stale 시에는 정지로 얼리지 않는다.
+    encoder_motion_constraint_publish_debug: true  # /localization/motion_mode 토픽 발행.
+    encoder_constraint_cmd_stale_sec: 0.30  # 이 시간보다 오래된 모터 명령은 엔코더 방향 sanity check에서 제외.
+    encoder_constraint_odom_stale_sec: 0.40  # 이 시간보다 오래된 엔코더는 motion mode 판단에서 제외.
+    encoder_constraint_linear_eps_mps: 0.025  # 이보다 작은 body 선속도는 정지로 본다.
+    encoder_constraint_angular_eps_rps: 0.12  # 이보다 작은 body 각속도는 정지로 본다.
+    encoder_constraint_axis_ratio: 2.0  # 주축 속도가 다른 축의 2배 이상일 때 전진/횡이동/회전으로 판정.
+    encoder_constraint_stop_translation_gain: 0.0  # 정지 중 object/visual 위치 변화는 막는다.
+    encoder_constraint_stop_yaw_gain: 0.05  # 정지 중 yaw 변화는 5%만 반영한다.
+    encoder_constraint_forward_gain: 1.0  # 전진 중 전후 pose 변화는 유지.
+    encoder_constraint_forward_lateral_gain: 0.12  # 전진 중 좌우 pose 흔들림은 12%만 반영.
+    encoder_constraint_forward_yaw_gain: 1.0  # 전진 중 yaw 보정은 절반만 반영.
+    encoder_constraint_lateral_gain: 1.0  # 횡이동 중 좌우 pose 변화는 유지.
+    encoder_constraint_lateral_forward_gain: 0.12  # 횡이동 중 전후 pose 흔들림은 12%만 반영.
+    encoder_constraint_lateral_yaw_gain: 1.0  # 횡이동 중 yaw 보정은 절반만 반영.
+    encoder_constraint_rotate_translation_gain: 0.08  # 제자리 회전 중 x/y 변화는 8%만 반영.
+    encoder_constraint_rotate_yaw_gain: 1.0  # 제자리 회전 중 yaw는 유지.
+    encoder_constraint_mixed_translation_gain: 0.60  # 명령/엔코더 불일치 또는 복합 동작은 보수적으로 60% 반영.
+    encoder_constraint_mixed_yaw_gain: 0.80
+    encoder_constraint_wall_translation_floor: 1.0  # 벽 기반 절대 위치 보정은 엔코더 흔들림 억제에 눌리지 않게 전량 반영.
+    encoder_constraint_wall_yaw_floor: 1.0  # 벽 heading 보정을 켤 경우에도 엔코더 constraint에 눌리지 않게 한다.
     use_object_flow: true                 # wide 카메라 물체점 흐름으로 회전/이동 추정을 보정할지 여부.
     object_flow_trans: true               # object-flow에서 병진 이동 보정까지 사용할지 여부.
     use_object_landmarks: true            # 이미 맵에 고정된 물체를 랜드마크처럼 보고 pose x/y drift를 보정할지 여부.
-    suppress_object_flow_when_stationary: true  # 정지 판정 중 object-flow 이동 보정을 막아 맵 흔들림을 줄인다.
+    suppress_object_flow_when_stationary: true  # 정지 중 object-flow translation이 벽 보정과 싸우지 않도록 막는다.
     landmark_gain: 0.5                    # 물체 랜드마크 위치 보정 강도. heading은 IMU만 사용하므로 낮게 둔다.
     landmark_theta_gain: 0.0              # heading은 IMU만 반영하고 물체 landmark heading 보정은 끈다.
     landmark_max_step_m: 0.2              # 한 번에 pose 위치를 보정할 수 있는 최대 거리.
     landmark_max_step_rad: 0.0            # 물체 landmark가 heading을 바꾸지 못하게 한다.
-    freeze_pose_when_stationary: true     # 정지 중 pose가 미세하게 흔들리는 것을 줄일지 여부.
+    freeze_pose_when_stationary: true     # 정지 중 landmark/visual translation이 pose를 계속 밀지 않도록 막는다.
     use_imu_heading: true                 # IMU heading 보정을 사용할지 여부.
     wall_anchor_gain: 0.50                # wall anchor 보정 강도. anchor가 꺼져 있으면 실질 영향 작음.
     wall_anchor_max_step_rad: 0.0         # 벽 anchor는 위치만 보정하고 heading은 IMU만 사용한다.
-    wall_field_gain: 0.35                 # 벽 선분 기반 field 보정 강도.
-    wall_field_max_step_m: 0.05           # 벽 보정이 한 번에 위치를 움직일 수 있는 최대 거리.
+    wall_field_gain: 0.0                  # 현재 wall raw 상대거리 오류 진단 중: 벽은 표시만 하고 pose에는 적용하지 않는다.
+    wall_field_theta_gain: 0.0            # 주황 raw 벽 상대 위치 진단 중에는 heading 보정을 끈다.
+    wall_field_fast_gain: 0.0             # opening/settle 중에도 틀린 wall raw가 pose를 끌지 못하게 한다.
+    wall_field_fast_theta_gain: 0.0       # opening/settle 중에도 heading 보정은 끈다.
+    wall_field_max_step_m: 0.0            # 벽 위치 보정 적용 차단. /localization/wall_field_correction은 진단용으로만 본다.
+    wall_field_fast_max_step_m: 0.0       # opening/settle 중 벽 위치 보정 적용 차단.
     wall_field_max_step_rad: 0.0          # 벽 field 보정은 heading을 바꾸지 않도록 한다.
+    wall_field_fast_max_step_rad: 0.0     # opening/settle 중에도 heading은 바꾸지 않는다.
 
 wall_localizer_node:
   ros__parameters:
+    cam_offset_x: 0.0                     # wide homography가 카메라 기준으로 밀릴 때 base_link 앞쪽 오프셋을 보정한다.
+    cam_offset_y: 0.0                     # wide homography가 카메라 기준으로 밀릴 때 base_link 왼쪽 오프셋을 보정한다.
     use_segmentation_mask: true           # 벽/바닥 경계 segmentation mask를 벽 보정에 사용할지 여부.
     segmentation_min_confidence: 0.30     # 벽 mask로 인정할 최소 confidence.
-    segmentation_run_rate_hz: 1.0         # 벽 segmentation 실행 주기. 높이면 GPU 부담 증가.
+    segmentation_run_rate_hz: 3.0         # opening 4초 정지 중 충분히 벽 보정이 들어오도록 벽 segmentation을 빠르게 실행한다.
     wall_image_edge_reject_ratio: 0.05    # 화면 가장자리 이 비율 안쪽 wall line은 불안정하므로 보정에서 제외.
     wall_anchor_enabled: false            # 여러 벽 선으로 절대 anchor를 잡는 기능. v1.0.0 기준은 꺼짐.
     wall_field_max_residual_m: 0.80       # 벽 관측과 경기장 벽 모델의 잔차 허용값.
+    wall_field_fast_smoothing: 1.0        # opening/settle 중에는 여러 프레임 평균 없이 즉시 반영한다.
+    wall_field_filter_window: 5           # 최근 벽 보정값 median으로 단일 프레임 mask 튐을 줄인다.
     wall_field_smoothing: 0.25            # 벽 보정 smoothing. 클수록 새 관측을 더 빨리 따른다.
 
 target_selector_node:
@@ -65,6 +96,7 @@ mission_fsm_node:
     set1_label: "dodecahedron"            # FSM이 Set1에서 실제로 집을 도형 라벨.
     set2_label: "banana"                  # FSM이 Set2에서 실제로 집을 과일 라벨.
     start_phase: 2                        # 과일 큐브 집기 테스트: 바로 Set2 단계에서 시작.
+    mixed_target_mode: true               # phase 순서 강제 없이 현재 zone 안의 Set1/Set2 목표를 가까운 순서로 함께 처리한다.
     shape_target_total: 4                 # 과일 큐브 집기 테스트 중에는 Set1 도형 quota를 끈다.
     fruit_target_total: 3                # 집을 Set2 과일 큐브 개수. 배치 개수에 맞춰 조정.
     set2_require_fruit_label: true       # 테스트용: SigLIP 과일 종류 판별 없이 fruit_photo_cube면 집는다.
@@ -72,15 +104,20 @@ mission_fsm_node:
     set2_slot_merge_radius_m: 0.22        # 이 거리 안에서 track ID가 바뀌면 같은 슬롯으로 병합한다.
     set2_slot_attach_radius_m: 0.18       # body/SigLIP 결과를 현재 슬롯에 붙일 최대 위치 잔차.
     set2_slot_confirm_min_obs: 1          # world_model 확정 track은 첫 입력부터 슬롯 present로 인정한다.
+    set2_slot_retry_enabled: false        # false면 body lost/분류불확실/잘못된 슬롯을 재시도하지 않고 바로 닫는다.
     set2_slot_retry_limit: 2              # 이 횟수 이상 실패한 슬롯은 lost_suspect로 표시하되 삭제하지 않는다.
     set2_slot_retry_cooldown_sec: 2.0     # 불확실한 슬롯을 바로 반복하지 않고 다른 슬롯 뒤에 재시도한다.
     set2_slot_body_max_age_sec: 1.5       # current slot에 붙일 body/SigLIP 관측의 최대 나이.
-    set2_slot_birth_min_confidence: 0.75  # 이 confidence 이상인 Set2 관측만 새 슬롯을 만든다.
-    set2_slot_birth_min_obs_wide: 5       # wide-only 관측은 누적 3회 이상일 때 새 슬롯을 만든다.
-    set2_slot_birth_min_obs_body: 1       # 위치가 정확한 body 관측은 1회부터 새 슬롯을 허용한다.
+    set2_slot_require_current_track_before_approach: false  # 현재 world track이 붙지 않은 track#0 슬롯은 바로 접근하지 않는다.
+    set2_slot_missing_track_recheck_attempts: 1  # track#0 슬롯은 한 번만 재확인 대기 후에도 없으면 닫는다.
+    set2_slot_distractor_front_x_m: 0.60   # Set2 ALIGN 중 이 전방 범위 안 Set1 도형은 잘못된 슬롯으로 본다.
+    set2_slot_distractor_side_y_m: 0.30    # Set2 ALIGN 중 Set1 도형 distractor를 볼 좌우 폭.
+    set2_slot_birth_min_confidence: 0.82  # 이 confidence 이상인 Set2 관측만 새 슬롯을 만든다.
+    set2_slot_birth_min_obs_wide: 7       # wide-only 관측은 누적 3회 이상일 때 새 슬롯을 만든다.
+    set2_slot_birth_min_obs_body: 2       # 위치가 정확한 body 관측은 1회부터 새 슬롯을 허용한다.
     set2_slot_birth_current_zone_only: true  # 현재 처리 구역 안의 Set2 후보만 슬롯으로 만든다.
-    set2_slot_birth_after_stabilize_only: false  # anchor 정지 안정화 없이 새 슬롯 생성을 허용한다.
-    set2_slot_birth_labels: ["fruit_photo_cube", "apple", "orange", "banana", "pineapple"]  # 과일 근거가 있는 라벨만 슬롯 생성 허용.
+    set2_slot_birth_after_stabilize_only: false  # zone stabilize를 쓰지 않는 현재 경기 흐름에서는 opening mapping gate가 초기 슬롯 생성을 막는다.
+    set2_slot_birth_labels: ["fruit_photo_cube"]  # 과일 근거가 있는 라벨만 슬롯 생성 허용.
     set2_slot_grid_lock_enabled: true     # Set2 슬롯 좌표를 관측 평균이 아니라 가장 가까운 격자점에 고정한다.
     set2_slot_grid_lock_radius_m: 0.20    # 관측이 이 반경 안의 격자점에 있을 때만 새 슬롯을 만든다.
     set2_slot_grid_rows: 6                # Set2 슬롯용 경기장 격자 행 개수.
@@ -100,13 +137,13 @@ mission_fsm_node:
     # 개막 동작
     opening_enabled: true                 # 경기 시작 직후 고정 개막 이동 사용 여부.
     startup_warmup_sec: 15.0              # 카메라/YOLO/world_model 준비 대기 시간.
-    opening_speed: 0.1                   # 개막 전진 명령 세기.
-    opening_forward_sec: 1.5             # 개막 전진 시간.
-    opening_strafe_speed: 0.18           # 개막 오른쪽 횡이동 명령 세기.
+    opening_speed: 0.12                  # 개막 전진 명령 세기. 일반 go_to_goal 속도와 별개.
+    opening_forward_sec: 2.0             # 개막 전진 시간.
+    opening_strafe_speed: 0.20           # 개막 오른쪽 횡이동 명령 세기. 일반 회피/ALIGN 횡이동과 별개.
     opening_strafe_right_sec: 1.0         # 개막 오른쪽 횡이동 시간.
     opening_turn_deg: 45.0                # 개막 제자리 회전 목표 각도.
-    opening_turn_omega: -0.255            # 개막 회전 명령. 음수는 시계방향.
-    opening_wait_after_turn_sec: 1.0      # 개막 회전 후 정지 대기 시간.
+    opening_turn_omega: -0.30             # 개막 회전 명령. 음수는 시계방향. 일반 회전 속도와 별개.
+    opening_wait_after_turn_sec: 4.0      # 개막 회전 후 4초 정지해 벽 보정으로 pose를 먼저 잡는다.
 
     # SCAN
     scan_search_omega: -0.1             # SCAN에서 제자리 탐색 회전 명령.
@@ -116,13 +153,16 @@ mission_fsm_node:
     # APPROACH
     approach_dist_m: 0.375                # 목표와 이 거리 이내면 APPROACH를 끝내고 ALIGN으로 넘어간다.
     approach_face_tol: 0.25               # 목표 방향과 로봇 방향 차이가 이 rad 안이면 전진한다.
-    approach_speed: 0.08                   # APPROACH 전진 명령 세기.
+    approach_speed: 0.1                   # APPROACH 전진 명령 세기.
     approach_kp_ang: 1.0                  # 목표 방향으로 돌 때 heading 오차에 곱하는 비례 게인.
-    approach_omega_max: 0.2              # APPROACH 회전 명령 최대값.
+    approach_omega_max: 0.18              # APPROACH 회전 명령 최대값.
     approach_look_sec: 1.0                # APPROACH 중 멈춰서 목표를 다시 보는 시간.
     approach_move_sec: 0.5                # APPROACH에서 한 번 회전/전진하는 시간.
     approach_lost_grace_sec: 2.5          # 목표가 잠깐 사라져도 같은 목표를 유지하는 유예 시간.
     approach_standoff_tol: 0.09           # 계획된 접근 지점에 도착했다고 보는 위치 허용오차.
+    approach_body_stop_enabled: true      # 가까운 거리에서는 맵 좌표 대신 body 상대거리로 APPROACH를 끝낸다.
+    approach_body_stop_x: 0.42            # body 기준 목표가 이 전방거리 안으로 들어오면 ALIGN으로 넘긴다.
+    approach_body_stop_max_age_sec: 0.6   # body detection이 이 시간보다 오래되면 접근 정지 기준으로 쓰지 않는다.
     classify_standoff_sec: 2.0            # Set2 과일 판별용 standoff 대기 시간. fruit_target_total=0이면 거의 미사용.
     opportunistic_set2_enabled: true       # Set1 진행 중 근처 목표 과일 큐브가 확정되면 잠깐 집고 Set1으로 복귀.
     opportunistic_set2_max_picks: 2        # 중간에 주울 Set2 목표 과일 최대 개수. 0이면 제한 없음.
@@ -134,8 +174,6 @@ mission_fsm_node:
     align_settle_sec: 1.0                 # ALIGN 진입 직후 안정화 시간.
     grab_x: 0.19                          # 집기 순간 목표 물체의 로봇 기준 전방 거리.
     grab_min_x: 0.17                      # 안전상 더 가까이 전진하지 않는 전방 최소 거리.
-    use_sonar_align: false                # true면 전후 정렬을 초음파로, false면 body 카메라 x좌표로 한다.
-    grab_range_m: 0.08                    # sonar 정렬 사용 시 집기 위치의 기대 초음파 거리.
     align_step_fwd_duty: 0.27             # 전후진 미세조정 명령 세기.
     align_step_fwd_sec: 0.15              # 한 번 전후진 미세조정 시간.
     align_step_strafe_duty: 0.315         # 좌우 횡이동 미세조정 명령 세기.
@@ -144,29 +182,32 @@ mission_fsm_node:
     align_mid_error_m: 0.06               # 선택된 축 오차가 이 값 이상이면 "멀다"고 보고 긴 펄스를 쓴다.
     align_step_fwd_mid_sec: 0.25          # 전후 오차가 클 때 쓰는 긴 전후진 펄스 시간.
     align_step_strafe_mid_sec: 0.3       # 좌우 오차가 클 때 쓰는 긴 횡이동 펄스 시간.
-    align_body_lost_backoff_enabled: true # body에서 목표를 놓쳤을 때 후진 복구를 할지 여부.
+    align_body_lost_backoff_enabled: false # body에서 목표를 놓쳤을 때 후진 복구를 할지 여부. 현재는 yaw scan 우선이라 끈다.
     align_body_lost_backoff_speed: 0.189  # body 목표 상실 복구 후진 명령 세기.
     align_body_lost_backoff_sec: 0.54     # body 목표 상실 복구 후진 시간.
     align_body_lost_backoff_settle_sec: 1.0  # 후진 복구 후 카메라 안정화 대기.
-    align_body_lost_same_slot_retry_enabled: true  # body lost 후 다른 슬롯으로 넘기기 전 같은 슬롯을 다시 접근한다.
-    align_body_lost_same_slot_retries: 2  # 같은 슬롯에 대해 body lost 재접근을 허용할 횟수.
+    align_body_lost_same_slot_retry_enabled: false # body lost 후 같은 슬롯 재접근을 끈다.
+    align_body_lost_same_slot_retries: 0  # 같은 슬롯에 대해 body lost 재접근을 허용할 횟수.
     align_retry_heading_tol_rad: 0.10     # body lost 재접근 후 ALIGN으로 넘기기 전 요구하는 heading 오차.
     align_retry_heading_timeout_sec: 2.0  # 이 시간 안에 heading이 안 맞으면 멈춰있지 않고 ALIGN으로 진입한다.
+    align_body_lost_yaw_scan_enabled: true # Set1 target/Set2 slot body lost 때 좌우 작은 회전으로 body 재획득을 시도한다.
+    align_body_lost_yaw_scan_deg: 10.0     # body 재획득용 좌우 yaw scan 각도.
+    align_body_lost_yaw_scan_omega: 0.10   # yaw scan 회전 명령 세기.
+    align_body_lost_yaw_scan_settle_sec: 0.35 # 각 scan 회전 후 카메라 안정화 시간.
+    align_body_lost_yaw_scan_max_attempts: 1 # target/slot 하나당 yaw scan 최대 횟수.
     align_settle_pulse_sec: 0.6           # ALIGN 구동 한 번 후 멈춰서 다시 측정하기까지 대기.
-    align_tol_m: 0.03                     # 집기 허용 좌우 오차.
-    align_fwd_tol_m: 0.03                 # 집기 허용 전후 오차.
-    align_sonar_tol_m: 0.02               # sonar 정렬 사용 시 전후 허용오차.
-    sonar_timeout_sec: 0.5                # sonar 값이 이 시간보다 오래되면 무시한다.
+    align_tol_m: 0.02                     # 집기 허용 좌우 오차.
+    align_fwd_tol_m: 0.02                 # 집기 허용 전후 오차.
 
     # Zone mission
     zone_mission_enabled: true            # zone 1->2->3->4 순서로 후보/슬롯을 처리한다.
     zone_order: [1, 2, 3, 4]              # zone 방문 순서.
     zone_bounds_m: [-2.0, 0.1, -0.25, 2.0, -2.0, 0.1, -2.0, -0.25, -0.1, 2.0, -2.0, -0.25, -0.1, 2.0, -0.25, 2.0]  # zone 1~4 경계. x=0만 ±10cm 중첩, y는 격자 사이 분리.
     zone_anchor_xy: [-0.75, 0.75, -0.75, -1.0, 0.75, -1.0, 0.75, 0.75]  # 구역별 중앙 근처 스캔 위치 Z1~Z4.
-    zone_no_target_advance_sec: 6.0       # 현재 zone 중심에서 목표가 없을 때 다음 zone으로 넘어가기 전 대기.
+    zone_no_target_advance_sec: 15.0      # zone 중심에 도착한 뒤 목표가 없을 때 다음 zone으로 넘어가기 전 대기.
     zone_center_reach_tol_m: 0.25         # zone 중심에 도착했다고 보는 거리 허용오차.
-    zone_anchor_nav_enabled: false        # zone anchor로 강제 이동하지 않고 현재 위치에서 해당 zone 후보를 처리한다.
-    zone_stabilize_enabled: false         # zone anchor 정지 안정화 과정을 생략한다.
+    zone_anchor_nav_enabled: true         # zone이 바뀌면 먼저 해당 zone 중앙 스캔 위치로 이동한다.
+    zone_stabilize_enabled: false         # zone 도착 후 별도 정지 안정화는 생략한다.
     zone_stabilize_sec: 3.0               # zone 진입 안정화 정지 시간. 맵이 더 흔들리면 5.0까지 올려 테스트.
     zone_stabilize_require_fresh_seen: false  # anchor fresh-seen 조건을 쓰지 않는다.
 
@@ -178,8 +219,8 @@ mission_fsm_node:
     phase_tol_m: 0.08                     # 물체가 추정 격자 위상에 맞는지 판단하는 허용오차.
     field_bounds_m: [-2.0, 2.0, -2.0, 2.0]  # 경기장 경계 [xmin,xmax,ymin,ymax].
     robot_margin_m: 0.22                  # 벽에서 로봇 중심이 최소로 떨어져야 하는 여유 거리.
-    lane_block_radius_m: 0.18             # 물체가 레인에 이 거리보다 가까우면 그 레인을 막힌 것으로 본다.
-    comfort_clear_m: 0.25                 # 장애물과 이 거리 이상 떨어진 레인을 편한 레인으로 본다.
+    lane_block_radius_m: 0.10             # 물체가 레인에 이 거리보다 가까우면 그 레인을 막힌 것으로 본다.
+    comfort_clear_m: 0.15                 # 장애물과 이 거리 이상 떨어진 레인을 편한 레인으로 본다.
     clearance_weight: 2.0                 # 장애물에서 먼 레인을 선호하는 비용 가중치.
     start_connect_k: 4                    # 현재 위치를 연결할 후보 레인 노드 개수.
     wp_reach_tol_m: 0.12                  # 현재 waypoint에 도착했다고 보고 다음 waypoint로 넘기는 거리.
@@ -191,12 +232,14 @@ mission_fsm_node:
     exclude_target_radius_m: 0.30         # 목표 주변 이 거리 안의 물체는 접근 대상이라 장애물에서 제외.
 
     # Storage
-    storage_x: 1.6                        # 보관함/종료 지점 field x.
-    storage_y: 1.6                        # 보관함/종료 지점 field y.
+    storage_x: 1.8                        # 보관함/종료 지점 field x.
+    storage_y: 1.8                        # 보관함/종료 지점 field y.
 
 siglip_gate_node:
   ros__parameters:
-    set2_label: "orange"                  # SigLIP이 비교할 목표 과일 라벨.
+    set2_label: "banana"                  # SigLIP이 비교할 목표 과일 라벨.
+    fruit_prompt_templates: ["a photo of a {fruit}", "a printed photo of a {fruit}", "a {fruit} printed on paper"] # 과일별 prompt 묶음.
+    fruit_prompt_pooling: "max"           # 과일별 여러 prompt 점수를 묶는 방식. max 또는 mean.
     confidence_threshold: 0.5             # SigLIP softmax margin 하한. 높이면 오판은 줄고 미검출은 늘 수 있다.
     min_box_area: 182                     # SigLIP 대상 crop으로 인정할 최소 box 면적.
     classify_rate_hz: 1.5                 # SigLIP 분류 실행 주기. 높이면 GPU 부담 증가.
@@ -204,6 +247,7 @@ siglip_gate_node:
 
 world_model_node:
   ros__parameters:
+    mapping_enabled_initially: false      # opening 이동/벽 보정 settle 전에는 물체 track/grid/slot을 만들지 않는다.
     assoc_radius_m: 0.18                  # 새 관측을 기존 track에 붙이는 기본 거리.
     reassoc_radius_m: 0.32                # 잠깐 놓친 관측을 기존 track에 다시 붙이는 거리.
     new_track_min_hits: 3                 # 새 물체 확정에 필요한 재관측 횟수.
@@ -253,8 +297,8 @@ world_model_node:
 go_to_goal_node:
   ros__parameters:
     kp_lin: 0.8                           # 목표 거리 오차에 곱하는 전진 비례 게인.
-    max_lin_speed: 0.0936                 # 일반 목표 이동 중 최대 전진 명령 세기.
-    min_lin_speed: 0.04                   # 전진 명령이 0이 아닐 때 적용하는 최소 명령 세기.
+    max_lin_speed: 0.12                 # 일반 목표 이동 중 최대 전진 명령 세기.
+    min_lin_speed: 0.06                   # 전진 명령이 0이 아닐 때 적용하는 최소 명령 세기.
     max_ang_speed: 0.405                  # 목표 방향으로 회전할 때 최대 회전 명령.
     fine_radius_m: 0.15                   # 목표가 이 거리 안이면 미세 이동 모드로 본다.
     face_tol_rad: 0.35                    # 목표 방향을 이 각도 안으로 바라봐야 전진한다.
@@ -265,18 +309,28 @@ go_to_goal_node:
     avoid_goal_skip_m: 0.30               # 목표 근처 이 거리 안의 물체는 회피하지 않는다.
     use_planning_obstacles: true          # go_to_goal 회피도 LanePlanner가 쓴 필터링된 장애물 목록을 우선 사용한다.
     planning_obstacle_timeout_sec: 1.0    # planning obstacle이 이 시간보다 오래되면 world_model 장애물로 fallback한다.
-    front_stop_m: 0.15                    # 전방 초음파가 이 거리보다 가까우면 전진을 멈춘다.
-    sonar_timeout_sec: 0.5                # 초음파 값이 이 시간보다 오래되면 무시한다.
+    avoid_strafe_enabled: true            # 회피 반경 안에 물체가 있으면 회전 없이 횡이동만 한다.
+    avoid_strafe_speed: 0.15              # 회피 횡이동 명령 세기. base_controller의 strafe 보정값이 적용된다.
+    avoid_strafe_forward_scale: 0.0        # 정면 장애물 접촉을 피하려고 횡이동 회피 중 전진은 기본 차단한다.
+    avoid_strafe_latch_sec: 0.6            # 좌/우 회피 방향을 잠깐 유지해 드드득 왕복을 줄인다.
 
 base_controller_node:
   ros__parameters:
     wheel_scales: [1.0, 1.0, 1.0, 1.0]             # 각 바퀴 기본 출력 보정 [FL,FR,RL,RR].
     strafe_right_scales: [0.875, 0.875, 1.0, 0.875] # 오른쪽 횡이동 시 바퀴별 출력 보정.
     strafe_left_scales: [0.867, 1.0, 1.0, 0.867]    # 왼쪽 횡이동 시 바퀴별 출력 보정.
-    wheel_min: 0.06                       # 일반 주행에서 바퀴가 실제로 돌기 시작하는 최소 명령 보정.
-    wheel_min_rot: 0.105                  # 제자리 회전에서 바퀴가 실제로 돌기 시작하는 최소 명령 보정.
-    wheel_boost: 0.3                  # 정지 상태에서 회전/횡이동 시작 시 순간 부스트 세기.
-    wheel_boost_ms: 100                   # 시작 부스트 유지 시간(ms).
+    wheel_min: 0.08                       # 일반 주행에서 바퀴가 실제로 돌기 시작하는 최소 명령 보정.
+    wheel_min_rot: 0.13                  # 일반 제자리 회전에서 바퀴가 실제로 돌기 시작하는 최소 명령 보정.
+    wheel_boost: 0.35                # 구버전 fallback. 실제 튜닝은 아래 strafe/rot 분리값을 사용한다.
+    wheel_boost_strafe: 0.45              # 일반 횡이동 시작 시 순간 부스트 세기.
+    wheel_boost_rot: 0.35                 # 일반 제자리 회전 시작 시 순간 부스트 세기.
+    wheel_boost_ms: 100                  # 일반 시작 부스트 유지 시간(ms).
+    opening_wheel_min: 0.10               # 개막 전진/복합 이동 전용 최소 바퀴 명령 보정.
+    opening_wheel_min_strafe: 0.11        # 개막 횡이동 전용 최소 바퀴 명령 보정.
+    opening_wheel_min_rot: 0.14           # 개막 제자리 회전 전용 최소 바퀴 명령 보정.
+    opening_wheel_boost_strafe: 0.35      # 개막 횡이동 시작 전용 순간 부스트 세기.
+    opening_wheel_boost_rot: 0.35         # 개막 제자리 회전 시작 전용 순간 부스트 세기.
+    opening_wheel_boost_ms: 100           # 개막 시작 부스트 유지 시간(ms).
     wheel_slew_per_tick: 0.02             # 제어 tick마다 바퀴 명령이 변할 수 있는 최대 변화량.
     align_wheel_boost: 0.63               # ALIGN 미세조정 구동 시작 시 사용하는 부스트 세기.
     align_brake_off: false                # true면 ALIGN 정지 브레이크를 끄고, false면 브레이크를 사용한다.
@@ -289,10 +343,11 @@ pick_sequencer_node:
     init_pose: [110.0, 30.0, 50.0]        # 주행 대기 자세 [어깨, 손목, 그리퍼].
     pick_shoulder_wrist: [25.0, 150.0]    # 집기 위해 내려갈 때 [어깨, 손목] 목표 각도.
     place_shoulder_wrist: [110.0, 30.0]   # 보관함에 놓을 때 [어깨, 손목] 목표 각도.
-    grip_open: 115.0                      # 그리퍼를 여는 목표 각도.
+    grip_open: 118.0                      # 그리퍼를 여는 목표 각도.
     grip_closed: 50.0                     # 그리퍼를 닫아 물체를 잡는 목표 각도.
-    move_sec: 4.0                         # 어깨/손목 이동 단계 램프 시간.
+    move_sec: 2.0                         # 어깨/손목 이동 단계 램프 시간.
     grasp_sec: 1.0                        # 그리퍼 열림/닫힘 단계 대기 시간.
+    preopen_sec: 0.25                     # 팔을 내리기 전에 그리퍼만 먼저 빠르게 여는 시간.
 
 mcu_bridge_base_node:
   ros__parameters:
@@ -329,3 +384,30 @@ anchor_waypoint_test:
     checkpoint_route_xy: [-1.8, 1.6, -1.8, -1.65, -0.75, -1.65, -0.75, 1.6, 0.25, 1.6, 0.25, -1.65, 1.25, -1.65, 1.25, 1.6]
     # 각 체크포인트에서 정지 후 바라볼 heading(rad). 맵 기준: up=-1.5708, left=0.0, down=1.5708.
     checkpoint_route_heading_rad: [-1.5708, 0.0, 1.5708, 0.0, -1.5708, 0.0, 1.5708, 0.0]
+
+parking_controller_node:
+  ros__parameters:
+    # 독립 arrival 후진 주차 테스트용 override. 기존 FSM/주행 노드는 이 섹션을 읽지 않는다.
+    drive_enabled: false                  # 실제 /base_command 출력 허용 여부. 기본은 관찰 모드.
+    armed: false                          # 주행 arm gate. 실제 주행 시 topic 또는 launch arg로 true.
+    auto_start: false                     # true면 launch 직후 ACQUIRE 시작. 기본은 수동 START.
+    require_deadman: true                 # true면 /parking_test/deadman heartbeat가 끊길 때 즉시 FAULT.
+    center_hint_x: -1.8                   # arrival 중심 힌트 x. 2사분면 코너 기준.
+    center_hint_y: 1.8                    # arrival 중심 힌트 y.
+    center_hint_scale_m: 0.65             # pair scoring에서 힌트 근접도를 완만하게 보는 스케일.
+    floor_pair_spacing_m: 0.36            # 바닥 arrival 두 점 사이 기대 거리. 현장 배치에 맞춰 조정.
+    floor_pair_spacing_tolerance_m: 0.18  # 기대 거리 허용 폭.
+    floor_pair_min_spacing_m: 0.15        # 너무 가까운 두 bbox는 같은 표식/벽 후보로 보고 제외.
+    floor_pair_max_spacing_m: 0.65        # 너무 먼 두 bbox는 바닥 pair 후보에서 제외.
+    min_pair_score: 0.35                  # 자동 floor pair 채택 최소 점수.
+    manual_floor_pair_indices: [-1, -1]   # 수동 pair 선택 시 arrival 검출 순서 2개. 예: [0, 2]
+    use_body_arrival_fallback: true        # wide가 arrival를 못 잡을 때 body 검출을 바닥 pair fallback으로 사용.
+    corner_direction_deg: 135.0           # field 기준 코너 방향 후진 벡터.
+    target_yaw_deg: -45.0                 # 주차 시 로봇 전방 목표 yaw.
+    parking_depth_offset_m: 0.05          # 바닥 pair 평균점에서 코너 방향으로 더 들어갈 base 중심 거리.
+    position_tol_m: 0.03                  # SUCCESS 위치 허용오차.
+    yaw_tol_deg: 5.0                      # SUCCESS yaw 허용오차.
+    body_ground_homography_path: "/home/seventt/seventt/workspace/data/calib/body_ground.npz"
+    body_px_scale_x: 2.5625               # body 이미지 640px를 1640px calibration domain으로 환산.
+    body_px_scale_y: 2.566667             # body 이미지 480px를 1232px calibration domain으로 환산.
+    body_workspace_m: [0.20, 0.75, -0.45, 0.45]  # arrival fallback용 body homography 유효 범위.

@@ -24,8 +24,28 @@ gi.require_version("Gst", "1.0")
 from gi.repository import Gst  # noqa: E402
 
 
+def _nvargus_source_props(exposuretimerange: str = "", gainrange: str = "",
+                          aelock: bool = False, awblock: bool = False,
+                          nvargus_extra: str = "") -> str:
+    props = []
+    if exposuretimerange:
+        props.append(f'exposuretimerange="{exposuretimerange}"')
+    if gainrange:
+        props.append(f'gainrange="{gainrange}"')
+    if aelock:
+        props.append("aelock=true")
+    if awblock:
+        props.append("awblock=true")
+    if nvargus_extra:
+        props.append(nvargus_extra.strip())
+    return (" " + " ".join(props)) if props else ""
+
+
 def make_gst_pipeline(sensor_id: int, sensor_mode: int, width: int, height: int, fps: int,
-                      flip: int, wbmode: int, out_width: int = 0, out_height: int = 0) -> str:
+                      flip: int, wbmode: int, out_width: int = 0, out_height: int = 0,
+                      exposuretimerange: str = "", gainrange: str = "",
+                      aelock: bool = False, awblock: bool = False,
+                      nvargus_extra: str = "") -> str:
     # nvvidconv (VIC) rescales on-GPU for free: keep the sensor caps at full FOV (width/height) and
     # ask the OUTPUT caps for a smaller frame. Per-frame CPU (all the copies + DDS serialize + every
     # subscriber's deserialize) is O(pixels), so this is the one lever that cuts it enough for 15 Hz.
@@ -33,8 +53,12 @@ def make_gst_pipeline(sensor_id: int, sensor_mode: int, width: int, height: int,
     out_caps = "video/x-raw, format=BGRx"
     if out_width > 0 and out_height > 0:
         out_caps += f", width={out_width}, height={out_height}"
+    source_props = _nvargus_source_props(
+        exposuretimerange, gainrange, aelock, awblock, nvargus_extra
+    )
     return (
-        f"nvarguscamerasrc sensor-id={sensor_id} sensor-mode={sensor_mode} wbmode={wbmode} "
+        f"nvarguscamerasrc sensor-id={sensor_id} sensor-mode={sensor_mode} wbmode={wbmode}"
+        f"{source_props} "
         f"! video/x-raw(memory:NVMM), width={width}, height={height}, "
         f"framerate={fps}/1, format=NV12 "
         f"! nvvidconv flip-method={flip} "
@@ -101,6 +125,13 @@ class CameraCsiNode(Node):
         # MUST match the training-capture pipeline (csi_capture.py): wbmode=8 (shade). The old
         # default (no wbmode -> nvargus auto) fed YOLO a different colour cast than it trained on.
         self.declare_parameter("wbmode", 8)
+        # Manual exposure/gain hooks. Empty ranges keep nvargus defaults; non-empty values should
+        # use the gst-inspect format, e.g. "8000000 8000000" ns and "1 1" gain.
+        self.declare_parameter("exposuretimerange", "")
+        self.declare_parameter("gainrange", "")
+        self.declare_parameter("aelock", False)
+        self.declare_parameter("awblock", False)
+        self.declare_parameter("nvargus_extra", "")
         # Post-capture per-channel WB gains [B,G,R] (body cam training used 1.16/1.08/0.82 to kill
         # the magenta cast). [1,1,1] = off (wide cam).
         self.declare_parameter("wb_gains", [1.0, 1.0, 1.0])
@@ -121,6 +152,11 @@ class CameraCsiNode(Node):
         self.fps = int(self.get_parameter("fps").value)
         self.flip = int(self.get_parameter("flip_method").value)
         self.wbmode = int(self.get_parameter("wbmode").value)
+        self.exposuretimerange = str(self.get_parameter("exposuretimerange").value).strip()
+        self.gainrange = str(self.get_parameter("gainrange").value).strip()
+        self.aelock = bool(self.get_parameter("aelock").value)
+        self.awblock = bool(self.get_parameter("awblock").value)
+        self.nvargus_extra = str(self.get_parameter("nvargus_extra").value).strip()
         gains = [float(g) for g in self.get_parameter("wb_gains").value]
         self._wb = np.array(gains[:3], dtype=np.float32).reshape(1, 1, 3) if len(gains) >= 3 else None
         self._apply_wb = self._wb is not None and not np.allclose(self._wb, 1.0)
@@ -141,7 +177,9 @@ class CameraCsiNode(Node):
 
         pipeline = make_gst_pipeline(self.sensor_id, self.sensor_mode, self.width, self.height,
                                      self.fps, self.flip, self.wbmode,
-                                     self.out_width, self.out_height)
+                                     self.out_width, self.out_height,
+                                     self.exposuretimerange, self.gainrange,
+                                     self.aelock, self.awblock, self.nvargus_extra)
         self.get_logger().info(f"GStreamer pipeline: {pipeline}")
 
         self.cap = GstCsiCapture(pipeline)

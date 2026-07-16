@@ -15,6 +15,7 @@ from __future__ import annotations
 import math
 import os
 import time
+from collections import deque
 from typing import Any
 
 import numpy as np
@@ -52,6 +53,8 @@ class WallLocalizerNode(Node):
         self.declare_parameter("image_rotated_180", True)
         self.declare_parameter("wide_homography_path",
                                "/home/seventt/seventt/workspace/data/calib/wide_ground.npz")
+        self.declare_parameter("cam_offset_x", 0.0)
+        self.declare_parameter("cam_offset_y", 0.0)
         self.declare_parameter("rate_hz", 3.0)
         self.declare_parameter("ignore_robot_rect", [0.34, 0.25, 0.66, 0.88])  # normalized x1,y1,x2,y2
         self.declare_parameter("max_range_m", 2.6)           # ignore projections beyond the arena+
@@ -73,6 +76,8 @@ class WallLocalizerNode(Node):
         self.declare_parameter("field_half_extent_m", 2.0)
         self.declare_parameter("wall_field_max_residual_m", 0.80)
         self.declare_parameter("wall_field_smoothing", 0.25)
+        self.declare_parameter("wall_field_fast_smoothing", 1.0)
+        self.declare_parameter("wall_field_filter_window", 5)
 
         self.fx = float(self.get_parameter("top_fx").value)
         self.fy = float(self.get_parameter("top_fy").value)
@@ -80,6 +85,8 @@ class WallLocalizerNode(Node):
         self.cy = float(self.get_parameter("top_cy").value)
         d = [float(v) for v in self.get_parameter("dist_coeffs").value]
         self.rot180 = bool(self.get_parameter("image_rotated_180").value)
+        self.cam_offset_x = float(self.get_parameter("cam_offset_x").value)
+        self.cam_offset_y = float(self.get_parameter("cam_offset_y").value)
         self.ignore_robot_rect = [float(v) for v in self.get_parameter("ignore_robot_rect").value]
         self.max_range = float(self.get_parameter("max_range_m").value)
         self.use_segmentation_mask = bool(self.get_parameter("use_segmentation_mask").value)
@@ -107,6 +114,12 @@ class WallLocalizerNode(Node):
             self.get_parameter("wall_field_max_residual_m").value
         )
         self.wall_field_smoothing = float(self.get_parameter("wall_field_smoothing").value)
+        self.wall_field_fast_smoothing = float(
+            self.get_parameter("wall_field_fast_smoothing").value
+        )
+        self.wall_field_filter_window = max(
+            1, int(self.get_parameter("wall_field_filter_window").value)
+        )
 
         self._K = np.array([[self.fx, 0, self.cx], [0, self.fy, self.cy], [0, 0, 1]], np.float64)
         self._D = np.array(d[:4], np.float64).reshape(4, 1)
@@ -127,10 +140,15 @@ class WallLocalizerNode(Node):
         self._wall_anchor_pose: tuple[float, float, float] | None = None
         self._wall_anchor_ema = np.zeros(3, dtype=np.float64)
         self._wall_field_ema = np.zeros(3, dtype=np.float64)
+        self._wall_field_history: deque[np.ndarray] = deque(maxlen=self.wall_field_filter_window)
+        self._wall_fast_correction = False
         self._load_segmentation_model()
 
         self.create_subscription(PoseStamped, "/localization/pose", self.on_pose, 10)
         self.create_subscription(Bool, "/localization/is_stationary", self.on_stationary, 10)
+        self.create_subscription(
+            Bool, "/localization/wall_fast_correction", self.on_wall_fast_correction, 10
+        )
         self.create_subscription(Image, "/camera_top/image_raw", self.on_img, qos_profile_sensor_data)
         self.pub_segments = self.create_publisher(Float32MultiArray, "/localization/wall_segments", 10)
         self.pub_raw_segments = self.create_publisher(
@@ -166,6 +184,12 @@ class WallLocalizerNode(Node):
     def on_stationary(self, msg: Bool) -> None:
         self._stationary = bool(msg.data)
 
+    def on_wall_fast_correction(self, msg: Bool) -> None:
+        fast = bool(msg.data)
+        if fast and not self._wall_fast_correction:
+            self._wall_field_history.clear()
+        self._wall_fast_correction = fast
+
     def on_img(self, msg: Image) -> None:
         self._img = msg
 
@@ -178,6 +202,8 @@ class WallLocalizerNode(Node):
         if self.rot180:
             n = -n
         out = cv2.perspectiveTransform(n.reshape(-1, 1, 2), self._Hmat).reshape(-1, 2)
+        out[:, 0] += self.cam_offset_x
+        out[:, 1] += self.cam_offset_y
         return out
 
     def _robot_rect_px(self, shape: tuple[int, int]) -> tuple[int, int, int, int]:
@@ -669,14 +695,50 @@ class WallLocalizerNode(Node):
 
         if not x_residuals and not y_residuals:
             return
-        correction = np.array([0.0, 0.0, dtheta], dtype=np.float64)
+        correction = np.array([math.nan, math.nan, dtheta], dtype=np.float64)
         if x_residuals:
             correction[0] = float(np.median(x_residuals))
         if y_residuals:
             correction[1] = float(np.median(y_residuals))
+
+        # A wall correction is a measurement, not a command. If an axis is not observed in the
+        # current frame, decay that axis toward zero instead of replaying an old correction forever.
+        # Also reset history when the measured correction crosses zero so EMA lag cannot keep
+        # pushing the pose past the wall.
+        sign_flip = any(
+            math.isfinite(float(correction[i]))
+            and abs(float(correction[i])) > 1e-6
+            and abs(float(self._wall_field_ema[i])) > 1e-6
+            and float(correction[i]) * float(self._wall_field_ema[i]) < 0.0
+            for i in range(3)
+        )
+        if sign_flip:
+            self._wall_field_history.clear()
+            self._wall_field_ema[:] = 0.0
+
+        if self._wall_fast_correction:
+            filtered = np.array(
+                [
+                    correction[i] if math.isfinite(float(correction[i])) else 0.0
+                    for i in range(3)
+                ],
+                dtype=np.float64,
+            )
+        else:
+            self._wall_field_history.append(correction)
+            hist = np.stack(list(self._wall_field_history), axis=0)
+            filtered = np.empty(3, dtype=np.float64)
+            for i in range(3):
+                if not math.isfinite(float(correction[i])):
+                    filtered[i] = 0.0
+                    continue
+                values = hist[:, i]
+                values = values[np.isfinite(values)]
+                filtered[i] = float(np.median(values)) if values.size else float(correction[i])
         # EMA prevents a single-frame mask jitter from moving the pose visibly.
-        a = max(0.0, min(1.0, self.wall_field_smoothing))
-        self._wall_field_ema = (1.0 - a) * self._wall_field_ema + a * correction
+        smoothing = self.wall_field_fast_smoothing if self._wall_fast_correction else self.wall_field_smoothing
+        a = max(0.0, min(1.0, smoothing))
+        self._wall_field_ema = (1.0 - a) * self._wall_field_ema + a * filtered
         confidence = min(1.0, (len(x_residuals) + len(y_residuals)) / 2.0)
         msg = Float32MultiArray()
         msg.data = [*map(float, self._wall_field_ema), float(confidence)]

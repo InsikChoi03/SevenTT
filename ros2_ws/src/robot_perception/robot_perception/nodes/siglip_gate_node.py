@@ -57,6 +57,15 @@ class SiglipGateNode(Node):
         self.declare_parameter("model_id", "google/siglip-base-patch16-224")
         self.declare_parameter("set2_label", "apple")
         self.declare_parameter("fruit_labels", ["apple", "orange", "banana", "pineapple"])
+        self.declare_parameter(
+            "fruit_prompt_templates",
+            [
+                "a photo of a {fruit}",
+                "a printed photo of a {fruit}",
+                "a {fruit} printed on paper",
+            ],
+        )
+        self.declare_parameter("fruit_prompt_pooling", "max")  # max | mean
         self.declare_parameter("confidence_threshold", 0.7)
         self.declare_parameter("device", "auto")
         self.declare_parameter("min_box_area", 400)
@@ -77,6 +86,15 @@ class SiglipGateNode(Node):
         self.model_id = str(self.get_parameter("model_id").value)
         self.set2_label = str(self.get_parameter("set2_label").value)
         self.fruit_labels = [str(f) for f in self.get_parameter("fruit_labels").value]
+        self.fruit_prompt_templates = [
+            str(p) for p in self.get_parameter("fruit_prompt_templates").value
+        ] or ["a photo of a {fruit}"]
+        self.fruit_prompt_pooling = str(self.get_parameter("fruit_prompt_pooling").value).lower()
+        if self.fruit_prompt_pooling not in {"max", "mean"}:
+            self.get_logger().warn(
+                f"unknown fruit_prompt_pooling='{self.fruit_prompt_pooling}', using max"
+            )
+            self.fruit_prompt_pooling = "max"
         self.confidence_threshold = float(self.get_parameter("confidence_threshold").value)
         device_param = str(self.get_parameter("device").value)
         self.min_box_area = int(self.get_parameter("min_box_area").value)
@@ -91,8 +109,16 @@ class SiglipGateNode(Node):
         # Latest fruit-cube candidates awaiting a (throttled, batched) SigLIP pass: (frame, dets, stamp).
         self._pending: Optional[tuple] = None
 
-        # Text prompts: fruit prompts first, then the two discriminator prompts.
-        self.fruit_prompts = [f"a photo of a {fruit}" for fruit in self.fruit_labels]
+        # Text prompts: all fruit prompt variants first, then the two discriminator prompts. Fruit
+        # variants are pooled back into one score per fruit before the fruit softmax/margin gate.
+        self.fruit_prompt_groups: list[tuple[str, list[int]]] = []
+        self.fruit_prompts: list[str] = []
+        for fruit in self.fruit_labels:
+            indices: list[int] = []
+            for tmpl in self.fruit_prompt_templates:
+                indices.append(len(self.fruit_prompts))
+                self.fruit_prompts.append(tmpl.format(fruit=fruit))
+            self.fruit_prompt_groups.append((fruit, indices))
         self.prompts = self.fruit_prompts + [PROMPT_IMAGE_FACE, PROMPT_PLAIN_CUBE]
 
         self.device = self._resolve_device(device_param)
@@ -112,6 +138,7 @@ class SiglipGateNode(Node):
         self.get_logger().info(
             f"model_id='{self.model_id}' device={self.device} "
             f"set2_label='{self.set2_label}' fruits={self.fruit_labels} "
+            f"fruit_prompts={len(self.fruit_prompts)} pooling={self.fruit_prompt_pooling} "
             f"thresh={self.confidence_threshold} min_box_area={self.min_box_area}"
         )
 
@@ -237,19 +264,28 @@ class SiglipGateNode(Node):
             self.get_logger().warn(f"SigLIP inference failed: {exc}", throttle_duration_sec=5.0)
             return
 
-        n_fruits = len(self.fruit_labels)
+        n_fruit_prompts = len(self.fruit_prompts)
+        n_fruits = len(self.fruit_prompt_groups)
         best = None          # (rank_key, label, margin, best_soft, image_face_visible, is_target)
         for logits in logits_all:
             sig = 1.0 / (1.0 + np.exp(-logits))          # sigmoid for the face discriminator
-            image_face_visible = float(sig[n_fruits]) > float(sig[n_fruits + 1])
-            # Fruit TYPE = SOFTMAX over fruit prompts; reliability = MARGIN over the runner-up
+            image_face_visible = float(sig[n_fruit_prompts]) > float(sig[n_fruit_prompts + 1])
+            # Fruit TYPE = pool prompt variants per fruit, then SOFTMAX over fruits. Reliability =
+            # MARGIN over the runner-up fruit (bigger gap -> more trust), published as confidence.
             # (bigger gap -> more trust), published as `confidence` for the world model's vote weight.
-            fl = logits[:n_fruits]
+            fruit_scores = []
+            for _fruit, indices in self.fruit_prompt_groups:
+                vals = logits[indices]
+                if self.fruit_prompt_pooling == "mean":
+                    fruit_scores.append(float(np.mean(vals)))
+                else:
+                    fruit_scores.append(float(np.max(vals)))
+            fl = np.asarray(fruit_scores, dtype=np.float64)
             e = np.exp(fl - fl.max())
             soft = e / e.sum()
             order = np.argsort(soft)[::-1]
             best_idx = int(order[0])
-            label = self.fruit_labels[best_idx]
+            label = self.fruit_prompt_groups[best_idx][0]
             best_soft = float(soft[best_idx])
             margin = best_soft - float(soft[order[1]]) if n_fruits > 1 else best_soft
             is_target = (

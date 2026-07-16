@@ -1,0 +1,149 @@
+parking_controller_node:
+  ros__parameters:
+    # Safety: observe-only by default. Real wheel output requires drive_enabled=true,
+    # armed=true, START, and a live /parking_test/deadman heartbeat.
+    drive_enabled: false
+    armed: false
+    auto_start: false
+    require_deadman: true
+    deadman_timeout_sec: 0.5
+    check_base_command_publishers: true
+    detection_timeout_sec: 1.5
+    pose_timeout_sec: 1.0
+    control_rate_hz: 20.0
+
+    # Competition-like test route: start at the quadrant-2 side, avoid world-model objects,
+    # drive toward a rough quadrant-1 staging pose, then wait for a stable wide floor
+    # arrival view near the computed reverse-start pose before parking.
+    route_to_zone4_enabled: true
+    route_requires_world_model: true
+    startup_warmup_sec: 15.0
+    startup_perception_stable_sec: 0.0
+    startup_requires_detections: false
+    startup_requires_world_model: false
+    world_model_timeout_sec: 1.5
+    route_timeout_sec: 35.0
+    opening_enabled: true
+    opening_forward_sec: 1.5
+    opening_forward_speed: 0.10
+    opening_strafe_right_sec: 1.0
+    opening_strafe_speed: 0.18
+    opening_turn_deg: 45.0
+    opening_turn_omega: -0.255
+    opening_wait_after_turn_sec: 1.0
+    zone4_staging_x: 1.35
+    zone4_staging_y: 1.35
+    zone4_staging_yaw_deg: -135.0
+    route_goal_tol_m: 0.12
+    route_goal_yaw_tol_deg: 12.0
+    route_waypoint_tol_m: 0.12
+    route_replan_sec: 1.0
+    route_max_speed: 0.16
+    route_min_speed: 0.04
+    route_kp_lin: 0.8
+    route_kp_ang: 1.2
+    route_max_omega: 0.35
+    route_face_tol_deg: 25.0
+    route_yaw_deadband_deg: 6.0
+    route_fine_radius_m: 0.18
+    route_field_bounds_m: [-2.0, 2.0, -2.0, 2.0]
+    route_robot_margin_m: 0.24
+    route_grid_spacing_m: 0.50
+    route_obstacle_block_radius_m: 0.24
+    route_obstacle_comfort_m: 0.35
+    route_obstacle_min_conf: 0.35
+    route_obstacle_min_nobs: 2
+    route_exclude_goal_radius_m: 0.35
+    prepark_search_omega: -0.08
+    prepark_approach_max_speed: 0.07
+
+    # Zone-4 / arrival layout hint.
+    arrival_label: "arrival"
+    center_hint_x: 1.8
+    center_hint_y: 1.8
+    center_hint_scale_m: 0.65
+    floor_pair_spacing_m: 0.36
+    floor_pair_spacing_tolerance_m: 0.18
+    floor_pair_min_spacing_m: 0.15
+    floor_pair_max_spacing_m: 0.65
+    min_pair_score: 0.35
+    manual_floor_pair_indices: [-1, -1]
+    use_body_arrival_fallback: true
+    parking_start_requires_wide: true
+    parking_start_stable_sec: 1.0
+    parking_start_min_pair_score: 0.35
+    parking_start_min_bbox_height_px: 18.0
+    parking_start_min_bbox_area_px: 400.0
+    parking_start_max_reverse_start_dist_m: 0.60
+
+    # Parking target: robot base center moves past the floor-pair mean toward the corner.
+    corner_direction_deg: 45.0
+    target_yaw_deg: -135.0
+    parking_depth_offset_m: 0.05
+    latch_stable_sec: 1.0
+    position_tol_m: 0.03
+    yaw_tol_deg: 5.0
+    total_timeout_sec: 6.0
+    approach_timeout_sec: 6.0
+    approach_standoff_m: 0.22
+    approach_pos_tol_m: 0.05
+    approach_max_speed: 0.08
+    approach_min_speed: 0.035
+    turn_timeout_sec: 2.0
+    reverse_timeout_sec: 3.0
+    max_reverse_speed: 0.10
+    min_reverse_speed: 0.035
+    lateral_error_threshold_m: 0.05
+    max_blind_reverse_m: 0.05
+
+    # Wide camera calibration. These mirror robot_bringup/config/perception.yaml.
+    top_fx: 669.125
+    top_fy: 670.185
+    top_cx: 639.976
+    top_cy: 479.677
+    fisheye_model: true
+    dist_coeffs: [-0.085721, 0.053910, -0.034649, 0.007943]
+    image_rotated_180: true
+    wide_homography_path: "/home/seventt/seventt/workspace/data/calib/wide_ground.npz"
+    cam_height_m: 0.885
+    cam_pitch_deg: 88.0
+    cam_offset_x: -0.15
+    cam_offset_y: 0.0
+    cam_yaw_deg: 90.0
+    body_ground_homography_path: "/home/seventt/seventt/workspace/data/calib/body_ground.npz"
+    body_px_scale_x: 2.5625
+    body_px_scale_y: 2.566667
+    body_workspace_m: [0.20, 0.75, -0.45, 0.45]
+
+localizer_node:
+  ros__parameters:
+    # Competition-like arrival parking test starts near quadrant 2 and moves in +x.
+    initial_x: -1.8
+    initial_y: 1.8
+    initial_theta: 0.0
+    use_object_flow: true
+    use_object_landmarks: true
+    use_landmark_correction: false
+
+base_controller_node:
+  ros__parameters:
+    cmd_timeout_sec: 0.5
+
+mcu_bridge_base_node:
+  ros__parameters:
+    publish_encoder_odom: true
+    publish_heartbeat_as_odom: false
+
+yolo_detector_node:
+  ros__parameters:
+    # Match the camera-domain-specific models used by the main perception pipeline.
+    top_model_path: "/home/seventt/seventt/workspace/models/wide.pt"
+    body_model_path: "/home/seventt/seventt/workspace/models/cube.pt"
+    conf_threshold: 0.5
+    imgsz: 640
+    top_imgsz: 1280
+    body_imgsz: 640
+    device: "cuda"
+    half: true
+    enable_top: true
+    enable_body: true

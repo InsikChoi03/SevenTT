@@ -44,11 +44,22 @@ class BaseControllerNode(Node):
         # get floored to wheel_min and spin too fast; set this LOWER for a slow-but-moving CW/CCW turn
         # (the start-boost still breaks static friction, then it relaxes to this). Raise if it stalls.
         self.declare_parameter("wheel_min_rot", 0.07)
-        # STATIC friction from REST is higher, so strafe/rotation starts kick to this for
-        # wheel_boost_ms, then relax to wheel_min/wheel_min_rot. Forward starts stay unboosted so
-        # straight-line tuning is not disturbed.
+        # STATIC friction from REST is higher, so strafe/rotation starts get a short breakaway kick,
+        # then relax to wheel_min/wheel_min_rot. Forward starts stay unboosted so straight-line tuning
+        # is not disturbed. `wheel_boost` is kept as a legacy fallback for older YAML files.
         self.declare_parameter("wheel_boost", 0.60)
+        legacy_boost = float(self.get_parameter("wheel_boost").value)
+        self.declare_parameter("wheel_boost_strafe", legacy_boost)
+        self.declare_parameter("wheel_boost_rot", legacy_boost)
         self.declare_parameter("wheel_boost_ms", 120)
+        # OPENING has its own tuning so match-start motion can be made assertive without changing
+        # normal SCAN/APPROACH/ALIGN behavior.
+        self.declare_parameter("opening_wheel_min", 0.0)
+        self.declare_parameter("opening_wheel_min_strafe", 0.0)
+        self.declare_parameter("opening_wheel_min_rot", 0.0)
+        self.declare_parameter("opening_wheel_boost_strafe", legacy_boost)
+        self.declare_parameter("opening_wheel_boost_rot", legacy_boost)
+        self.declare_parameter("opening_wheel_boost_ms", 120)
         self.declare_parameter("wheel_deadband", 0.02)   # below this = treat as stop
         # BRAKE: mirror of the start boost. The heavy base coasts past target after a command stops,
         # so on EVERY move->stop we emit a brief reverse pulse (opposite the last travel direction,
@@ -70,8 +81,17 @@ class BaseControllerNode(Node):
         self.strafe_left = sl if len(sl) == 4 else [0.65, 0.75, 0.75, 0.65]
         self.wheel_min = float(self.get_parameter("wheel_min").value)
         self.wheel_min_rot = float(self.get_parameter("wheel_min_rot").value)
-        self.wheel_boost = float(self.get_parameter("wheel_boost").value)
+        self.wheel_boost_strafe = float(self.get_parameter("wheel_boost_strafe").value)
+        self.wheel_boost_rot = float(self.get_parameter("wheel_boost_rot").value)
         self.wheel_boost_ms = float(self.get_parameter("wheel_boost_ms").value)
+        self.opening_wheel_min = float(self.get_parameter("opening_wheel_min").value)
+        self.opening_wheel_min_strafe = float(self.get_parameter("opening_wheel_min_strafe").value)
+        self.opening_wheel_min_rot = float(self.get_parameter("opening_wheel_min_rot").value)
+        self.opening_wheel_boost_strafe = float(
+            self.get_parameter("opening_wheel_boost_strafe").value
+        )
+        self.opening_wheel_boost_rot = float(self.get_parameter("opening_wheel_boost_rot").value)
+        self.opening_wheel_boost_ms = float(self.get_parameter("opening_wheel_boost_ms").value)
         self.wheel_deadband = float(self.get_parameter("wheel_deadband").value)
         self.wheel_brake_ms = float(self.get_parameter("wheel_brake_ms").value)
         self.wheel_brake_scale = float(self.get_parameter("wheel_brake_scale").value)
@@ -172,17 +192,37 @@ class BaseControllerNode(Node):
             # its own floor, while strafe/rotation starts also get a short breakaway boost.
             is_rot = abs(vx) < 0.02 and abs(vy) < 0.02 and abs(omega) > 1e-3
             is_strafe = abs(vy) >= 0.02 and abs(vy) >= abs(vx)
+            opening = self._mstate == "OPENING"
+            boost = 0.0
+            boost_ms = self.wheel_boost_ms
+            if opening and is_rot:
+                boost = self.opening_wheel_boost_rot
+                boost_ms = self.opening_wheel_boost_ms
+            elif opening and is_strafe:
+                boost = self.opening_wheel_boost_strafe
+                boost_ms = self.opening_wheel_boost_ms
+            elif is_rot:
+                boost = self.wheel_boost_rot
+            elif is_strafe:
+                boost = self.wheel_boost_strafe
             if (not aligning and not was_moving and (is_rot or is_strafe)
-                    and self.wheel_boost > 0.0 and self.wheel_boost_ms > 0.0):
-                self._boost_until = now + self.wheel_boost_ms / 1000.0
-            steady_floor = self.wheel_min_rot if is_rot else self.wheel_min
+                    and boost > 0.0 and boost_ms > 0.0):
+                self._boost_until = now + boost_ms / 1000.0
+            if opening and is_rot and self.opening_wheel_min_rot > 0.0:
+                steady_floor = self.opening_wheel_min_rot
+            elif opening and is_strafe and self.opening_wheel_min_strafe > 0.0:
+                steady_floor = self.opening_wheel_min_strafe
+            elif opening and self.opening_wheel_min > 0.0:
+                steady_floor = self.opening_wheel_min
+            else:
+                steady_floor = self.wheel_min_rot if is_rot else self.wheel_min
             if 0.0 < m < steady_floor:
                 s = steady_floor / m
                 wheels = [max(-1.0, min(1.0, w * s)) for w in wheels]
             if (is_rot or is_strafe) and now < self._boost_until:
                 bm = max(abs(w) for w in wheels)
-                if 0.0 < bm < self.wheel_boost:
-                    s = self.wheel_boost / bm
+                if 0.0 < bm < boost:
+                    s = boost / bm
                     wheels = [max(-1.0, min(1.0, w * s)) for w in wheels]
                 kick = True                           # boost pulse must hit immediately
             self._last_move_wheels = list(wheels)     # remember travel direction for the stop brake

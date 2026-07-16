@@ -30,7 +30,7 @@ from rclpy.node import Node
 from rcl_interfaces.msg import SetParametersResult
 
 from geometry_msgs.msg import PoseStamped, Vector3
-from std_msgs.msg import Float32MultiArray, UInt64
+from std_msgs.msg import Bool, Float32MultiArray, UInt64
 from robot_interfaces.msg import Classification, DetectionArray, Object, WorldModel
 
 # cv2/numpy only needed for the fisheye ray (top cam is a ~150 deg fisheye). Guarded so the
@@ -119,6 +119,10 @@ class WorldModelNode(Node):
 
         # Publish / tracker timing.
         self.declare_parameter("publish_rate_hz", 10.0)
+        # When false, detections are ignored and no object tracks/slots are born. This lets the
+        # opening motion finish and wall correction settle before the first field-grid objects are
+        # committed to the map.
+        self.declare_parameter("mapping_enabled_initially", True)
 
         # Top-cam intrinsics (pixels). Any zero -> cannot project (warn, pose only).
         self.declare_parameter("top_fx", 0.0)
@@ -451,6 +455,7 @@ class WorldModelNode(Node):
         self.robot_y: float = 0.0
         self.robot_theta: float = 0.0
         self.have_pose: bool = False
+        self.mapping_enabled = bool(self.get_parameter("mapping_enabled_initially").value)
         # Short robot-pose history (t, x, y, theta) so a detection can be projected at the ROBOT POSE
         # AT IMAGE-CAPTURE TIME (see _pose_at) rather than at message-arrival time — the inference
         # delay otherwise smears the map during rotation. ~3 s at the 20 Hz pose rate covers any
@@ -480,6 +485,7 @@ class WorldModelNode(Node):
         self.create_subscription(DetectionArray, "/camera_body/detections", self.on_body_detections, 10)
         self.create_subscription(Classification, "/classification/siglip", self.on_siglip, 10)
         self.create_subscription(PoseStamped, "/localization/pose", self.on_pose, 10)
+        self.create_subscription(Bool, "/world_model/mapping_enabled", self.on_mapping_enabled, 10)
         self.create_subscription(
             Float32MultiArray, "/localization/wall_map_transform", self.on_wall_map_transform, 10
         )
@@ -514,6 +520,7 @@ class WorldModelNode(Node):
             f"rot180={self.rotated_180} body_fusion={self.can_project_body} "
             f"landmark_corr={self.landmark_correction} "
             f"grid_prior={self.grid_prior_enabled} grid_points={len(self._grid_points)} "
+            f"mapping_enabled={self.mapping_enabled} "
             f"cam_h={self.cam_height}m pitch={self.cam_pitch_deg}deg yaw={self.cam_yaw_deg}deg "
             f"offset=({self.cam_offset_x},{self.cam_offset_y}) "
             f"arm_base_off=({self.arm_base_off_x},{self.arm_base_off_y}) body_ws={self.body_ws} "
@@ -574,6 +581,17 @@ class WorldModelNode(Node):
 
     def _now_sec(self) -> float:
         return self.get_clock().now().nanoseconds * 1e-9
+
+    def _clear_mapping_state(self) -> None:
+        self.tracks.clear()
+        self._candidates.clear()
+        self._next_id = 1
+        self._last_body_fruit_id = None
+        self._last_body_fruit_sec = 0.0
+        self._prev_wide_base = []
+        self._proj_wide = []
+        self._proj_body = []
+        self._corr_pairs.clear()
 
     def _on_parameters_changed(self, params) -> SetParametersResult:
         """Allow the grid prior and its debug logging to be toggled without restarting ROS."""
@@ -732,6 +750,21 @@ class WorldModelNode(Node):
         self._pose_hist.append((t if t > 0.0 else self._now_sec(),
                                 self.robot_x, self.robot_y, self.robot_theta))
 
+    def on_mapping_enabled(self, msg: Bool) -> None:
+        enabled = bool(msg.data)
+        if enabled == self.mapping_enabled:
+            return
+        self.mapping_enabled = enabled
+        # Start the grid-prior initial phase from the first trusted mapping frame, not from process
+        # startup while the robot is still doing its opening move.
+        if enabled:
+            self._grid_start_sec = self._now_sec()
+            self._clear_mapping_state()
+            self.get_logger().info("object mapping enabled after opening wall-settle")
+        else:
+            self._clear_mapping_state()
+            self.get_logger().info("object mapping disabled")
+
     def on_wall_map_transform(self, msg: Float32MultiArray) -> None:
         """Move robot history, tracks and anchors by the same wall-alignment transform."""
         if len(msg.data) < 3:
@@ -774,6 +807,10 @@ class WorldModelNode(Node):
         self.get_logger().info(f"blacklisted track id={track.id}")
 
     def on_detections(self, msg: DetectionArray) -> None:
+        if not self.mapping_enabled:
+            self._prev_wide_base = []
+            self._proj_wide = []
+            return
         if not self.can_project:
             self.get_logger().warn(
                 "top-cam detections received but projection disabled (intrinsics unset)",
@@ -831,6 +868,9 @@ class WorldModelNode(Node):
 
     def on_body_detections(self, msg: DetectionArray) -> None:
         """Body-cam detections: project via the pick homography and fuse (body wins identity)."""
+        if not self.mapping_enabled:
+            self._proj_body = []
+            return
         if not self.can_project_body:
             self.get_logger().warn(
                 "body-cam detections received but homography unavailable; skipping",
@@ -1627,9 +1667,12 @@ class WorldModelNode(Node):
 
     def tick(self) -> None:
         now = self._now_sec()
-        self._merge_duplicates()
-        self._apply_negative_evidence(now)
-        self._forget_stale(now)
+        if self.mapping_enabled:
+            self._merge_duplicates()
+            self._apply_negative_evidence(now)
+            self._forget_stale(now)
+        else:
+            self._clear_mapping_state()
 
         msg = WorldModel()
         msg.header.stamp = self.get_clock().now().to_msg()
