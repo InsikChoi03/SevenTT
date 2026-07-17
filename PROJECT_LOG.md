@@ -26,10 +26,10 @@
 
 ## 2. 현재 상태 (Snapshot — 이 섹션만 최신값으로 덮어쓰기)
 
-- **현재 버전:** `v1.5.0`
-- **최종 업데이트:** 2026-07-17 06:55 (KST)
+- **현재 버전:** `v1.6.0`
+- **최종 업데이트:** 2026-07-17 22:42 (KST)
 - **최종 작업자:** `@AI`
-- **한 줄 요약:** 경기 실주행 중 위치추정 흔들림을 줄이기 위해 엔코더 기반 motion constraint, 벽 보정 안전 모드, opening mapping gate, 회피/정렬 튜닝을 통합했다.
+- **한 줄 요약:** 통합 벽 segmentation 모델과 boundary gate 기반 벽선 추출을 적용하고, 위치보정·회피·진단 흐름을 실주행 기준으로 보강했다.
 
 ---
 
@@ -135,6 +135,37 @@
 ## 5. 변경 이력 (Changelog) — ⛔ 삭제 금지 / 최신 항목이 맨 위
 
 <!-- 새 엔트리는 바로 이 줄 아래에 추가하세요. 기존 엔트리는 건드리지 마세요. -->
+
+### `v1.6.0` — 2026-07-17 22:42 (KST) · 작업자: `@AI` · ID: `2026-07-17-02`
+- **변경 요약:** 통합 wall segmentation 모델을 기준으로 벽-바닥 경계 추출/검증을 재구성하고, 실주행 중 위치보정·회피·진단 튜닝을 보강했다.
+- **상세:**
+  - `wall_seg_v1.pt` 단일 모델에서 `wall_surface`와 `wall_floor_boundary` class를 함께 읽도록 벽 localizer를 변경했다.
+  - 두꺼운 wall surface mask에서 로봇 중심 방향의 floor-side edge를 여러 선분으로 추출하고, boundary mask와 겹치는 선분만 벽-바닥 경계로 쓰도록 gate를 추가했다.
+  - boundary gate가 너무 빡세게 작동해 벽 후보가 줄어드는 문제를 완화하기 위해 overlap/confidence/dilation/sample 간격을 실주행 테스트 기준으로 넓혔다.
+  - 주황 raw wall overlay가 `/localization/wall_map_transform`을 중복 적용해 과장되어 보이는 문제를 막고, wall localizer가 계산한 field-frame raw 관측을 그대로 표시하도록 시각화를 정리했다.
+  - 정지/settle/ALIGN/APPROACH standoff 등 실제로 멈춘 상태에서만 fast wall correction이 적용되도록 localizer와 wall localizer의 fast correction 조건을 보강했다.
+  - opening warmup을 늘리고, opening/settle 후 mapping gate와 wall correction 흐름을 실제 경기 초기 인식 안정화에 맞췄다.
+  - APPROACH 큰 전방 장애물 상황에서 direct fallback 대신 lateral escape waypoint를 만들도록 FSM planning fallback을 보강했다.
+  - 일반 전진용 최소 바퀴 출력과 일반 횡이동용 최소 바퀴 출력을 분리해, 횡이동 명령이 모터 삐소리만 내고 실제로 움직이지 않는 상황을 완화했다.
+  - wall raw segment를 base_link 기준으로 기록·비교하는 독립/메인 파이프라인 진단 스크립트를 추가했다.
+  - body 카메라 밝기를 초기 설정에 가깝게 되돌리기 위해 고정 exposure/gain lock을 제거했다.
+- **변경 파일:**
+  - `.gitignore` / 수정
+  - `ros2_ws/src/robot_bringup/config/motion_tuning.yaml` / 수정
+  - `ros2_ws/src/robot_bringup/config/perception.yaml` / 수정
+  - `ros2_ws/src/robot_bringup/config/test_field.yaml` / 수정
+  - `ros2_ws/src/robot_bringup/launch/cameras.launch.py` / 수정
+  - `ros2_ws/src/robot_control/robot_control/nodes/base_controller_node.py` / 수정
+  - `ros2_ws/src/robot_perception/robot_perception/nodes/localizer_node.py` / 수정
+  - `ros2_ws/src/robot_perception/robot_perception/nodes/recognition_viz_node.py` / 수정
+  - `ros2_ws/src/robot_perception/robot_perception/nodes/wall_localizer_node.py` / 수정
+  - `ros2_ws/src/robot_planning/robot_planning/nodes/mission_fsm_node.py` / 수정
+  - `scripts/run_wall_boundary_base_debug.sh` / 신규
+  - `scripts/wall_boundary_base_debug.py` / 신규
+  - `scripts/wall_distance_pause_diagnose.py` / 신규
+  - `PROJECT_LOG.md` / 수정
+- **다음 할 일 반영:** 통합 wall 모델의 boundary gate 통과율과 raw 주황선/base_link 상대거리, 횡이동 최소 출력, front escape waypoint 동작을 실주행에서 계속 검증한다.
+- **버전 근거:** 벽 segmentation 입력/추출 방식 변경, boundary 검증 gate 추가, 위치보정 조건 보강, 회피 waypoint 및 진단 도구 추가가 포함된 기능 단위 변경이므로 `MINOR` 버전 증가로 `v1.6.0`으로 올렸다.
 
 ### `v1.5.0` — 2026-07-17 06:55 (KST) · 작업자: `@AI` · ID: `2026-07-17-01`
 - **변경 요약:** 경기 실주행 중 pose drift와 벽 raw 오차 문제를 격리하고, 엔코더 기반 motion constraint와 메인 경기 안정화 튜닝을 통합했다.

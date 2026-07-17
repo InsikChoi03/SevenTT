@@ -408,6 +408,12 @@ class MissionFsmNode(Node):
         self.declare_parameter("obstacle_min_conf", 0.4)        # phantom filter for obstacles
         self.declare_parameter("obstacle_min_nobs", 2)
         self.declare_parameter("exclude_target_radius_m", 0.30)  # drop objects near dest (final leg reachable)
+        self.declare_parameter("front_escape_enabled", True)
+        self.declare_parameter("front_escape_x_min_m", 0.05)
+        self.declare_parameter("front_escape_x_max_m", 0.45)
+        self.declare_parameter("front_escape_y_abs_m", 0.25)
+        self.declare_parameter("front_escape_step_m", 0.25)
+        self.declare_parameter("front_escape_forward_m", 0.0)
         self.planner_enabled = bool(self.get_parameter("planner_enabled").value)
         fb = [float(v) for v in self.get_parameter("field_bounds_m").value]
         self.wp_reach_tol_m = float(self.get_parameter("wp_reach_tol_m").value)
@@ -417,6 +423,12 @@ class MissionFsmNode(Node):
         self.obstacle_min_conf = float(self.get_parameter("obstacle_min_conf").value)
         self.obstacle_min_nobs = int(self.get_parameter("obstacle_min_nobs").value)
         self.exclude_target_radius_m = float(self.get_parameter("exclude_target_radius_m").value)
+        self.front_escape_enabled = bool(self.get_parameter("front_escape_enabled").value)
+        self.front_escape_x_min_m = float(self.get_parameter("front_escape_x_min_m").value)
+        self.front_escape_x_max_m = float(self.get_parameter("front_escape_x_max_m").value)
+        self.front_escape_y_abs_m = float(self.get_parameter("front_escape_y_abs_m").value)
+        self.front_escape_step_m = float(self.get_parameter("front_escape_step_m").value)
+        self.front_escape_forward_m = float(self.get_parameter("front_escape_forward_m").value)
         self._planner = LanePlanner(
             spacing=float(self.get_parameter("grid_spacing_m").value),
             bounds=(fb[0], fb[1], fb[2], fb[3]) if len(fb) == 4 else (-2.0, 2.0, -2.0, 2.0),
@@ -432,6 +444,7 @@ class MissionFsmNode(Node):
         self._plan: list[tuple[float, float]] | None = None   # active via list (last = dest)
         self._plan_idx = 0
         self._plan_dest: tuple[float, float] | None = None
+        self._plan_escape = False
         self._plan_stamp = 0.0
         self._last_replan_t = 0.0
         self._coverage: list[tuple[float, float]] | None = None   # SCAN lane-sweep waypoints
@@ -605,11 +618,30 @@ class MissionFsmNode(Node):
     def _time_in_state(self) -> float:
         return self._now_s() - self.state_enter_s
 
+    def _wall_fast_correction_requested(self) -> bool:
+        """Request fast wall correction only in states intended to be stationary."""
+        if self.state in {
+            "OPENING",
+            "ZONE_STABILIZE",
+            "ALIGN",
+            "PICK",
+            "STORE_IN_TRAY",
+            "ALIGN_OVER_BIN",
+            "DUMP_ALL",
+        }:
+            return True
+        if self.state == "SCAN" and self._search_phase == "look":
+            return True
+        if self.state == "APPROACH" and self._standoff_arrived_s is not None:
+            return True
+        return False
+
     def _enter(self, new_state: str) -> None:
         prev = self.state
         self.state = new_state
         self.state_enter_s = self._now_s()
         self._plan = None                       # a state change invalidates the active travel plan
+        self._plan_escape = False
         if new_state == "ALIGN":
             self._align_phase = "measure"       # start each ALIGN by measuring the settled position
             self._yaw_scan_step = 0
@@ -1650,6 +1682,62 @@ class MissionFsmNode(Node):
             out.append((float(o.x), float(o.y)))
         return out
 
+    def _base_obstacles(
+        self,
+        obstacles: list[tuple[float, float]],
+    ) -> list[tuple[float, float, float, float]]:
+        """Obstacle list as (field_x, field_y, base_x, base_y)."""
+        if self.world is None:
+            return []
+        out: list[tuple[float, float, float, float]] = []
+        for ox, oy in obstacles:
+            base = self._to_base(ox, oy)
+            if base is None:
+                continue
+            bx, by = base
+            out.append((float(ox), float(oy), float(bx), float(by)))
+        return out
+
+    def _front_escape_waypoint(
+        self,
+        obstacles: list[tuple[float, float]],
+    ) -> tuple[float, float, int] | None:
+        """Return a latched side-step waypoint when a large obstacle blocks the front."""
+        if not self.front_escape_enabled or self.world is None:
+            return None
+        base_obs = self._base_obstacles(obstacles)
+        front = [
+            item for item in base_obs
+            if self.front_escape_x_min_m <= item[2] <= self.front_escape_x_max_m
+            and abs(item[3]) <= self.front_escape_y_abs_m
+        ]
+        if not front:
+            return None
+
+        left_penalty = 0.0
+        right_penalty = 0.0
+        for _ox, _oy, bx, by in base_obs:
+            if bx < -0.10 or bx > self.front_escape_x_max_m + 0.35:
+                continue
+            weight = 1.0 / max(0.08, math.hypot(bx, by))
+            if by >= 0.0:
+                left_penalty += weight
+            else:
+                right_penalty += weight
+        # +1 means robot-left escape; -1 means robot-right escape.
+        sign = 1 if left_penalty <= right_penalty else -1
+        step = max(0.05, abs(self.front_escape_step_m))
+        fwd = max(0.0, self.front_escape_forward_m)
+        th = float(self.world.robot_theta)
+        ct, st = math.cos(th), math.sin(th)
+        ex = float(self.world.robot_x) + fwd * ct - sign * step * st
+        ey = float(self.world.robot_y) + fwd * st + sign * step * ct
+        self._decide(
+            f"FRONT ESCAPE {'L' if sign > 0 else 'R'} "
+            f"front={len(front)} L={left_penalty:.1f} R={right_penalty:.1f}"
+        )
+        return ex, ey, sign
+
     def _publish_planning_obstacles(self, obstacles: list[tuple[float, float]]) -> None:
         """Share the exact obstacle set used for lane planning with local go-to-goal avoidance."""
         msg = PoseArray()
@@ -1686,7 +1774,16 @@ class MissionFsmNode(Node):
         if self._plan is None or ((drifted or stale) and now - self._last_replan_t >= self.replan_throttle_sec):
             self._last_replan_t = now
             vias = self._planner.plan(rxy, dest, obstacles)
-            self._plan = vias if vias else [dest]     # None (no lane route) -> direct goal fallback
+            self._plan_escape = False
+            if vias:
+                self._plan = vias
+            else:
+                escape = self._front_escape_waypoint(obstacles)
+                if escape is not None:
+                    self._plan = [(escape[0], escape[1])]
+                    self._plan_escape = True
+                else:
+                    self._plan = [dest]     # no lane route and no front block -> direct fallback
             self._plan_idx = 0
             self._plan_dest = dest
             self._plan_stamp = now
@@ -1702,6 +1799,14 @@ class MissionFsmNode(Node):
             else:
                 break
         wx, wy = self._plan[self._plan_idx]
+        if self._plan_escape:
+            d_escape = self._distance_to(wx, wy)
+            if d_escape is not None and d_escape < self.wp_reach_tol_m:
+                self._plan = None
+                self._plan_escape = False
+                self._publish_goal(float(self.world.robot_x), float(self.world.robot_y),
+                                   self.world.robot_theta if self.world is not None else yaw)
+                return
         last = self._plan_idx == len(self._plan) - 1
         # intermediate vias pass current heading (go_to_goal faces the via by position anyway); only the
         # FINAL via carries the intended yaw (APPROACH: face the target; storage: as given).
@@ -2565,7 +2670,7 @@ class MissionFsmNode(Node):
         if self.state != "OPENING":
             self._set_world_mapping_enabled(True)
         self.pub_mapping_enabled.publish(Bool(data=bool(self._world_mapping_enabled)))
-        self.pub_wall_fast.publish(Bool(data=bool(self.state == "OPENING")))
+        self.pub_wall_fast.publish(Bool(data=self._wall_fast_correction_requested()))
 
         # 2) publish mission state every tick
         msg = MissionState()

@@ -772,6 +772,9 @@ class LocalizerNode(Node):
     def on_wall_fast_correction(self, msg: Bool) -> None:
         self.wall_fast_correction = bool(msg.data)
 
+    def _wall_fast_active(self) -> bool:
+        return bool(self.wall_fast_correction and self.is_stationary)
+
     def on_wall_field_correction(self, msg: Float32MultiArray) -> None:
         """Apply the wall alignment as one rigid transform to the robot/map frame."""
         self.last_wall_correction_time = self.get_clock().now().nanoseconds * 1e-9
@@ -781,20 +784,21 @@ class LocalizerNode(Node):
         conf = max(0.0, min(1.0, float(msg.data[3]) if len(msg.data) > 3 else 1.0))
         if math.hypot(dx, dy) < self.wall_field_deadband_m and abs(dth) < math.radians(0.3):
             return
-        gain_value = self.wall_field_fast_gain if self.wall_fast_correction else self.wall_field_gain
+        fast_active = self._wall_fast_active()
+        gain_value = self.wall_field_fast_gain if fast_active else self.wall_field_gain
         theta_gain_value = (
             self.wall_field_fast_theta_gain
-            if self.wall_fast_correction
+            if fast_active
             else self.wall_field_theta_gain
         )
         max_step_m = (
             self.wall_field_fast_max_step_m
-            if self.wall_fast_correction
+            if fast_active
             else self.wall_field_max_step_m
         )
         max_step_rad = (
             self.wall_field_fast_max_step_rad
-            if self.wall_fast_correction
+            if fast_active
             else self.wall_field_max_step_rad
         )
         gain = max(0.0, gain_value) * conf

@@ -14,7 +14,7 @@ import math
 import rclpy
 from rclpy.node import Node
 from robot_interfaces.msg import BaseCommand, MissionState
-from std_msgs.msg import Float32MultiArray
+from std_msgs.msg import Bool, Float32MultiArray
 
 
 class BaseControllerNode(Node):
@@ -40,6 +40,7 @@ class BaseControllerNode(Node):
         # MAX_SPEED 0.6, so 0.42 ~ 0.7 duty). The velocity pipeline commands 0.05-0.20 which just
         # buzzed — so any real move is floored to this (direction preserved). 0 disables.
         self.declare_parameter("wheel_min", 0.42)
+        self.declare_parameter("wheel_min_strafe", 0.42)
         # Separate stiction floor for PURE IN-PLACE ROTATION (|vx|,|vy|~0). In-place turns otherwise
         # get floored to wheel_min and spin too fast; set this LOWER for a slow-but-moving CW/CCW turn
         # (the start-boost still breaks static friction, then it relaxes to this). Raise if it stalls.
@@ -80,6 +81,7 @@ class BaseControllerNode(Node):
         sl = [float(v) for v in self.get_parameter("strafe_left_scales").value]
         self.strafe_left = sl if len(sl) == 4 else [0.65, 0.75, 0.75, 0.65]
         self.wheel_min = float(self.get_parameter("wheel_min").value)
+        self.wheel_min_strafe = float(self.get_parameter("wheel_min_strafe").value)
         self.wheel_min_rot = float(self.get_parameter("wheel_min_rot").value)
         self.wheel_boost_strafe = float(self.get_parameter("wheel_boost_strafe").value)
         self.wheel_boost_rot = float(self.get_parameter("wheel_boost_rot").value)
@@ -109,6 +111,8 @@ class BaseControllerNode(Node):
         self._prev_out = [0.0, 0.0, 0.0, 0.0]
         self._mstate = ""
         self.create_subscription(MissionState, "/mission_state", self._on_mstate, 10)
+        self._debug_pause = False
+        self.create_subscription(Bool, "/debug/pause_motion", self._on_debug_pause, 10)
         self._moving = False
         self._boost_until = 0.0
         self._brake_until = 0.0
@@ -131,10 +135,25 @@ class BaseControllerNode(Node):
     def _on_mstate(self, msg: MissionState) -> None:
         self._mstate = str(msg.state)
 
+    def _on_debug_pause(self, msg: Bool) -> None:
+        paused = bool(msg.data)
+        if paused != self._debug_pause:
+            self.get_logger().warn(
+                f"debug pause {'enabled' if paused else 'disabled'}: wheel output clamped"
+            )
+        self._debug_pause = paused
+
     def tick(self) -> None:
         # Watchdog: zero output if no recent command
         elapsed = (self.get_clock().now() - self.last_cmd_time).nanoseconds * 1e-9
-        if elapsed > self.cmd_timeout:
+        if self._debug_pause:
+            # Diagnostic pause is applied after all /base_command publishers, inside the single
+            # base controller owner, so command publishers do not fight each other on /base_command.
+            vx, vy, omega = 0.0, 0.0, 0.0
+            self._moving = False
+            self._boost_until = 0.0
+            self._brake_until = 0.0
+        elif elapsed > self.cmd_timeout:
             vx, vy, omega = 0.0, 0.0, 0.0
         else:
             vx, vy, omega = self.last_cmd
@@ -215,7 +234,12 @@ class BaseControllerNode(Node):
             elif opening and self.opening_wheel_min > 0.0:
                 steady_floor = self.opening_wheel_min
             else:
-                steady_floor = self.wheel_min_rot if is_rot else self.wheel_min
+                if is_rot:
+                    steady_floor = self.wheel_min_rot
+                elif is_strafe:
+                    steady_floor = self.wheel_min_strafe
+                else:
+                    steady_floor = self.wheel_min
             if 0.0 < m < steady_floor:
                 s = steady_floor / m
                 wheels = [max(-1.0, min(1.0, w * s)) for w in wheels]

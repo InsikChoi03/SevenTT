@@ -449,7 +449,13 @@ class RecognitionVizNode(Node):
             self.trail.append(point)
 
     def on_wall_map_transform(self, msg: Float32MultiArray) -> None:
-        """Keep debug overlays and the trail rigid with a global wall alignment."""
+        """Keep map-owned debug overlays rigid with a global wall alignment.
+
+        Raw wall segments are intentionally excluded.  wall_localizer_node already
+        publishes them in field coordinates using the pose for that camera frame;
+        transforming them again here would double-apply the wall correction and
+        make the orange calibration overlay drift away from the actual observation.
+        """
         if len(msg.data) < 3:
             return
         tx, ty, dth = (float(msg.data[i]) for i in range(3))
@@ -464,10 +470,6 @@ class RecognitionVizNode(Node):
         self._wall_tf_th = math.atan2(math.sin(old_th + dth), math.cos(old_th + dth))
 
         self.trail = deque((transform(x, y) for x, y in self.trail), maxlen=self.trail.maxlen)
-        self.wall_raw_segments = [
-            (*transform(x0, y0), *transform(x1, y1))
-            for x0, y0, x1, y1 in self.wall_raw_segments
-        ]
         self.proj_dets = [(*transform(x, y), src) for x, y, src in self.proj_dets]
 
     def on_top_det(self, msg: DetectionArray) -> None:
@@ -488,9 +490,9 @@ class RecognitionVizNode(Node):
         vals = [float(v) for v in msg.data]
         segs = []
         for i in range(0, len(vals) - 3, 4):
-            x0, y0 = self._apply_wall_map_transform(vals[i], vals[i + 1])
-            x1, y1 = self._apply_wall_map_transform(vals[i + 2], vals[i + 3])
-            segs.append((x0, y0, x1, y1))
+            # These values are already field-frame coordinates produced from the
+            # wide-camera observation and the localizer pose for this frame.
+            segs.append((vals[i], vals[i + 1], vals[i + 2], vals[i + 3]))
         self.wall_raw_segments = segs
         self.wall_raw_segments_time = time.time()
 
@@ -833,7 +835,7 @@ class RecognitionVizNode(Node):
         return canvas
 
     def _draw_wall_raw_segments(self, canvas) -> None:
-        """Draw unsnapped wall projections in orange for calibration debugging."""
+        """Draw wall_localizer's unmodified field-frame observations in orange."""
         if not self.wall_raw_segments or time.time() - self.wall_raw_segments_time > 1.5:
             return
         for x0, y0, x1, y1 in self.wall_raw_segments:

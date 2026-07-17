@@ -41,12 +41,6 @@ def generate_launch_description() -> LaunchDescription:
             **common,
             # body cam training applied fixed WB gains to kill the magenta cast (csi_capture)
             "wb_gains": [1.16, 1.08, 0.82],
-            # With a fixed body light, keep the near-field classifier input stable by locking
-            # exposure/gain instead of letting nvargus 3A chase every cube highlight.
-            "exposuretimerange": "8000000 8000000",
-            "gainrange": "1 1",
-            "aelock": True,
-            "awblock": True,
             # GPU downscale 1640x1232 -> 640x480 (cube.pt trains at imgsz 640, so this is its native
             # size). Body detection PIXELS are upscaled x2.5625/x2.5667 back to the 1640 calibration
             # domain in world_model + mission_fsm before the body homography (npz files untouched).

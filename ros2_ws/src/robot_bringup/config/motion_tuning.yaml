@@ -56,12 +56,12 @@ localizer_node:
     use_imu_heading: true                 # IMU heading 보정을 사용할지 여부.
     wall_anchor_gain: 0.50                # wall anchor 보정 강도. anchor가 꺼져 있으면 실질 영향 작음.
     wall_anchor_max_step_rad: 0.0         # 벽 anchor는 위치만 보정하고 heading은 IMU만 사용한다.
-    wall_field_gain: 0.0                  # 현재 wall raw 상대거리 오류 진단 중: 벽은 표시만 하고 pose에는 적용하지 않는다.
-    wall_field_theta_gain: 0.0            # 주황 raw 벽 상대 위치 진단 중에는 heading 보정을 끈다.
-    wall_field_fast_gain: 0.0             # opening/settle 중에도 틀린 wall raw가 pose를 끌지 못하게 한다.
+    wall_field_gain: 0.18                 # 새 wall_surface raw 선 검증 후 위치 보정만 보수적으로 다시 켠다.
+    wall_field_theta_gain: 0.0            # 1차 재활성화 단계에서는 heading 보정은 아직 끈다.
+    wall_field_fast_gain: 0.45            # opening/settle 중에는 빠르게 잡되 한 번에 많이 끌지 않게 제한한다.
     wall_field_fast_theta_gain: 0.0       # opening/settle 중에도 heading 보정은 끈다.
-    wall_field_max_step_m: 0.0            # 벽 위치 보정 적용 차단. /localization/wall_field_correction은 진단용으로만 본다.
-    wall_field_fast_max_step_m: 0.0       # opening/settle 중 벽 위치 보정 적용 차단.
+    wall_field_max_step_m: 0.02           # 일반 주행 중 벽 위치 보정 1회 최대 반영량.
+    wall_field_fast_max_step_m: 0.05      # opening/settle 중 벽 위치 보정 1회 최대 반영량.
     wall_field_max_step_rad: 0.0          # 벽 field 보정은 heading을 바꾸지 않도록 한다.
     wall_field_fast_max_step_rad: 0.0     # opening/settle 중에도 heading은 바꾸지 않는다.
 
@@ -70,8 +70,25 @@ wall_localizer_node:
     cam_offset_x: 0.0                     # wide homography가 카메라 기준으로 밀릴 때 base_link 앞쪽 오프셋을 보정한다.
     cam_offset_y: 0.0                     # wide homography가 카메라 기준으로 밀릴 때 base_link 왼쪽 오프셋을 보정한다.
     use_segmentation_mask: true           # 벽/바닥 경계 segmentation mask를 벽 보정에 사용할지 여부.
+    segmentation_model_path: "/home/seventt/seventt/workspace/models/wall_seg_v1.pt" # 통합 벽 모델. class0=wall_surface, class1=wall_floor_boundary.
     segmentation_min_confidence: 0.30     # 벽 mask로 인정할 최소 confidence.
     segmentation_run_rate_hz: 3.0         # opening 4초 정지 중 충분히 벽 보정이 들어오도록 벽 segmentation을 빠르게 실행한다.
+    wall_boundary_verify_enabled: true    # 통합 모델의 wall_floor_boundary mask와 겹칠 때만 surface 선분을 벽으로 사용한다.
+    wall_surface_class_id: 0              # 통합 모델 class 0: wall_surface.
+    wall_boundary_class_id: 1             # 통합 모델 class 1: wall_floor_boundary.
+    wall_boundary_model_path: ""          # 구버전 호환용. 통합 모델 사용 시 별도 boundary 모델은 로드하지 않는다.
+    wall_boundary_min_confidence: 0.25    # boundary 검증 mask 최소 confidence. 낮추면 얇은 boundary도 통과 후보가 된다.
+    wall_boundary_overlap_min: 0.45       # 선분 샘플 중 이 비율 이상이 boundary mask 안에 있어야 통과한다.
+    wall_boundary_dilate_px: 12           # surface/boundary mask 픽셀 오차를 허용하는 검증 mask 팽창 반경.
+    wall_boundary_sample_spacing_px: 5.0  # 선분 전체를 이 간격으로 샘플링해 일부 점만 맞는 오검출을 막는다.
+    wall_boundary_verify_fail_open: false # boundary mask가 없으면 검증되지 않은 surface 선분을 사용하지 않는다.
+    segmentation_mask_line_mode: "floor_side_edge" # wall_surface mask의 로봇쪽/floor-side contour edge를 벽-바닥 경계선으로 쓴다.
+    wall_surface_edge_approx_epsilon_ratio: 0.012 # contour polygon 단순화 비율. 작을수록 곡면/왜곡을 더 잘 따라간다.
+    wall_surface_edge_refine_px: 7.0       # 선택된 contour 변 주변 이 픽셀 폭 안에서 경계선을 다시 fit한다.
+    wall_surface_inner_edge_band_m: 0.18   # fallback 시 base_link에서 가장 가까운 contour band 폭.
+    wall_surface_inner_edge_percentile: 35.0 # fallback 시 가까운 contour 점 선택 percentile.
+    wall_surface_max_edges_per_component: 4 # 휘어진 wall_surface 한 덩어리에서 여러 내부 경계 선분을 허용한다.
+    wall_surface_edge_min_length_m: 0.12   # 너무 짧은 side edge는 벽-바닥 경계선에서 제외한다.
     wall_image_edge_reject_ratio: 0.05    # 화면 가장자리 이 비율 안쪽 wall line은 불안정하므로 보정에서 제외.
     wall_anchor_enabled: false            # 여러 벽 선으로 절대 anchor를 잡는 기능. v1.0.0 기준은 꺼짐.
     wall_field_max_residual_m: 0.80       # 벽 관측과 경기장 벽 모델의 잔차 허용값.
@@ -136,7 +153,7 @@ mission_fsm_node:
 
     # 개막 동작
     opening_enabled: true                 # 경기 시작 직후 고정 개막 이동 사용 여부.
-    startup_warmup_sec: 15.0              # 카메라/YOLO/world_model 준비 대기 시간.
+    startup_warmup_sec: 18.0              # 카메라/YOLO/world_model 준비 대기 시간. 초기 YOLO 안정화를 위해 3초 추가.
     opening_speed: 0.12                  # 개막 전진 명령 세기. 일반 go_to_goal 속도와 별개.
     opening_forward_sec: 2.0             # 개막 전진 시간.
     opening_strafe_speed: 0.20           # 개막 오른쪽 횡이동 명령 세기. 일반 회피/ALIGN 횡이동과 별개.
@@ -177,11 +194,11 @@ mission_fsm_node:
     align_step_fwd_duty: 0.27             # 전후진 미세조정 명령 세기.
     align_step_fwd_sec: 0.15              # 한 번 전후진 미세조정 시간.
     align_step_strafe_duty: 0.315         # 좌우 횡이동 미세조정 명령 세기.
-    align_step_strafe_sec: 0.15          # 한 번 좌우 횡이동 미세조정 시간.
+    align_step_strafe_sec: 0.30          # 한 번 좌우 횡이동 미세조정 시간. 약 5cm 목표.
     align_adaptive_steps_enabled: true    # true면 물체까지 오차가 클 때 아래 긴 펄스를 사용한다.
     align_mid_error_m: 0.06               # 선택된 축 오차가 이 값 이상이면 "멀다"고 보고 긴 펄스를 쓴다.
     align_step_fwd_mid_sec: 0.25          # 전후 오차가 클 때 쓰는 긴 전후진 펄스 시간.
-    align_step_strafe_mid_sec: 0.3       # 좌우 오차가 클 때 쓰는 긴 횡이동 펄스 시간.
+    align_step_strafe_mid_sec: 0.60      # 좌우 오차가 클 때 쓰는 긴 횡이동 펄스 시간. 약 10cm 목표.
     align_body_lost_backoff_enabled: false # body에서 목표를 놓쳤을 때 후진 복구를 할지 여부. 현재는 yaw scan 우선이라 끈다.
     align_body_lost_backoff_speed: 0.189  # body 목표 상실 복구 후진 명령 세기.
     align_body_lost_backoff_sec: 0.54     # body 목표 상실 복구 후진 시간.
@@ -230,6 +247,12 @@ mission_fsm_node:
     obstacle_min_conf: 0.4                # 장애물로 인정할 월드모델 track 최소 confidence.
     obstacle_min_nobs: 2                  # 장애물로 인정할 최소 관측 횟수.
     exclude_target_radius_m: 0.30         # 목표 주변 이 거리 안의 물체는 접근 대상이라 장애물에서 제외.
+    front_escape_enabled: true            # 큰 전방 장애물 앞에서 direct fallback 대신 탈출 waypoint를 만든다.
+    front_escape_x_min_m: 0.05            # 로봇 기준 이 전방거리부터 전방 장애물로 본다.
+    front_escape_x_max_m: 0.35            # 로봇 기준 이 전방거리까지 전방 장애물로 본다.
+    front_escape_y_abs_m: 0.15            # 로봇 중심선 좌우 이 폭 안이면 정면을 막는 것으로 본다.
+    front_escape_step_m: 0.25             # 막혔을 때 더 빈 쪽으로 이동할 탈출 waypoint 좌우 거리.
+    front_escape_forward_m: 0.0           # 전방 장애물 탈출 중 전진 성분. 기본은 충돌 방지를 위해 0.
 
     # Storage
     storage_x: 1.8                        # 보관함/종료 지점 field x.
@@ -320,6 +343,7 @@ base_controller_node:
     strafe_right_scales: [0.875, 0.875, 1.0, 0.875] # 오른쪽 횡이동 시 바퀴별 출력 보정.
     strafe_left_scales: [0.867, 1.0, 1.0, 0.867]    # 왼쪽 횡이동 시 바퀴별 출력 보정.
     wheel_min: 0.08                       # 일반 주행에서 바퀴가 실제로 돌기 시작하는 최소 명령 보정.
+    wheel_min_strafe: 0.16                # 일반 횡이동 유지 중 바퀴가 실제로 계속 움직이는 최소 명령 보정.
     wheel_min_rot: 0.13                  # 일반 제자리 회전에서 바퀴가 실제로 돌기 시작하는 최소 명령 보정.
     wheel_boost: 0.35                # 구버전 fallback. 실제 튜닝은 아래 strafe/rot 분리값을 사용한다.
     wheel_boost_strafe: 0.45              # 일반 횡이동 시작 시 순간 부스트 세기.

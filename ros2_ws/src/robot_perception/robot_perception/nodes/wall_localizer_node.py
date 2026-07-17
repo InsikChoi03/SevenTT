@@ -1,14 +1,17 @@
 """Arena-wall observation from the learned wide-camera segmentation mask.
 
-Each connected mask component is represented by a line through its median pixel in the component's
-dominant direction. These mask-derived lines are authoritative wall observations; the old arena-axis
-and expected-wall-position acceptance gates are intentionally not used.
+The learned model can output both a thick wall-surface mask and a wall-floor-boundary mask.
+Class 0 is treated as wall_surface, class 1 as wall_floor_boundary. The surface component is
+converted to the contour edge that faces the robot/base_link, then verified against the boundary
+mask from the same inference result. The old centerline/PCA extractor remains as a fallback for
+legacy thin wall/floor-boundary masks.
 
 Publishes:
   /localization/wall_segments        Float32MultiArray correction-eligible mask lines in field coordinates
   /localization/wall_raw_segments    Float32MultiArray raw projected mask lines in field coordinates
   /localization/wall_mask_segments_image Float32MultiArray authoritative mask lines in image pixels
   /localization/wall_segmentation_mask Image mono8 debug mask from the learned model
+  /localization/wall_boundary_verification_mask Image mono8 boundary gate mask
 """
 from __future__ import annotations
 
@@ -66,9 +69,26 @@ class WallLocalizerNode(Node):
         self.declare_parameter("segmentation_run_rate_hz", 1.0)
         self.declare_parameter("segmentation_morph_kernel", 5)
         self.declare_parameter("publish_segmentation_mask", True)
+        self.declare_parameter("wall_boundary_verify_enabled", False)
+        self.declare_parameter("wall_surface_class_id", 0)
+        self.declare_parameter("wall_boundary_class_id", 1)
+        self.declare_parameter("wall_boundary_model_path", "")
+        self.declare_parameter("wall_boundary_min_confidence", 0.25)
+        self.declare_parameter("wall_boundary_overlap_min", 0.45)
+        self.declare_parameter("wall_boundary_dilate_px", 12)
+        self.declare_parameter("wall_boundary_sample_spacing_px", 5.0)
+        self.declare_parameter("wall_boundary_verify_fail_open", False)
+        self.declare_parameter("publish_wall_boundary_mask", True)
         self.declare_parameter("segmentation_min_component_area", 120)
         self.declare_parameter("segmentation_max_components", 6)
         self.declare_parameter("segmentation_min_line_length_px", 60)
+        self.declare_parameter("segmentation_mask_line_mode", "floor_side_edge")
+        self.declare_parameter("wall_surface_edge_approx_epsilon_ratio", 0.012)
+        self.declare_parameter("wall_surface_edge_refine_px", 7.0)
+        self.declare_parameter("wall_surface_inner_edge_band_m", 0.18)
+        self.declare_parameter("wall_surface_inner_edge_percentile", 35.0)
+        self.declare_parameter("wall_surface_max_edges_per_component", 4)
+        self.declare_parameter("wall_surface_edge_min_length_m", 0.12)
         self.declare_parameter("wall_image_edge_reject_ratio", 0.05)
         self.declare_parameter("wall_anchor_enabled", True)
         self.declare_parameter("wall_anchor_min_lines", 2)
@@ -98,11 +118,58 @@ class WallLocalizerNode(Node):
         )
         self.segmentation_morph_kernel = int(self.get_parameter("segmentation_morph_kernel").value)
         self.publish_segmentation_mask = bool(self.get_parameter("publish_segmentation_mask").value)
+        self.wall_boundary_verify_enabled = bool(
+            self.get_parameter("wall_boundary_verify_enabled").value
+        )
+        self.wall_surface_class_id = int(self.get_parameter("wall_surface_class_id").value)
+        self.wall_boundary_class_id = int(self.get_parameter("wall_boundary_class_id").value)
+        self.wall_boundary_model_path = str(
+            self.get_parameter("wall_boundary_model_path").value
+        )
+        self.wall_boundary_min_conf = float(
+            self.get_parameter("wall_boundary_min_confidence").value
+        )
+        self.wall_boundary_overlap_min = max(
+            0.0, min(1.0, float(self.get_parameter("wall_boundary_overlap_min").value))
+        )
+        self.wall_boundary_dilate_px = max(
+            0, int(self.get_parameter("wall_boundary_dilate_px").value)
+        )
+        self.wall_boundary_sample_spacing_px = max(
+            1.0, float(self.get_parameter("wall_boundary_sample_spacing_px").value)
+        )
+        self.wall_boundary_verify_fail_open = bool(
+            self.get_parameter("wall_boundary_verify_fail_open").value
+        )
+        self.publish_wall_boundary_mask = bool(
+            self.get_parameter("publish_wall_boundary_mask").value
+        )
         self.segmentation_min_component_area = int(
             self.get_parameter("segmentation_min_component_area").value
         )
         self.segmentation_max_components = int(self.get_parameter("segmentation_max_components").value)
         self.h_len = int(self.get_parameter("segmentation_min_line_length_px").value)
+        self.segmentation_mask_line_mode = str(
+            self.get_parameter("segmentation_mask_line_mode").value
+        ).strip().lower()
+        self.wall_surface_edge_approx_epsilon_ratio = float(
+            self.get_parameter("wall_surface_edge_approx_epsilon_ratio").value
+        )
+        self.wall_surface_edge_refine_px = float(
+            self.get_parameter("wall_surface_edge_refine_px").value
+        )
+        self.wall_surface_inner_edge_band_m = float(
+            self.get_parameter("wall_surface_inner_edge_band_m").value
+        )
+        self.wall_surface_inner_edge_percentile = float(
+            self.get_parameter("wall_surface_inner_edge_percentile").value
+        )
+        self.wall_surface_max_edges_per_component = max(
+            1, int(self.get_parameter("wall_surface_max_edges_per_component").value)
+        )
+        self.wall_surface_edge_min_length_m = float(
+            self.get_parameter("wall_surface_edge_min_length_m").value
+        )
         self.wall_image_edge_reject_ratio = max(
             0.0, min(0.49, float(self.get_parameter("wall_image_edge_reject_ratio").value))
         )
@@ -166,12 +233,17 @@ class WallLocalizerNode(Node):
         self.pub_segmentation_mask = self.create_publisher(
             Image, "/localization/wall_segmentation_mask", 10
         )
+        self.pub_boundary_mask = self.create_publisher(
+            Image, "/localization/wall_boundary_verification_mask", 10
+        )
 
         ok = _CV and self._Hmat is not None
         self.get_logger().info(
             f"wall_localizer {'ready' if ok else 'IDLE (cv2/homography missing)'} "
             f"mask-authoritative rate={self.get_parameter('rate_hz').value}Hz "
-            f"seg={'on' if self._seg_model is not None else 'off'}"
+            f"seg={'on' if self._seg_model is not None else 'off'} "
+            f"boundary-gate={'on' if self.wall_boundary_verify_enabled else 'off'} "
+            f"classes=surface:{self.wall_surface_class_id} boundary:{self.wall_boundary_class_id}"
         )
         if ok:
             self.timer = self.create_timer(1.0 / max(0.5, float(self.get_parameter("rate_hz").value)),
@@ -189,6 +261,9 @@ class WallLocalizerNode(Node):
         if fast and not self._wall_fast_correction:
             self._wall_field_history.clear()
         self._wall_fast_correction = fast
+
+    def _wall_fast_active(self) -> bool:
+        return bool(self._wall_fast_correction and self._stationary)
 
     def on_img(self, msg: Image) -> None:
         self._img = msg
@@ -246,10 +321,13 @@ class WallLocalizerNode(Node):
             return []
         self._last_seg_time = now
 
+        predict_conf = self.segmentation_min_conf
+        if self.wall_boundary_verify_enabled:
+            predict_conf = min(predict_conf, self.wall_boundary_min_conf)
         try:
             results = self._seg_model.predict(
                 frame,
-                conf=self.segmentation_min_conf,
+                conf=predict_conf,
                 imgsz=self.segmentation_input_size,
                 verbose=False,
             )
@@ -275,7 +353,47 @@ class WallLocalizerNode(Node):
             self._publish_mask_segments_image([])
             return []
 
-        mask = (np.max(arr, axis=0) > 0.5).astype(np.uint8) * 255
+        classes = None
+        boxes = getattr(results[0], "boxes", None)
+        confs = None
+        if boxes is not None and getattr(boxes, "cls", None) is not None:
+            try:
+                classes = boxes.cls.detach().cpu().numpy().astype(np.int32)
+            except Exception:  # noqa: BLE001
+                classes = boxes.cls.cpu().numpy().astype(np.int32)
+            if getattr(boxes, "conf", None) is not None:
+                try:
+                    confs = boxes.conf.detach().cpu().numpy().astype(np.float32)
+                except Exception:  # noqa: BLE001
+                    confs = boxes.conf.cpu().numpy().astype(np.float32)
+            if classes.shape[0] != arr.shape[0]:
+                classes = None
+                confs = None
+            if confs is not None and confs.shape[0] != arr.shape[0]:
+                confs = None
+
+        if classes is None:
+            surface_arr = arr
+            boundary_arr = np.empty((0, *arr.shape[1:]), dtype=arr.dtype)
+        else:
+            surface_keep = classes == self.wall_surface_class_id
+            boundary_keep = classes == self.wall_boundary_class_id
+            if confs is not None:
+                surface_keep &= confs >= self.segmentation_min_conf
+                boundary_keep &= confs >= self.wall_boundary_min_conf
+            surface_arr = arr[surface_keep]
+            boundary_arr = arr[boundary_keep]
+
+        if surface_arr.size == 0:
+            self._publish_mask_segments_image([])
+            self._publish_boundary_mask(np.zeros((h, w), dtype=np.uint8))
+            self.get_logger().warn(
+                f"wall segmentation produced no wall_surface class {self.wall_surface_class_id}",
+                throttle_duration_sec=5.0,
+            )
+            return []
+
+        mask = (np.max(surface_arr, axis=0) > 0.5).astype(np.uint8) * 255
         if mask.shape[:2] != (h, w):
             mask = cv2.resize(mask, (w, h), interpolation=cv2.INTER_NEAREST)
 
@@ -291,14 +409,91 @@ class WallLocalizerNode(Node):
                 self.pub_segmentation_mask.publish(self._bridge.cv2_to_imgmsg(mask, encoding="mono8"))
             except Exception:  # noqa: BLE001 - debug overlay must never affect localization
                 pass
-        candidates = self._mask_centerline_candidates(mask)
+        candidates = self._mask_line_candidates(mask)
+        boundary_mask = self._boundary_verification_mask(boundary_arr, (h, w))
+        unverified_count = len(candidates)
+        candidates = self._verify_boundary_candidates(candidates, boundary_mask)
         self._publish_mask_segments_image(candidates)
         self.get_logger().debug(
             f"authoritative mask wall lines={len(candidates)} "
-            f"mask_px={int(np.count_nonzero(mask))}",
+            f"unverified={unverified_count} mask_px={int(np.count_nonzero(mask))}",
             throttle_duration_sec=1.0,
         )
         return candidates
+
+    def _boundary_verification_mask(
+        self,
+        boundary_arr: np.ndarray,
+        shape: tuple[int, int],
+    ) -> np.ndarray | None:
+        """Return the dilated wall-floor-boundary mask from the same YOLO inference."""
+        if not self.wall_boundary_verify_enabled:
+            return None
+
+        h, w = shape[:2]
+        mask = np.zeros((h, w), dtype=np.uint8)
+        if boundary_arr.size:
+            mask = (np.max(boundary_arr, axis=0) > 0.5).astype(np.uint8) * 255
+            if mask.shape[:2] != (h, w):
+                mask = cv2.resize(mask, (w, h), interpolation=cv2.INTER_NEAREST)
+
+        if self.wall_boundary_dilate_px > 0:
+            radius = self.wall_boundary_dilate_px
+            kernel = cv2.getStructuringElement(
+                cv2.MORPH_ELLIPSE,
+                (2 * radius + 1, 2 * radius + 1),
+            )
+            mask = cv2.dilate(mask, kernel, iterations=1)
+        self._publish_boundary_mask(mask)
+        return mask
+
+    def _publish_boundary_mask(self, mask: np.ndarray) -> None:
+        if self.publish_wall_boundary_mask and self._bridge is not None:
+            try:
+                self.pub_boundary_mask.publish(self._bridge.cv2_to_imgmsg(mask, encoding="mono8"))
+            except Exception:  # noqa: BLE001 - debug publication must not affect localization
+                pass
+
+    def _verify_boundary_candidates(
+        self,
+        candidates: list[tuple[int, int, int, int]],
+        boundary_mask: np.ndarray | None,
+    ) -> list[tuple[int, int, int, int]]:
+        """Keep surface-edge segments whose sampled pixels mostly lie in the boundary mask."""
+        if not self.wall_boundary_verify_enabled:
+            return candidates
+        if boundary_mask is None or not np.any(boundary_mask):
+            if self.wall_boundary_verify_fail_open:
+                return candidates
+            self.get_logger().warn(
+                "wall boundary gate has no mask; rejecting unverified surface lines",
+                throttle_duration_sec=5.0,
+            )
+            return []
+
+        h, w = boundary_mask.shape[:2]
+        accepted: list[tuple[int, int, int, int]] = []
+        overlap_values: list[float] = []
+        for line in candidates:
+            x0, y0, x1, y1 = line
+            length = math.hypot(x1 - x0, y1 - y0)
+            sample_count = max(3, int(math.ceil(length / self.wall_boundary_sample_spacing_px)) + 1)
+            xs = np.rint(np.linspace(x0, x1, sample_count)).astype(np.int32)
+            ys = np.rint(np.linspace(y0, y1, sample_count)).astype(np.int32)
+            xs = np.clip(xs, 0, w - 1)
+            ys = np.clip(ys, 0, h - 1)
+            overlap = float(np.count_nonzero(boundary_mask[ys, xs])) / float(sample_count)
+            overlap_values.append(overlap)
+            if overlap >= self.wall_boundary_overlap_min:
+                accepted.append(line)
+
+        best = max(overlap_values, default=0.0)
+        self.get_logger().info(
+            f"wall boundary gate accepted={len(accepted)}/{len(candidates)} "
+            f"best_overlap={best:.2f} threshold={self.wall_boundary_overlap_min:.2f}",
+            throttle_duration_sec=1.0,
+        )
+        return accepted
 
     def _publish_mask_segments_image(
         self,
@@ -392,12 +587,279 @@ class WallLocalizerNode(Node):
         ]
         self.pub_wall_anchor.publish(msg)
 
+    def _mask_line_candidates(self, mask: np.ndarray) -> list[tuple[int, int, int, int]]:
+        """Extract wall observation lines from the learned mask according to the configured mode."""
+        mode = self.segmentation_mask_line_mode
+        if mode in {"floor_side_edge", "inner_edge", "wall_surface_edge"}:
+            lines = self._mask_floor_side_edge_candidates(mask)
+            if lines:
+                return lines
+            self.get_logger().warn(
+                "wall_surface floor-side edge extraction produced no lines; falling back to centerline",
+                throttle_duration_sec=5.0,
+            )
+        return self._mask_centerline_candidates(mask)
+
+    def _mask_floor_side_edge_candidates(self, mask: np.ndarray) -> list[tuple[int, int, int, int]]:
+        """Use the contour edge closest to base_link as the wall/floor boundary.
+
+        A wall_surface label is a thick polygon. Its floor-side edge is the side facing the robot,
+        so after projecting candidate contour edges to base_link ground coordinates, the correct
+        edge is normally the long edge with the smallest distance to the base_link origin.
+        """
+        num, labels, stats, _ = cv2.connectedComponentsWithStats((mask > 0).astype(np.uint8), 8)
+        comps = []
+        for idx in range(1, num):
+            area = int(stats[idx, cv2.CC_STAT_AREA])
+            if area >= self.segmentation_min_component_area:
+                comps.append((area, idx))
+        comps.sort(reverse=True)
+
+        out: list[tuple[int, int, int, int]] = []
+        for _, idx in comps[:max(1, self.segmentation_max_components)]:
+            out.extend(self._component_floor_side_edges(labels == idx))
+        return out
+
+    def _component_floor_side_edges(self, component: np.ndarray) -> list[tuple[int, int, int, int]]:
+        contours, _ = cv2.findContours(
+            component.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE
+        )
+        if not contours:
+            return []
+        contour = max(contours, key=cv2.contourArea)
+        perimeter = float(cv2.arcLength(contour, True))
+        if perimeter <= 1.0:
+            return []
+
+        h, w = component.shape[:2]
+        eps_ratio = max(0.001, min(0.10, self.wall_surface_edge_approx_epsilon_ratio))
+        approx = cv2.approxPolyDP(contour, max(2.0, eps_ratio * perimeter), True)
+        vertices = approx.reshape(-1, 2).astype(np.float64)
+        selected_lines: list[tuple[int, int, int, int]] = []
+        if len(vertices) >= 2:
+            edge_candidates: list[tuple[float, float, float, np.ndarray, np.ndarray]] = []
+            min_edge_len = max(20.0, self.h_len * 0.35)
+            for i, p0 in enumerate(vertices):
+                p1 = vertices[(i + 1) % len(vertices)]
+                vec = p1 - p0
+                length = float(np.linalg.norm(vec))
+                if length < min_edge_len:
+                    continue
+                samples = np.stack(
+                    [p0 + vec * t for t in (0.20, 0.50, 0.80)],
+                    axis=0,
+                )
+                base = self._to_base(samples)
+                if base is None or not np.all(np.isfinite(base)):
+                    continue
+                distances = np.linalg.norm(base, axis=1)
+                if not np.all(np.isfinite(distances)):
+                    continue
+                projected_len = float(np.linalg.norm(base[-1] - base[0]))
+                if projected_len < max(0.02, self.wall_surface_edge_min_length_m * 0.35):
+                    continue
+                dist = float(np.median(distances))
+                # Distance is the primary signal; a tiny length bonus only orders similarly
+                # close pieces without collapsing a curved/n-gon boundary into one segment.
+                score = dist - 0.0005 * min(length, 400.0)
+                edge_candidates.append((score, dist, length, p0, p1))
+
+            if edge_candidates:
+                min_dist = min(item[1] for item in edge_candidates)
+                band_m = max(0.01, self.wall_surface_inner_edge_band_m)
+                kept = [
+                    item for item in edge_candidates
+                    if item[1] <= min_dist + band_m
+                ]
+                kept.sort(key=lambda item: item[0])
+                for _, _, _, p0, p1 in kept[:self.wall_surface_max_edges_per_component]:
+                    refined = self._refine_contour_edge_line(contour, p0, p1, (h, w))
+                    line = refined if refined is not None else self._clamp_image_line(p0, p1, (h, w))
+                    if self._projected_line_length_ok(line):
+                        selected_lines.append(line)
+
+        if selected_lines:
+            return self._dedupe_image_lines(selected_lines)
+
+        fallback = self._inner_band_lines_from_contour(contour, (h, w))
+        return self._dedupe_image_lines(fallback)
+
+    def _refine_contour_edge_line(
+        self,
+        contour: np.ndarray,
+        p0: np.ndarray,
+        p1: np.ndarray,
+        shape: tuple[int, int],
+    ) -> tuple[int, int, int, int] | None:
+        vec = p1 - p0
+        length = float(np.linalg.norm(vec))
+        if length < 1e-6:
+            return None
+        axis = vec / length
+        pts = contour.reshape(-1, 2).astype(np.float64)
+        rel = pts - p0
+        along = rel @ axis
+        across = np.abs(rel[:, 0] * axis[1] - rel[:, 1] * axis[0])
+        band_px = max(3.0, self.wall_surface_edge_refine_px)
+        keep = (along >= -band_px) & (along <= length + band_px) & (across <= band_px)
+        selected = pts[keep]
+        if selected.shape[0] < 6:
+            return None
+        return self._line_from_image_points(selected, shape, min_length_px=max(20.0, self.h_len * 0.45))
+
+    def _inner_band_lines_from_contour(
+        self,
+        contour: np.ndarray,
+        shape: tuple[int, int],
+    ) -> list[tuple[int, int, int, int]]:
+        pts = contour.reshape(-1, 2).astype(np.float64)
+        if pts.shape[0] < 6:
+            return []
+        base = self._to_base(pts)
+        if base is None or not np.all(np.isfinite(base)):
+            return []
+        dist = np.linalg.norm(base, axis=1)
+        finite = np.isfinite(dist)
+        if int(np.count_nonzero(finite)) < 6:
+            return []
+        pts = pts[finite]
+        dist = dist[finite]
+        band_m = max(0.01, self.wall_surface_inner_edge_band_m)
+        keep = dist <= float(np.min(dist)) + band_m
+        if int(np.count_nonzero(keep)) < 6:
+            pct = max(5.0, min(80.0, self.wall_surface_inner_edge_percentile))
+            keep = dist <= float(np.percentile(dist, pct))
+        selected = pts[keep]
+        if selected.shape[0] < 6:
+            return []
+        split = self._split_points_into_image_segments(
+            selected,
+            shape,
+            min_length_px=max(20.0, self.h_len * 0.45),
+        )
+        return [line for line in split if self._projected_line_length_ok(line)]
+
+    def _split_points_into_image_segments(
+        self,
+        pts: np.ndarray,
+        shape: tuple[int, int],
+        *,
+        min_length_px: float,
+    ) -> list[tuple[int, int, int, int]]:
+        if pts.shape[0] < 6:
+            return []
+        h, w = shape[:2]
+        canvas = np.zeros((h, w), dtype=np.uint8)
+        rounded = np.rint(pts).astype(np.int32)
+        rounded[:, 0] = np.clip(rounded[:, 0], 0, w - 1)
+        rounded[:, 1] = np.clip(rounded[:, 1], 0, h - 1)
+        canvas[rounded[:, 1], rounded[:, 0]] = 255
+        k = max(3, int(round(self.wall_surface_edge_refine_px)) | 1)
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+        canvas = cv2.dilate(canvas, kernel, iterations=1)
+        detected = cv2.HoughLinesP(
+            canvas,
+            rho=1.0,
+            theta=np.pi / 180.0,
+            threshold=max(10, int(min_length_px * 0.35)),
+            minLineLength=max(12, int(min_length_px)),
+            maxLineGap=max(8, int(self.wall_surface_edge_refine_px * 2.0)),
+        )
+        lines: list[tuple[int, int, int, int]] = []
+        if detected is not None:
+            candidates: list[tuple[float, tuple[int, int, int, int]]] = []
+            for raw in detected[:, 0, :]:
+                x0, y0, x1, y1 = (int(v) for v in raw)
+                length = math.hypot(x1 - x0, y1 - y0)
+                if length >= min_length_px:
+                    candidates.append((length, (x0, y0, x1, y1)))
+            candidates.sort(reverse=True, key=lambda item: item[0])
+            for _, line in candidates[:self.wall_surface_max_edges_per_component]:
+                lines.append(line)
+        if lines:
+            return lines
+        line = self._line_from_image_points(pts, shape, min_length_px=min_length_px)
+        return [line] if line is not None else []
+
+    def _projected_line_length_ok(self, line: tuple[int, int, int, int]) -> bool:
+        base = self._to_base(np.array([[line[0], line[1]], [line[2], line[3]]], np.float64))
+        if base is None or not np.all(np.isfinite(base)):
+            return False
+        if max(np.linalg.norm(base[0]), np.linalg.norm(base[1])) > self.max_range:
+            return False
+        return float(np.linalg.norm(base[1] - base[0])) >= max(0.02, self.wall_surface_edge_min_length_m)
+
+    @staticmethod
+    def _dedupe_image_lines(
+        lines: list[tuple[int, int, int, int]]
+    ) -> list[tuple[int, int, int, int]]:
+        out: list[tuple[int, int, int, int]] = []
+        desc: list[tuple[float, np.ndarray]] = []
+        for line in lines:
+            x0, y0, x1, y1 = line
+            angle = math.atan2(y1 - y0, x1 - x0) % math.pi
+            mid = np.array([(x0 + x1) * 0.5, (y0 + y1) * 0.5], dtype=np.float64)
+            duplicate = False
+            for old_angle, old_mid in desc:
+                angle_gap = min(abs(angle - old_angle), math.pi - abs(angle - old_angle))
+                if angle_gap < math.radians(8.0) and float(np.linalg.norm(mid - old_mid)) < 18.0:
+                    duplicate = True
+                    break
+            if duplicate:
+                continue
+            out.append(line)
+            desc.append((angle, mid))
+        return out
+
+    def _line_from_image_points(
+        self,
+        pts: np.ndarray,
+        shape: tuple[int, int],
+        *,
+        min_length_px: float,
+    ) -> tuple[int, int, int, int] | None:
+        if pts.shape[0] < 2:
+            return None
+        anchor = np.median(pts, axis=0)
+        centered = pts - anchor
+        cov = np.cov(centered, rowvar=False)
+        try:
+            vals, vecs = np.linalg.eigh(cov)
+        except np.linalg.LinAlgError:
+            return None
+        axis = vecs[:, int(np.argmax(vals))]
+        norm = float(np.linalg.norm(axis))
+        if norm < 1e-9:
+            return None
+        axis = axis / norm
+        proj = centered @ axis
+        if proj.size < 2:
+            return None
+        t0, t1 = np.percentile(proj, [4.0, 96.0])
+        p0 = anchor + axis * t0
+        p1 = anchor + axis * t1
+        if float(np.linalg.norm(p1 - p0)) < min_length_px:
+            return None
+        return self._clamp_image_line(p0, p1, shape)
+
+    @staticmethod
+    def _clamp_image_line(
+        p0: np.ndarray,
+        p1: np.ndarray,
+        shape: tuple[int, int],
+    ) -> tuple[int, int, int, int]:
+        h, w = shape[:2]
+        return (
+            int(round(min(max(float(p0[0]), 0.0), w - 1.0))),
+            int(round(min(max(float(p0[1]), 0.0), h - 1.0))),
+            int(round(min(max(float(p1[0]), 0.0), w - 1.0))),
+            int(round(min(max(float(p1[1]), 0.0), h - 1.0))),
+        )
+
     def _mask_centerline_candidates(self, mask: np.ndarray) -> list[tuple[int, int, int, int]]:
         """Fit centerline segments through connected mask blobs.
 
-        The model is trained to output a thin wall/floor-boundary band. Using the mask gradient
-        finds the band edges; fitting the foreground pixels instead gives a segment through the
-        middle of the learned boundary, which is what the ground projection should use.
+        Legacy fallback for models trained to output a thin wall/floor-boundary band.
         """
         num, labels, stats, _ = cv2.connectedComponentsWithStats((mask > 0).astype(np.uint8), 8)
         comps = []
@@ -716,7 +1178,8 @@ class WallLocalizerNode(Node):
             self._wall_field_history.clear()
             self._wall_field_ema[:] = 0.0
 
-        if self._wall_fast_correction:
+        fast_active = self._wall_fast_active()
+        if fast_active:
             filtered = np.array(
                 [
                     correction[i] if math.isfinite(float(correction[i])) else 0.0
@@ -736,7 +1199,7 @@ class WallLocalizerNode(Node):
                 values = values[np.isfinite(values)]
                 filtered[i] = float(np.median(values)) if values.size else float(correction[i])
         # EMA prevents a single-frame mask jitter from moving the pose visibly.
-        smoothing = self.wall_field_fast_smoothing if self._wall_fast_correction else self.wall_field_smoothing
+        smoothing = self.wall_field_fast_smoothing if fast_active else self.wall_field_smoothing
         a = max(0.0, min(1.0, smoothing))
         self._wall_field_ema = (1.0 - a) * self._wall_field_ema + a * filtered
         confidence = min(1.0, (len(x_residuals) + len(y_residuals)) / 2.0)
@@ -774,6 +1237,8 @@ class WallLocalizerNode(Node):
             return
         lines = self._line_candidates(frame)
         if not lines:
+            self.pub_raw_segments.publish(Float32MultiArray())
+            self.pub_segments.publish(Float32MultiArray())
             return
         h, w = frame.shape[:2]
         correction_lines = [

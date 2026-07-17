@@ -81,14 +81,30 @@ wall_localizer_node:
     ignore_robot_rect: [0.34, 0.25, 0.66, 0.88]
     max_range_m: 2.3
     use_segmentation_mask: true
-    segmentation_model_path: "/home/seventt/seventt/workspace/models/wall_floor_boundary_seg_v3.pt"
+    segmentation_model_path: "/home/seventt/seventt/workspace/models/wall_seg_v1.pt"
     segmentation_input_size: 640
     segmentation_min_confidence: 0.30
     segmentation_run_rate_hz: 1.0
     segmentation_morph_kernel: 5
+    wall_boundary_verify_enabled: true
+    wall_surface_class_id: 0
+    wall_boundary_class_id: 1
+    wall_boundary_model_path: ""
+    wall_boundary_min_confidence: 0.25
+    wall_boundary_overlap_min: 0.45
+    wall_boundary_dilate_px: 12
+    wall_boundary_sample_spacing_px: 5.0
+    wall_boundary_verify_fail_open: false
     segmentation_min_component_area: 120
     segmentation_max_components: 6
     segmentation_min_line_length_px: 55
+    segmentation_mask_line_mode: "floor_side_edge"
+    wall_surface_edge_approx_epsilon_ratio: 0.012
+    wall_surface_edge_refine_px: 7.0
+    wall_surface_inner_edge_band_m: 0.18
+    wall_surface_inner_edge_percentile: 35.0
+    wall_surface_max_edges_per_component: 4
+    wall_surface_edge_min_length_m: 0.12
     wall_image_edge_reject_ratio: 0.05    # 노란 선분 중점이 화면 가장자리 5% 안이면 보정에서 제외
     wall_anchor_enabled: false
     wall_anchor_min_lines: 2
