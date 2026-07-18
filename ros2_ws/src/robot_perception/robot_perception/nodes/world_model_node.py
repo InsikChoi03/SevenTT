@@ -254,7 +254,7 @@ class WorldModelNode(Node):
         self.declare_parameter("grid_track_lock_alpha", 1.0)
         self.declare_parameter(
             "zone_anchor_xy",
-            [-0.75, 0.75, -0.75, -1.0, 0.75, -1.0, 0.75, 0.75],
+            [-1.0, 0.5, -1.0, -1.0, 0.75, -1.0, 0.75, 0.5],
         )
         self.declare_parameter("grid_moved_threshold_m", 0.22)
 

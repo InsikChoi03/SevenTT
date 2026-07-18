@@ -56,6 +56,20 @@ localizer_node:
     wall_field_deadband_m: 0.005
     wall_correction_stale_sec: 1.5
     use_imu_heading: true                 # IMU heading 보정 ON: 벽 보정 OFF 조건 비교 테스트
+    imu_motion_smoothing_enabled: true    # accel 적분 없이 IMU 상태로 순간 x/y correction gain만 조절
+    imu_motion_publish_debug: true        # /localization/imu_motion_state 발행
+    imu_stationary_gyro_eps_radps: 0.035
+    imu_stationary_accel_norm_eps: 0.35
+    imu_stationary_accel_var_eps: 0.10
+    imu_rotating_gyro_eps_radps: 0.18
+    imu_impact_accel_norm_eps: 1.50
+    imu_impact_accel_delta_eps: 1.20
+    imu_object_flow_stationary_gain: 0.10
+    imu_object_flow_rotating_trans_gain: 0.30
+    imu_object_flow_impact_gain: 0.20
+    imu_landmark_impact_gain: 0.40
+    imu_wall_rotating_gain: 0.60
+    imu_wall_impact_gain: 0.50
     fisheye_model: true
     # Intrinsics SCALED for the 1280x960 GPU-downscaled wide stream (was 1640x1232). fx,cx x0.780488
     # (1280/1640); fy,cy x0.779221 (960/1232). dist_coeffs are ray-normalized -> resolution-invariant.
@@ -197,7 +211,7 @@ world_model_node:
     grid_track_lock_enabled: true         # 주행 테스트 중 확인된 물체 track을 격자점에 고정한다.
     grid_track_lock_radius_m: 0.26
     grid_track_lock_alpha: 1.0
-    zone_anchor_xy: [-0.75, 0.75, -0.75, -1.0, 0.75, -1.0, 0.75, 0.75]
+    zone_anchor_xy: [-1.0, 0.5, -1.0, -1.0, 0.75, -1.0, 0.75, 0.5]
     grid_moved_threshold_m: 0.22
     # 위치 vs 분류 분리 + 음의 증거(FOV 안인데 미검출 시 지속 감점 → 팬텀/집어간 물체 정리)
     class_conf_threshold: 0.85            # 광각 IDENTITY 커트라인(높게): 이 이상만 클래스 투표(광각=위치 위주)
@@ -255,7 +269,7 @@ target_selector_node:
     set1_base: 20.0                       # Set1 outranks Set2 (approach bias; order enforced by FSM phase)
     set2_base: 10.0
     zone_filter_enabled: true             # FSM의 /planning/zone에 맞춰 선택 후보를 현재 2x2 구역으로 제한
-    zone_bounds_m: [-2.0, 0.1, -0.25, 2.0,  -2.0, 0.1, -2.0, -0.25,  -0.1, 2.0, -2.0, -0.25,  -0.1, 2.0, -0.25, 2.0]
+    zone_bounds_m: [-2.0, -0.25, -0.25, 2.0,  -2.0, -0.25, -2.0, -0.25,  -0.25, 2.0, -2.0, -0.25,  -0.25, 2.0, -0.25, 2.0]
 
 mission_fsm_node:
   ros__parameters:
@@ -336,8 +350,8 @@ mission_fsm_node:
     # 격자 기준 구역 미션: x=0 가운데 열만 ±10cm 중첩, y는 -0.25m 격자 사이에서 중첩 없이 분리한다.
     zone_mission_enabled: true
     zone_order: [1, 2, 3, 4]
-    zone_bounds_m: [-2.0, 0.1, -0.25, 2.0,  -2.0, 0.1, -2.0, -0.25,  -0.1, 2.0, -2.0, -0.25,  -0.1, 2.0, -0.25, 2.0]
-    zone_anchor_xy: [-0.75, 0.75, -0.75, -1.0, 0.75, -1.0, 0.75, 0.75]
+    zone_bounds_m: [-2.0, -0.25, -0.25, 2.0,  -2.0, -0.25, -2.0, -0.25,  -0.25, 2.0, -2.0, -0.25,  -0.25, 2.0, -0.25, 2.0]
+    zone_anchor_xy: [-1.0, 0.5, -1.0, -1.0, 0.75, -1.0, 0.75, 0.5]
     zone_no_target_advance_sec: 6.0
     zone_center_reach_tol_m: 0.25
     zone_stabilize_enabled: true
@@ -455,9 +469,9 @@ recognition_viz_node:
     grid_origin_x_m: -1.50                # world_model_node grid prior와 같은 기준
     grid_origin_y_m: -1.50
     show_zone_regions: true               # FSM이 쓰는 격자 기준 구역을 라이브 맵에 사각형으로 표시
-    zone_bounds_m: [-2.0, 0.1, -0.25, 2.0,  -2.0, 0.1, -2.0, -0.25,  -0.1, 2.0, -2.0, -0.25,  -0.1, 2.0, -0.25, 2.0]
+    zone_bounds_m: [-2.0, -0.25, -0.25, 2.0,  -2.0, -0.25, -2.0, -0.25,  -0.25, 2.0, -2.0, -0.25,  -0.25, 2.0, -0.25, 2.0]
     show_zone_anchors: true
-    zone_anchor_xy: [-0.75, 0.75, -0.75, -1.0, 0.75, -1.0, 0.75, 0.75]
+    zone_anchor_xy: [-1.0, 0.5, -1.0, -1.0, 0.75, -1.0, 0.75, 0.5]
     # 맵 FOV 표시(world_model 과 동일값): 본체=부채꼴, 광각=전방 타원
     body_fov_half_deg: 30.0
     body_fov_near_m: 0.25

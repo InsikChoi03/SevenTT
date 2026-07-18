@@ -63,6 +63,13 @@ class SiglipGateNode(Node):
                 "a photo of a {fruit}",
                 "a printed photo of a {fruit}",
                 "a {fruit} printed on paper",
+                "a printed picture of a {fruit} on a white cube",
+                "a close-up photo of a {fruit} printed on a cube",
+                "an angled photo of a printed {fruit}",
+                "a tilted printed {fruit} picture",
+                "an oblique view of a {fruit} picture on paper",
+                "a wide crop of a printed {fruit}",
+                "a tall crop of a printed {fruit}",
             ],
         )
         self.declare_parameter("fruit_prompt_pooling", "max")  # max | mean
@@ -75,6 +82,7 @@ class SiglipGateNode(Node):
         self.declare_parameter("target_label", "fruit_photo_cube")
         self.declare_parameter("aspect_ratio_min", 0.6)   # w/h lower bound
         self.declare_parameter("aspect_ratio_max", 1.7)   # w/h upper bound
+        self.declare_parameter("square_pad_crops", True)
         # SigLIP runs on a TIMER at this rate over the latest body frame's fruit-cube crops — NOT
         # synchronously per detection message. Firing on every body detection (up to ~16 Hz) stole
         # the single GPU from YOLO right during the approach; the world model only needs a fruit
@@ -101,6 +109,7 @@ class SiglipGateNode(Node):
         self.target_label = str(self.get_parameter("target_label").value)
         self.aspect_ratio_min = float(self.get_parameter("aspect_ratio_min").value)
         self.aspect_ratio_max = float(self.get_parameter("aspect_ratio_max").value)
+        self.square_pad_crops = bool(self.get_parameter("square_pad_crops").value)
         self.classify_rate_hz = float(self.get_parameter("classify_rate_hz").value)
         self.max_batch = int(self.get_parameter("max_batch").value)
 
@@ -244,7 +253,30 @@ class SiglipGateNode(Node):
                 throttle_duration_sec=5.0,
             )
             return None
-        return frame[y1:y2, x1:x2]
+        crop = frame[y1:y2, x1:x2]
+        return self._square_pad(crop) if self.square_pad_crops else crop
+
+    @staticmethod
+    def _square_pad(crop: np.ndarray) -> np.ndarray:
+        h, w = crop.shape[:2]
+        if h <= 0 or w <= 0 or h == w:
+            return crop
+        side = max(h, w)
+        pad_y = side - h
+        pad_x = side - w
+        top = pad_y // 2
+        bottom = pad_y - top
+        left = pad_x // 2
+        right = pad_x - left
+        return cv2.copyMakeBorder(
+            crop,
+            top,
+            bottom,
+            left,
+            right,
+            cv2.BORDER_CONSTANT,
+            value=(255, 255, 255),
+        )
 
     def _classify_and_publish(self, crops: list[np.ndarray], stamp) -> None:
         """One batched SigLIP forward pass over every fruit-cube crop; publish the best read."""

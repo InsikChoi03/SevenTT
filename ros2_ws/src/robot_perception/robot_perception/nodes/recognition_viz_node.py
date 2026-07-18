@@ -223,12 +223,12 @@ class RecognitionVizNode(Node):
         self.declare_parameter("grid_origin_x_m", 0.50)
         self.declare_parameter("grid_origin_y_m", 0.50)
         # Visualise the grid-aligned mission zones used by mission_fsm_node.
-        # The center x=0 grid column is slightly overlapped; the y split is between grid rows.
+        # Z1/Z2 cover the right 3 columns; Z3/Z4 cover the left 4 columns, with no overlap.
         self.declare_parameter("show_zone_regions", True)
         self.declare_parameter(
             "zone_bounds_m",
-            [-2.0, 0.1, -0.25, 2.0, -2.0, 0.1, -2.0, -0.25,
-             -0.1, 2.0, -2.0, -0.25, -0.1, 2.0, -0.25, 2.0],
+            [-2.0, -0.25, -0.25, 2.0, -2.0, -0.25, -2.0, -0.25,
+             -0.25, 2.0, -2.0, -0.25, -0.25, 2.0, -0.25, 2.0],
         )
 
         ext = [float(v) for v in self.get_parameter("field_extent_m").value]
@@ -278,7 +278,7 @@ class RecognitionVizNode(Node):
         self.declare_parameter("show_zone_anchors", True)
         self.declare_parameter(
             "zone_anchor_xy",
-            [-0.75, 0.75, -0.75, -1.0, 0.75, -1.0, 0.75, 0.75],
+            [-1.0, 0.5, -1.0, -1.0, 0.75, -1.0, 0.75, 0.5],
         )
         self.show_zone_anchors = bool(self.get_parameter("show_zone_anchors").value)
         za = [float(v) for v in self.get_parameter("zone_anchor_xy").value]

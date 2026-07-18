@@ -26,6 +26,7 @@ initial pose with no camera and no wheel odometry connected.
 """
 from __future__ import annotations
 
+from collections import deque
 import math
 from typing import Optional, Tuple
 
@@ -318,7 +319,74 @@ class LocalizerNode(Node):
         self.imu_stale_sec = float(self.get_parameter("imu_stale_sec").value)
         self.declare_parameter("imu_gyro_deadband_rad", 0.01)   # ~0.6 deg/s: below = 0 (kill bias walk)
         self.imu_gyro_deadband = float(self.get_parameter("imu_gyro_deadband_rad").value)
+        # IMU motion smoothing does NOT integrate accel into x/y. It only classifies the short-term
+        # body state and attenuates suspicious translation corrections from vision/wall landmarks.
+        self.declare_parameter("imu_motion_smoothing_enabled", False)
+        self.imu_motion_smoothing_enabled = bool(
+            self.get_parameter("imu_motion_smoothing_enabled").value
+        )
+        self.declare_parameter("imu_motion_publish_debug", True)
+        self.imu_motion_publish_debug = bool(
+            self.get_parameter("imu_motion_publish_debug").value
+        )
+        self.declare_parameter("imu_motion_stale_sec", 0.30)
+        self.imu_motion_stale_sec = float(self.get_parameter("imu_motion_stale_sec").value)
+        self.declare_parameter("imu_motion_accel_window", 12)
+        self.imu_motion_accel_window = max(
+            3, int(self.get_parameter("imu_motion_accel_window").value)
+        )
+        self.declare_parameter("imu_accel_norm_ref", 9.80665)
+        self.imu_accel_norm_ref = float(self.get_parameter("imu_accel_norm_ref").value)
+        self.declare_parameter("imu_stationary_gyro_eps_radps", 0.035)
+        self.imu_stationary_gyro_eps = float(
+            self.get_parameter("imu_stationary_gyro_eps_radps").value
+        )
+        self.declare_parameter("imu_stationary_accel_norm_eps", 0.35)
+        self.imu_stationary_accel_norm_eps = float(
+            self.get_parameter("imu_stationary_accel_norm_eps").value
+        )
+        self.declare_parameter("imu_stationary_accel_var_eps", 0.10)
+        self.imu_stationary_accel_var_eps = float(
+            self.get_parameter("imu_stationary_accel_var_eps").value
+        )
+        self.declare_parameter("imu_rotating_gyro_eps_radps", 0.18)
+        self.imu_rotating_gyro_eps = float(
+            self.get_parameter("imu_rotating_gyro_eps_radps").value
+        )
+        self.declare_parameter("imu_impact_accel_norm_eps", 1.50)
+        self.imu_impact_accel_norm_eps = float(
+            self.get_parameter("imu_impact_accel_norm_eps").value
+        )
+        self.declare_parameter("imu_impact_accel_delta_eps", 1.20)
+        self.imu_impact_accel_delta_eps = float(
+            self.get_parameter("imu_impact_accel_delta_eps").value
+        )
+        self.declare_parameter("imu_object_flow_stationary_gain", 0.10)
+        self.imu_object_flow_stationary_gain = float(
+            self.get_parameter("imu_object_flow_stationary_gain").value
+        )
+        self.declare_parameter("imu_object_flow_rotating_trans_gain", 0.30)
+        self.imu_object_flow_rotating_trans_gain = float(
+            self.get_parameter("imu_object_flow_rotating_trans_gain").value
+        )
+        self.declare_parameter("imu_object_flow_impact_gain", 0.20)
+        self.imu_object_flow_impact_gain = float(
+            self.get_parameter("imu_object_flow_impact_gain").value
+        )
+        self.declare_parameter("imu_landmark_impact_gain", 0.40)
+        self.imu_landmark_impact_gain = float(
+            self.get_parameter("imu_landmark_impact_gain").value
+        )
+        self.declare_parameter("imu_wall_rotating_gain", 0.60)
+        self.imu_wall_rotating_gain = float(self.get_parameter("imu_wall_rotating_gain").value)
+        self.declare_parameter("imu_wall_impact_gain", 0.50)
+        self.imu_wall_impact_gain = float(self.get_parameter("imu_wall_impact_gain").value)
         self.last_imu_time = None
+        self.imu_motion_state = "UNKNOWN"
+        self.imu_motion_state_time = None
+        self.imu_accel_norm_var = 0.0
+        self._imu_last_accel_norm = None
+        self._imu_accel_norm_window = deque(maxlen=self.imu_motion_accel_window)
         self.last_wall_correction_time = None
         self.wall_fast_correction = False
 
@@ -393,6 +461,9 @@ class LocalizerNode(Node):
         self.pub = self.create_publisher(PoseStamped, "/localization/pose", 10)
         self.pub_stationary = self.create_publisher(Bool, "/localization/is_stationary", 10)
         self.pub_motion_mode = self.create_publisher(String, "/localization/motion_mode", 10)
+        self.pub_imu_motion_state = self.create_publisher(
+            String, "/localization/imu_motion_state", 10
+        )
         self.pub_wall_map_transform = self.create_publisher(
             Float32MultiArray, "/localization/wall_map_transform", 10
         )
@@ -404,6 +475,7 @@ class LocalizerNode(Node):
             f"obj_landmarks={self.use_object_landmarks} tf={self.tf_broadcaster is not None} "
             f"wheel_odom_enabled={self.wheel_odom_enabled} "
             f"encoder_constraint={self.encoder_motion_constraint_enabled} "
+            f"imu_smoothing={self.imu_motion_smoothing_enabled} "
             f"intrinsics={'set' if self.have_intrinsics else 'unset'} "
             f"fisheye={self.use_fisheye} rate={rate}Hz"
         )
@@ -660,11 +732,87 @@ class LocalizerNode(Node):
         return (self.use_imu and self.last_imu_time is not None
                 and (now - self.last_imu_time) <= self.imu_stale_sec)
 
+    def _imu_motion_fresh(self, now: float) -> bool:
+        return (
+            self.imu_motion_smoothing_enabled
+            and self.imu_motion_state_time is not None
+            and (now - self.imu_motion_state_time) <= self.imu_motion_stale_sec
+        )
+
+    def _update_imu_motion_state(self, msg: Imu, now: float) -> None:
+        ax = float(msg.linear_acceleration.x)
+        ay = float(msg.linear_acceleration.y)
+        az = float(msg.linear_acceleration.z)
+        accel_norm = math.sqrt(ax * ax + ay * ay + az * az)
+        accel_delta = 0.0
+        if self._imu_last_accel_norm is not None:
+            accel_delta = abs(accel_norm - float(self._imu_last_accel_norm))
+        self._imu_last_accel_norm = accel_norm
+        self._imu_accel_norm_window.append(accel_norm)
+        if len(self._imu_accel_norm_window) >= 3:
+            self.imu_accel_norm_var = float(np.var(self._imu_accel_norm_window))
+        else:
+            self.imu_accel_norm_var = 0.0
+
+        wz = abs(float(msg.angular_velocity.z))
+        norm_err = abs(accel_norm - self.imu_accel_norm_ref)
+        impact = (
+            norm_err >= self.imu_impact_accel_norm_eps
+            or accel_delta >= self.imu_impact_accel_delta_eps
+        )
+        stable_gravity = (
+            wz <= self.imu_stationary_gyro_eps
+            and norm_err <= self.imu_stationary_accel_norm_eps
+            and self.imu_accel_norm_var <= self.imu_stationary_accel_var_eps
+        )
+        if impact:
+            state = "IMPACT_OR_SLIP"
+        elif wz >= self.imu_rotating_gyro_eps:
+            state = "ROTATING"
+        elif stable_gravity and self.is_stationary:
+            state = "STOP"
+        else:
+            state = "MOVING_SMOOTH"
+
+        self.imu_motion_state = state
+        self.imu_motion_state_time = now
+        if self.imu_motion_publish_debug:
+            debug = String()
+            debug.data = state
+            self.pub_imu_motion_state.publish(debug)
+
+    def _imu_translation_gain(self, source: str) -> float:
+        if not self.imu_motion_smoothing_enabled:
+            return 1.0
+        now = self.get_clock().now().nanoseconds * 1e-9
+        if not self._imu_motion_fresh(now):
+            return 1.0
+
+        state = self.imu_motion_state
+        if source == "object_flow":
+            if state == "STOP":
+                return self._bounded_gain(self.imu_object_flow_stationary_gain)
+            if state == "ROTATING":
+                return self._bounded_gain(self.imu_object_flow_rotating_trans_gain)
+            if state == "IMPACT_OR_SLIP":
+                return self._bounded_gain(self.imu_object_flow_impact_gain)
+        elif source == "object_landmark":
+            if state == "IMPACT_OR_SLIP":
+                return self._bounded_gain(self.imu_landmark_impact_gain)
+        elif source.startswith("wall"):
+            if state == "ROTATING":
+                return self._bounded_gain(self.imu_wall_rotating_gain)
+            if state == "IMPACT_OR_SLIP":
+                return self._bounded_gain(self.imu_wall_impact_gain)
+        return 1.0
+
     def on_imu(self, msg: Imu) -> None:
         """TOP-PRIORITY heading: integrate the bias-removed yaw-rate gyro. Low noise + slow bias, so
         heading stays steady (no object-flow churn / LK-VO hallucination). When this is fresh the
         object-flow / LK-VO / wheel yaw are all suppressed so nothing double-counts the rotation."""
         now = self.get_clock().now().nanoseconds * 1e-9
+        if self.imu_motion_smoothing_enabled:
+            self._update_imu_motion_state(msg, now)
         wz = float(msg.angular_velocity.z)
         if self.last_imu_time is not None:
             dt = now - self.last_imu_time
@@ -700,6 +848,9 @@ class LocalizerNode(Node):
         self.last_objflow_time = now
         self.last_vo_time = now      # object-flow owns rotation -> keep wheel-yaw AND LK-VO suppressed
         dfwd, dleft, dtheta = self._constrain_robot_delta(dfwd, dleft, dtheta, "object_flow")
+        trans_gain = self._imu_translation_gain("object_flow")
+        dfwd *= trans_gain
+        dleft *= trans_gain
         if not self._imu_fresh(now):  # IMU gyro outranks object-flow for yaw (steadier)
             self.theta = wrap_angle(self.theta + dtheta)
         if self.object_flow_trans:
@@ -732,6 +883,9 @@ class LocalizerNode(Node):
         g_xy = self.landmark_gain * cf
         applied_dx = max(-mx, min(mx, g_xy * dx))
         applied_dy = max(-mx, min(mx, g_xy * dy))
+        trans_gain = self._imu_translation_gain("object_landmark")
+        applied_dx *= trans_gain
+        applied_dy *= trans_gain
         g_th = self.landmark_theta_gain * cf                        # confidence-scaled heading authority
         applied_dth = max(-mr, min(mr, g_th * dth))
         applied_dx, applied_dy, applied_dth = self._constrain_world_delta(
@@ -750,13 +904,14 @@ class LocalizerNode(Node):
         if math.hypot(dx, dy) < self.wall_anchor_deadband_m and abs(dth) < math.radians(0.3):
             return
         gain = max(0.0, self.wall_anchor_gain) * conf
+        trans_gain = self._imu_translation_gain("wall_anchor")
         applied_dx = -max(
             -self.wall_anchor_max_step_m,
-            min(self.wall_anchor_max_step_m, gain * dx),
+            min(self.wall_anchor_max_step_m, gain * trans_gain * dx),
         )
         applied_dy = -max(
             -self.wall_anchor_max_step_m,
-            min(self.wall_anchor_max_step_m, gain * dy),
+            min(self.wall_anchor_max_step_m, gain * trans_gain * dy),
         )
         applied_dth = -max(
             -self.wall_anchor_max_step_rad,
@@ -801,7 +956,8 @@ class LocalizerNode(Node):
             if fast_active
             else self.wall_field_max_step_rad
         )
-        gain = max(0.0, gain_value) * conf
+        trans_gain = self._imu_translation_gain("wall_field")
+        gain = max(0.0, gain_value) * conf * trans_gain
         theta_gain = max(0.0, theta_gain_value) * conf
         tx = max(-max_step_m, min(max_step_m, gain * dx))
         ty = max(-max_step_m, min(max_step_m, gain * dy))

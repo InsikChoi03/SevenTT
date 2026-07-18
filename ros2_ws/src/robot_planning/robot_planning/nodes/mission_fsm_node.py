@@ -127,13 +127,12 @@ class MissionFsmNode(Node):
         self.declare_parameter("end_after_quota", False)
         self.declare_parameter("select_timeout_sec", 0.0)
         # --- hardcoded opening move (very first thing at match start), BODY frame ---
-        # Drive forward, strafe right, rotate in place by opening_turn_deg, wait, then hand over to SCAN.
+        # Wait briefly, drive forward, strafe right, rotate in place by opening_turn_deg, then hold
+        # until the configured match-elapsed release time before handing over to SCAN.
         # Timed through /base_command so the base_controller's start-boost + stop-brake apply.
         self.declare_parameter("opening_enabled", True)
-        # Hold STATIONARY at startup until perception is warm: YOLO (wide.pt@1280) takes ~10-15 s to
-        # load, and moving before detections flow makes the localizer's object-flow/VO drift and lose
-        # heading. Wait this long AND until the first /world_model arrives before the opening move.
-        self.declare_parameter("startup_warmup_sec", 15.0)
+        # Hold briefly at startup, then run the opening while perception is still warming up.
+        self.declare_parameter("startup_warmup_sec", 3.0)
         self.declare_parameter("opening_speed", 0.35)        # >= wheel_min so it's the actual speed
         self.declare_parameter("opening_forward_sec", 1.0)
         self.declare_parameter("opening_strafe_speed", 0.35)
@@ -141,6 +140,7 @@ class MissionFsmNode(Node):
         self.declare_parameter("opening_turn_deg", 45.0)
         self.declare_parameter("opening_turn_omega", -0.17)   # negative = CW, positive = CCW
         self.declare_parameter("opening_wait_after_turn_sec", 1.0)
+        self.declare_parameter("opening_release_at_sec", 0.0)  # if >0, do not start SCAN before this match time
         # SCAN search: the start pose likely sees nothing, so after the opening the robot turns slowly
         # CLOCKWISE in place to sweep for objects. Negative omega = CW (REP-103 +z is up). The actual
         # turn speed is set by base_controller wheel_min_rot (this just needs to be non-zero CW).
@@ -154,18 +154,18 @@ class MissionFsmNode(Node):
         self.declare_parameter("patrol_waypoints",
                                [0.0, 0.0, 1.2, 1.2, 1.2, -1.2, -1.2, -1.2, -1.2, 1.2])
         self.declare_parameter("patrol_reach_tol", 0.3)   # advance to next waypoint within this
-        # Zone mission: grid-aligned zones. The center x=0 grid column is overlapped by 10cm
-        # on both sides, while the upper/lower split is between grid rows at y=-0.25.
+        # Zone mission: grid-aligned, non-overlapping zones. Z1/Z2 own the right 3 columns,
+        # and Z3/Z4 own the left 4 columns; upper/lower split is between grid rows at y=-0.25.
         self.declare_parameter("zone_mission_enabled", False)
         self.declare_parameter("zone_order", [1, 2, 3, 4])
         self.declare_parameter(
             "zone_bounds_m",
-            [-2.0, 0.1, -0.25, 2.0, -2.0, 0.1, -2.0, -0.25,
-             -0.1, 2.0, -2.0, -0.25, -0.1, 2.0, -0.25, 2.0],
+            [-2.0, -0.25, -0.25, 2.0, -2.0, -0.25, -2.0, -0.25,
+             -0.25, 2.0, -2.0, -0.25, -0.25, 2.0, -0.25, 2.0],
         )
         self.declare_parameter(
             "zone_anchor_xy",
-            [-0.75, 0.75, -0.75, -1.0, 0.75, -1.0, 0.75, 0.75],
+            [-1.0, 0.5, -1.0, -1.0, 0.75, -1.0, 0.75, 0.5],
         )
         self.declare_parameter("zone_no_target_advance_sec", 6.0)
         self.declare_parameter("zone_center_reach_tol_m", 0.25)
@@ -354,6 +354,7 @@ class MissionFsmNode(Node):
         self.opening_turn_deg = float(self.get_parameter("opening_turn_deg").value)
         self.opening_turn_omega = float(self.get_parameter("opening_turn_omega").value)
         self.opening_wait_after_turn_sec = float(self.get_parameter("opening_wait_after_turn_sec").value)
+        self.opening_release_at_sec = max(0.0, float(self.get_parameter("opening_release_at_sec").value))
         self.scan_search_omega = float(self.get_parameter("scan_search_omega").value)
         self.map_center_x = float(self.get_parameter("map_center_x").value)
         self.map_center_y = float(self.get_parameter("map_center_y").value)
@@ -400,6 +401,8 @@ class MissionFsmNode(Node):
         self.declare_parameter("lane_block_radius_m", 0.24)     # obstacle-to-lane dist that blocks an edge
         self.declare_parameter("comfort_clear_m", 0.35)
         self.declare_parameter("clearance_weight", 2.0)         # prefer roomy lanes over tight gates
+        self.declare_parameter("lane_simplify_enabled", True)   # false keeps raw 4-connected lane vias
+        self.declare_parameter("direct_fallback_enabled", True)  # false holds position if no lane route exists
         self.declare_parameter("start_connect_k", 4)
         self.declare_parameter("wp_reach_tol_m", 0.12)          # advance to next via within this
         self.declare_parameter("replan_period_sec", 1.5)
@@ -429,6 +432,7 @@ class MissionFsmNode(Node):
         self.front_escape_y_abs_m = float(self.get_parameter("front_escape_y_abs_m").value)
         self.front_escape_step_m = float(self.get_parameter("front_escape_step_m").value)
         self.front_escape_forward_m = float(self.get_parameter("front_escape_forward_m").value)
+        self.direct_fallback_enabled = bool(self.get_parameter("direct_fallback_enabled").value)
         self._planner = LanePlanner(
             spacing=float(self.get_parameter("grid_spacing_m").value),
             bounds=(fb[0], fb[1], fb[2], fb[3]) if len(fb) == 4 else (-2.0, 2.0, -2.0, 2.0),
@@ -440,6 +444,7 @@ class MissionFsmNode(Node):
             origin_mode=str(self.get_parameter("grid_origin_mode").value),
             origin_xy=tuple(float(v) for v in self.get_parameter("grid_origin_xy").value)[:2] or (0.0, 0.0),
             start_connect_k=int(self.get_parameter("start_connect_k").value),
+            simplify=bool(self.get_parameter("lane_simplify_enabled").value),
         )
         self._plan: list[tuple[float, float]] | None = None   # active via list (last = dest)
         self._plan_idx = 0
@@ -1753,9 +1758,8 @@ class MissionFsmNode(Node):
 
     def _drive_toward(self, dest_x: float, dest_y: float, yaw: float = 0.0, exclude_id: int = 0) -> None:
         """Route to (dest_x,dest_y) via collision-free lane waypoints, publishing the ACTIVE via to
-        go_to_goal each tick and advancing on the FSM's own arrival test. Falls back to a direct goal
-        when the planner is disabled or finds no lane route. The caller keeps its own dest-arrival
-        test to fire the state transition."""
+        go_to_goal each tick and advancing on the FSM's own arrival test. The caller keeps its own
+        dest-arrival test to fire the state transition."""
         dest = (float(dest_x), float(dest_y))
         obstacles = self._obstacles_snapshot(exclude_id, dest)
         self._publish_planning_obstacles(obstacles)
@@ -1764,7 +1768,10 @@ class MissionFsmNode(Node):
             return
         rxy = self._robot_xy()
         if rxy is None:
-            self._publish_goal(dest_x, dest_y, yaw)
+            if self.direct_fallback_enabled:
+                self._publish_goal(dest_x, dest_y, yaw)
+            else:
+                self._hold_current_goal(yaw)
             return
         now = self._now_s()
         drifted = (self._plan_dest is None
@@ -1782,13 +1789,15 @@ class MissionFsmNode(Node):
                 if escape is not None:
                     self._plan = [(escape[0], escape[1])]
                     self._plan_escape = True
-                else:
+                elif self.direct_fallback_enabled:
                     self._plan = [dest]     # no lane route and no front block -> direct fallback
+                else:
+                    self._plan = []         # lane-only mode: stop and wait for a future replan
             self._plan_idx = 0
             self._plan_dest = dest
             self._plan_stamp = now
         if not self._plan:                            # safety: never index a None/empty plan
-            self._publish_goal(dest_x, dest_y, yaw)
+            self._hold_current_goal()
             return
         # advance monotonically past intermediate vias already reached
         while self._plan_idx < len(self._plan) - 1:
@@ -2233,21 +2242,23 @@ class MissionFsmNode(Node):
         self._enter("SELECT_TARGET")
 
     def _step_opening(self) -> None:
-        """Hardcoded match opening: forward -> right strafe -> 45deg turn -> wait -> SCAN.
+        """Hardcoded match opening: wait -> forward -> right strafe -> turn -> timed hold -> SCAN.
 
         BODY-frame commands are timed; state_enter_s is reset at each leg so _time_in_state()
-        measures that leg only. The turn duration is derived from opening_turn_deg/omega.
+        measures that leg only. The release gate uses match elapsed time from node startup.
         """
         self._set_world_mapping_enabled(False, "opening move / wall settle")
         t = self._time_in_state()
         leg = self._opening_leg
         if leg == "wait":
-            # Hold STATIONARY for the configured warmup, then run the opening even if perception
-            # is still late. This guarantees the match-start motion happens after the 15 s wait.
+            # Hold briefly, then run the opening while YOLO/world_model are still warming up.
             self._drive(0.0, 0.0)
             warm = (self._now_s() - self._node_start_s) >= self.startup_warmup_sec
             if warm:
-                self.get_logger().info("warmup done -> opening move (forward + right strafe + 45deg turn)")
+                self.get_logger().info(
+                    f"startup hold done -> opening move "
+                    f"(forward + right strafe + {self.opening_turn_deg:.0f}deg turn)"
+                )
                 self._opening_leg = "forward"
                 self.state_enter_s = self._now_s()
         elif leg == "forward":
@@ -2287,9 +2298,27 @@ class MissionFsmNode(Node):
                 self.state_enter_s = self._now_s()
         else:  # settle
             self._drive(0.0, 0.0)
-            if t >= self.opening_wait_after_turn_sec:
+            match_elapsed = self._now_s() - self._node_start_s
+            release_ready = (
+                self.opening_release_at_sec <= 0.0
+                or match_elapsed >= self.opening_release_at_sec
+            )
+            if t >= self.opening_wait_after_turn_sec and release_ready:
                 self._set_world_mapping_enabled(True, "opening wall settle complete")
-                self.get_logger().info("opening done (forward + right strafe + 45deg turn + wait) -> SCAN")
+                if (
+                    self.zone_mission_enabled
+                    and self.zone_anchor_nav_enabled
+                    and self._active_zone_id() == 1
+                ):
+                    self._zone_anchor_reached_idx = self._zone_idx
+                    self._zone_stabilized_idx = self._zone_idx
+                    self._zone_stabilized_after_s = self.state_enter_s
+                    self._reset_zone_scan_timer()
+                    self._decide("ZONE 1 ANCHOR SKIPPED AFTER OPENING")
+                self.get_logger().info(
+                    f"opening done at t={match_elapsed:.1f}s "
+                    f"(release_at={self.opening_release_at_sec:.1f}s) -> SCAN"
+                )
                 self._enter("SCAN")
 
     def _search_step(self) -> None:

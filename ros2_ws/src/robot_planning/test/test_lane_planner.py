@@ -97,3 +97,18 @@ def test_direct_shot_is_single_via():
     lp = _planner()
     p = lp.plan((-1.75, -1.75), (-1.75, 1.75), GRID)   # left wall lane, clear
     assert p == [(-1.75, 1.75)]
+
+
+def test_simplify_disabled_keeps_four_connected_lane_vias():
+    lp = LanePlanner(spacing=0.5, bounds=(-2, 2, -2, 2), margin=0.22, simplify=False)
+    p = lp.plan((-1.25, -1.25), (1.25, 1.25), GRID)
+    assert p is not None
+    lane_vias = p[:-1]
+    assert len(lane_vias) > 1
+    for a, b in zip(lane_vias, lane_vias[1:]):
+        dx = abs(b[0] - a[0])
+        dy = abs(b[1] - a[1])
+        assert (
+            (abs(dx - S) < 1e-6 and dy < 1e-6)
+            or (dx < 1e-6 and abs(dy - S) < 1e-6)
+        )

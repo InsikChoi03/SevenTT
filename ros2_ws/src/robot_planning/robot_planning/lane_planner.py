@@ -53,6 +53,7 @@ class LanePlanner:
         origin_mode: str = "infer",
         origin_xy: tuple[float, float] = (0.0, 0.0),
         start_connect_k: int = 4,
+        simplify: bool = True,
     ) -> None:
         self.s = float(spacing)
         xmin, xmax, ymin, ymax = bounds
@@ -66,6 +67,7 @@ class LanePlanner:
         self.origin_mode = str(origin_mode)
         self.origin_xy = (float(origin_xy[0]), float(origin_xy[1]))
         self.k = int(start_connect_k)
+        self.simplify = bool(simplify)
 
     # ------------------------------------------------------------ lattice phase
     def _circ_phase(self, coords: list[float]) -> float:
@@ -209,6 +211,13 @@ class LanePlanner:
             i = j
         return out
 
+    def _drop_duplicate_points(self, pts):
+        out = []
+        for p in pts:
+            if not out or math.hypot(p[0] - out[-1][0], p[1] - out[-1][1]) > 1e-9:
+                out.append(p)
+        return out
+
     # ------------------------------------------------------------ public: plan
     def plan(self, start, dest, obstacles):
         """Collision-free via list from `start` to `dest` (field xy, metres). Returns a list of
@@ -220,8 +229,9 @@ class LanePlanner:
         obstacles = [(float(ox), float(oy)) for ox, oy in obstacles]
         if math.hypot(dx - sx, dy - sy) < 1e-6:
             return [(dx, dy)]
-        # Direct shot already clear? then no vias needed.
-        if self._seg_free((sx, sy), (dx, dy), obstacles):
+        # Direct shot already clear? then no vias needed. Disabled with simplify=false so tests can
+        # observe the raw 4-connected lane route instead of a straight shortcut across the field.
+        if self.simplify and self._seg_free((sx, sy), (dx, dy), obstacles):
             return [(dx, dy)]
         ox0, oy0 = self.infer_origin(obstacles)
         nodes = self._lane_nodes(ox0, oy0)
@@ -235,7 +245,9 @@ class LanePlanner:
         if path_ij is None:
             return None
         pts = [(sx, sy)] + [nodes[ij] for ij in path_ij] + [(dx, dy)]
-        pts = self._simplify(pts, obstacles)
+        pts = self._drop_duplicate_points(pts)
+        if self.simplify:
+            pts = self._simplify(pts, obstacles)
         return pts[1:]   # drop the robot's own start point
 
     # ------------------------------------------------------------ public: coverage sweep

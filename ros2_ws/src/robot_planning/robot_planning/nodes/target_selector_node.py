@@ -49,8 +49,8 @@ class TargetSelectorNode(Node):
         self.declare_parameter("zone_filter_enabled", False)
         self.declare_parameter(
             "zone_bounds_m",
-            [-2.0, 0.1, -0.25, 2.0, -2.0, 0.1, -2.0, -0.25,
-             -0.1, 2.0, -2.0, -0.25, -0.1, 2.0, -0.25, 2.0],
+            [-2.0, -0.25, -0.25, 2.0, -2.0, -0.25, -2.0, -0.25,
+             -0.25, 2.0, -2.0, -0.25, -0.25, 2.0, -0.25, 2.0],
         )
 
         self.set1_label = str(self.get_parameter("set1_label").value)

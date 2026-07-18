@@ -9,7 +9,7 @@
 #   2. 이미 실행 중이면 런치를 다시 시작한다.
 #   3. launch 변경 후 첫 1회만 robot_bringup 재빌드가 필요하다.
 #
-# 단위:
+# 단위
 #   *_m   = 미터
 #   *_sec = 초
 #   *_deg = 도
@@ -18,8 +18,8 @@
 
 localizer_node:
   ros__parameters:
-    initial_x: -1.8                       # 시작 위치 x. 경기장 중심 원점 기준, 우측하단 시작이면 -1.8.
-    initial_y: 1.8                        # 시작 위치 y. 경기장 중심 원점 기준, 우측하단 시작이면 1.8.
+    initial_x: -1.15                       # 시작 위치 x. 경기장 중심 원점 기준, 우측하단 시작이면 -1.8.
+    initial_y: 1.7                        # 시작 위치 y. 경기장 중심 원점 기준, 우측하단 시작이면 1.8.
     initial_theta: 0.0                    # 시작 heading. 현재 맵 방향 기준 왼쪽을 보는 상태.
     use_wheel_odom: false                 # 엔코더 거리 적분은 끈다. 아래 constraint는 속도 패턴 판정에만 엔코더를 쓴다.
     wheel_odom_enabled_wheels: [false, true, true, true]  # FL 엔코더 제외, FR/RL/RR 3개만 사용.
@@ -54,6 +54,21 @@ localizer_node:
     landmark_max_step_rad: 0.0            # 물체 landmark가 heading을 바꾸지 못하게 한다.
     freeze_pose_when_stationary: true     # 정지 중 landmark/visual translation이 pose를 계속 밀지 않도록 막는다.
     use_imu_heading: true                 # IMU heading 보정을 사용할지 여부.
+
+    imu_motion_smoothing_enabled: true    # accel 적분 없이 IMU 상태로 순간 x/y correction gain만 조절한다.
+    imu_motion_publish_debug: true        # /localization/imu_motion_state로 STOP/ROTATING/MOVING_SMOOTH/IMPACT_OR_SLIP 발행.
+    imu_stationary_gyro_eps_radps: 0.035  # 이보다 작은 gyro_z와 안정적인 accel이면 정지 후보로 본다.
+    imu_stationary_accel_norm_eps: 0.35   # accel norm이 1g에서 벗어나는 허용폭(m/s^2).
+    imu_stationary_accel_var_eps: 0.10    # accel norm 최근 window 분산 허용값.
+    imu_rotating_gyro_eps_radps: 0.18     # 회전 중이면 object-flow 병진 보정을 낮춘다.
+    imu_impact_accel_norm_eps: 1.50       # 충격/미끄러짐 후보 accel norm 편차.
+    imu_impact_accel_delta_eps: 1.20      # 연속 IMU 샘플 간 accel norm 급변 기준.
+    imu_object_flow_stationary_gain: 0.10 # 정지+IMU 안정 시 object-flow x/y 튐을 거의 막는다.
+    imu_object_flow_rotating_trans_gain: 0.30 # 회전 중 object-flow x/y는 낮게 반영.
+    imu_object_flow_impact_gain: 0.20     # 충격 후보 순간 object-flow x/y는 낮게 반영.
+    imu_landmark_impact_gain: 0.40        # 충격 후보 순간 object landmark 위치 보정 완화.
+    imu_wall_rotating_gain: 0.60          # 회전 중 wall 위치 보정은 완만하게 반영.
+    imu_wall_impact_gain: 0.50            # 충격 후보 순간 wall 위치 보정 완화.
     wall_anchor_gain: 0.50                # wall anchor 보정 강도. anchor가 꺼져 있으면 실질 영향 작음.
     wall_anchor_max_step_rad: 0.0         # 벽 anchor는 위치만 보정하고 heading은 IMU만 사용한다.
     wall_field_gain: 0.18                 # 새 wall_surface raw 선 검증 후 위치 보정만 보수적으로 다시 켠다.
@@ -105,7 +120,7 @@ target_selector_node:
     set1_base: 10.0                       # Set1 목표 후보 기본 점수. 클수록 우선 선택된다.
     set2_base: 20.0                       # Set2 목표 후보 기본 점수.
     zone_filter_enabled: true             # 현재 처리 구역 안의 물체만 목표 후보로 본다.
-    zone_bounds_m: [-2.0, 0.1, -0.25, 2.0, -2.0, 0.1, -2.0, -0.25, -0.1, 2.0, -2.0, -0.25, -0.1, 2.0, -0.25, 2.0]  # zone 1~4의 [xmin,xmax,ymin,ymax]. x=0만 ±10cm 중첩, y는 격자 사이 분리.
+    zone_bounds_m: [-2.0, -0.25, -0.25, 2.0, -2.0, -0.25, -2.0, -0.25, -0.25, 2.0, -2.0, -0.25, -0.25, 2.0, -0.25, 2.0]  # zone 1~4의 [xmin,xmax,ymin,ymax]. Z1/Z2는 오른쪽 3열x3행(9점), Z3/Z4는 왼쪽 4열x3행(12점), 중첩 없음.
 
 mission_fsm_node:
   ros__parameters:
@@ -153,15 +168,15 @@ mission_fsm_node:
 
     # 개막 동작
     opening_enabled: true                 # 경기 시작 직후 고정 개막 이동 사용 여부.
-    startup_warmup_sec: 18.0              # 카메라/YOLO/world_model 준비 대기 시간. 초기 YOLO 안정화를 위해 3초 추가.
+    startup_warmup_sec: 3.0               # 실행 후 3초만 정지한 뒤 YOLO 로딩 중에도 개막 동작을 먼저 시작한다.
     opening_speed: 0.12                  # 개막 전진 명령 세기. 일반 go_to_goal 속도와 별개.
     opening_forward_sec: 2.0             # 개막 전진 시간.
     opening_strafe_speed: 0.20           # 개막 오른쪽 횡이동 명령 세기. 일반 회피/ALIGN 횡이동과 별개.
     opening_strafe_right_sec: 1.0         # 개막 오른쪽 횡이동 시간.
     opening_turn_deg: 45.0                # 개막 제자리 회전 목표 각도.
     opening_turn_omega: -0.30             # 개막 회전 명령. 음수는 시계방향. 일반 회전 속도와 별개.
-    opening_wait_after_turn_sec: 4.0      # 개막 회전 후 4초 정지해 벽 보정으로 pose를 먼저 잡는다.
-
+    opening_wait_after_turn_sec: 1.0      # 개막 회전 후 최소 정지 시간. 이후 release 시간까지 계속 정지한다.
+    opening_release_at_sec: 18.0          # 경기 시작 후 18초가 되기 전에는 SCAN/타겟 주행으로 넘어가지 않는다.
     # SCAN
     scan_search_omega: -0.1             # SCAN에서 제자리 탐색 회전 명령.
     search_turn_sec: 0.5                  # 한 번에 회전하는 시간.
@@ -219,9 +234,9 @@ mission_fsm_node:
     # Zone mission
     zone_mission_enabled: true            # zone 1->2->3->4 순서로 후보/슬롯을 처리한다.
     zone_order: [1, 2, 3, 4]              # zone 방문 순서.
-    zone_bounds_m: [-2.0, 0.1, -0.25, 2.0, -2.0, 0.1, -2.0, -0.25, -0.1, 2.0, -2.0, -0.25, -0.1, 2.0, -0.25, 2.0]  # zone 1~4 경계. x=0만 ±10cm 중첩, y는 격자 사이 분리.
-    zone_anchor_xy: [-0.75, 0.75, -0.75, -1.0, 0.75, -1.0, 0.75, 0.75]  # 구역별 중앙 근처 스캔 위치 Z1~Z4.
-    zone_no_target_advance_sec: 15.0      # zone 중심에 도착한 뒤 목표가 없을 때 다음 zone으로 넘어가기 전 대기.
+    zone_bounds_m: [-2.0, -0.25, -0.25, 2.0, -2.0, -0.25, -2.0, -0.25, -0.25, 2.0, -2.0, -0.25, -0.25, 2.0, -0.25, 2.0]  # zone 1~4 경계. 오른쪽 3열/왼쪽 4열, 위/아래 3행으로 나누며 중첩 없음.
+    zone_anchor_xy: [-1.0, 0.5, -1.0, -1.0, 0.75, -1.0, 0.75, 0.5]  # 구역별 중앙 근처 스캔 위치 Z1~Z4.
+    zone_no_target_advance_sec: 6.0      # zone 중심에 도착한 뒤 목표가 없을 때 다음 zone으로 넘어가기 전 대기.
     zone_center_reach_tol_m: 0.25         # zone 중심에 도착했다고 보는 거리 허용오차.
     zone_anchor_nav_enabled: true         # zone이 바뀌면 먼저 해당 zone 중앙 스캔 위치로 이동한다.
     zone_stabilize_enabled: false         # zone 도착 후 별도 정지 안정화는 생략한다.
@@ -238,7 +253,9 @@ mission_fsm_node:
     robot_margin_m: 0.22                  # 벽에서 로봇 중심이 최소로 떨어져야 하는 여유 거리.
     lane_block_radius_m: 0.10             # 물체가 레인에 이 거리보다 가까우면 그 레인을 막힌 것으로 본다.
     comfort_clear_m: 0.15                 # 장애물과 이 거리 이상 떨어진 레인을 편한 레인으로 본다.
-    clearance_weight: 2.0                 # 장애물에서 먼 레인을 선호하는 비용 가중치.
+    clearance_weight: 0.5                 # 장애물에서 먼 레인을 선호하는 비용 가중치. 낮을수록 좁은 경로도 쉽게 선택한다.
+    lane_simplify_enabled: false          # false면 대각선 shortcut/string-pull 없이 상하좌우 레인 waypoint를 그대로 따른다.
+    direct_fallback_enabled: false        # false면 레인 경로 실패 시 목표 직행 대신 현재 위치에서 멈춘다.
     start_connect_k: 4                    # 현재 위치를 연결할 후보 레인 노드 개수.
     wp_reach_tol_m: 0.12                  # 현재 waypoint에 도착했다고 보고 다음 waypoint로 넘기는 거리.
     replan_period_sec: 1.5                # 경로를 주기적으로 다시 계산하는 최소 주기.
@@ -247,7 +264,8 @@ mission_fsm_node:
     obstacle_min_conf: 0.4                # 장애물로 인정할 월드모델 track 최소 confidence.
     obstacle_min_nobs: 2                  # 장애물로 인정할 최소 관측 횟수.
     exclude_target_radius_m: 0.30         # 목표 주변 이 거리 안의 물체는 접근 대상이라 장애물에서 제외.
-    front_escape_enabled: true            # 큰 전방 장애물 앞에서 direct fallback 대신 탈출 waypoint를 만든다.
+
+    front_escape_enabled: false           # 단순 주행 baseline: 큰 전방 장애물 앞 lateral escape를 끈다.
     front_escape_x_min_m: 0.05            # 로봇 기준 이 전방거리부터 전방 장애물로 본다.
     front_escape_x_max_m: 0.35            # 로봇 기준 이 전방거리까지 전방 장애물로 본다.
     front_escape_y_abs_m: 0.15            # 로봇 중심선 좌우 이 폭 안이면 정면을 막는 것으로 본다.
@@ -261,12 +279,25 @@ mission_fsm_node:
 siglip_gate_node:
   ros__parameters:
     set2_label: "banana"                  # SigLIP이 비교할 목표 과일 라벨.
-    fruit_prompt_templates: ["a photo of a {fruit}", "a printed photo of a {fruit}", "a {fruit} printed on paper"] # 과일별 prompt 묶음.
+    fruit_prompt_templates:               # 과일별 prompt 묶음. max pooling이라 비스듬한/길쭉한 crop 표현을 보강한다.
+      - "a photo of a {fruit}"
+      - "a printed photo of a {fruit}"
+      - "a {fruit} printed on paper"
+      - "a printed picture of a {fruit} on a white cube"
+      - "a close-up photo of a {fruit} printed on a cube"
+      - "an angled photo of a printed {fruit}"
+      - "a tilted printed {fruit} picture"
+      - "an oblique view of a {fruit} picture on paper"
+      - "a wide crop of a printed {fruit}"
+      - "a tall crop of a printed {fruit}"
     fruit_prompt_pooling: "max"           # 과일별 여러 prompt 점수를 묶는 방식. max 또는 mean.
     confidence_threshold: 0.5             # SigLIP softmax margin 하한. 높이면 오판은 줄고 미검출은 늘 수 있다.
     min_box_area: 182                     # SigLIP 대상 crop으로 인정할 최소 box 면적.
     classify_rate_hz: 1.5                 # SigLIP 분류 실행 주기. 높이면 GPU 부담 증가.
     max_batch: 4                          # 한 번에 분류할 crop 최대 개수.
+    aspect_ratio_min: 0.2                 # fruit_photo_cube을 크롭하는 허용 비율 최소
+    aspect_ratio_max: 5.0                 # fruit_photo_cube을 크롭하는 허용 비율 최대
+    square_pad_crops: true                # 길쭉한 crop을 흰 배경 정사각형으로 패딩해 SigLIP 입력 찌그러짐을 줄인다.
 
 world_model_node:
   ros__parameters:
@@ -294,7 +325,7 @@ world_model_node:
     grid_track_lock_enabled: true         # 주행 테스트 중 확인된 물체 track을 격자점에 고정해 좌표 흔들림을 줄인다.
     grid_track_lock_radius_m: 0.26        # 이 반경 안의 track만 가장 가까운 격자점에 고정한다.
     grid_track_lock_alpha: 1.0            # 1.0이면 표시/선택 좌표를 격자점으로 완전히 고정한다.
-    zone_anchor_xy: [-0.75, 0.75, -0.75, -1.0, 0.75, -1.0, 0.75, 0.75]
+    zone_anchor_xy: [-1.0, 0.5, -1.0, -1.0, 0.75, -1.0, 0.75, 0.5]
     grid_moved_threshold_m: 0.22          # 물체가 격자 시작 위치에서 이 이상 벗어나면 이동한 물체로 본다.
     fruit_cube_sticky_enabled: true       # fruit_photo_cube 근거가 충분하면 shape vote에 눌리지 않게 Set2로 고정.
     fruit_cube_sticky_conf_wide: 0.75     # wide fruit_photo_cube 누적 근거로 인정할 최소 confidence.
@@ -327,12 +358,12 @@ go_to_goal_node:
     face_tol_rad: 0.35                    # 목표 방향을 이 각도 안으로 바라봐야 전진한다.
     field_bounds_m: [-2.0, 2.0, -2.0, 2.0]  # 목표 위치 클램프용 경기장 경계.
     robot_margin_m: 0.22                  # 벽에서 로봇 중심이 최소로 떨어져야 하는 여유 거리.
-    avoid_radius_m: 0.24                  # 반응형 물체 회피가 작동하는 장애물 반경. LanePlanner 보조용으로 작게 둔다.
-    avoid_gain: 0.05                      # 장애물에서 밀어내는 반응형 회피 세기. 경로 선택은 LanePlanner가 주도한다.
+    avoid_radius_m: 0.0                   # 단순 주행 baseline: go_to_goal 반응형 물체 회피를 끈다.
+    avoid_gain: 0.0                       # 단순 주행 baseline: 장애물 repulsion을 끈다.
     avoid_goal_skip_m: 0.30               # 목표 근처 이 거리 안의 물체는 회피하지 않는다.
     use_planning_obstacles: true          # go_to_goal 회피도 LanePlanner가 쓴 필터링된 장애물 목록을 우선 사용한다.
     planning_obstacle_timeout_sec: 1.0    # planning obstacle이 이 시간보다 오래되면 world_model 장애물로 fallback한다.
-    avoid_strafe_enabled: true            # 회피 반경 안에 물체가 있으면 회전 없이 횡이동만 한다.
+    avoid_strafe_enabled: false           # 단순 주행 baseline: go_to_goal 횡회피를 끈다.
     avoid_strafe_speed: 0.15              # 회피 횡이동 명령 세기. base_controller의 strafe 보정값이 적용된다.
     avoid_strafe_forward_scale: 0.0        # 정면 장애물 접촉을 피하려고 횡이동 회피 중 전진은 기본 차단한다.
     avoid_strafe_latch_sec: 0.6            # 좌/우 회피 방향을 잠깐 유지해 드드득 왕복을 줄인다.
@@ -369,7 +400,7 @@ pick_sequencer_node:
     place_shoulder_wrist: [110.0, 30.0]   # 보관함에 놓을 때 [어깨, 손목] 목표 각도.
     grip_open: 118.0                      # 그리퍼를 여는 목표 각도.
     grip_closed: 50.0                     # 그리퍼를 닫아 물체를 잡는 목표 각도.
-    move_sec: 2.0                         # 어깨/손목 이동 단계 램프 시간.
+    move_sec: 1.5                         # 어깨/손목 이동 단계 램프 시간.
     grasp_sec: 1.0                        # 그리퍼 열림/닫힘 단계 대기 시간.
     preopen_sec: 0.25                     # 팔을 내리기 전에 그리퍼만 먼저 빠르게 여는 시간.
 
@@ -395,8 +426,8 @@ recognition_viz_node:
     grid_spacing_m: 0.50                  # 표시용 격자 간격.
     grid_origin_x_m: -1.50                # 표시용 첫 격자점 x.
     grid_origin_y_m: -1.50                # 표시용 첫 격자점 y.
-    zone_bounds_m: [-2.0, 0.1, -0.25, 2.0, -2.0, 0.1, -2.0, -0.25, -0.1, 2.0, -2.0, -0.25, -0.1, 2.0, -0.25, 2.0]  # 표시용 zone 경계.
-    zone_anchor_xy: [-0.75, 0.75, -0.75, -1.0, 0.75, -1.0, 0.75, 0.75]
+    zone_bounds_m: [-2.0, -0.25, -0.25, 2.0, -2.0, -0.25, -2.0, -0.25, -0.25, 2.0, -2.0, -0.25, -0.25, 2.0, -0.25, 2.0]  # 표시용 zone 경계.
+    zone_anchor_xy: [-1.0, 0.5, -1.0, -1.0, 0.75, -1.0, 0.75, 0.5]
     show_checkpoint_route: false          # 체크포인트 테스트 경로를 라이브 맵에 표시.
     checkpoint_route_xy: [-1.8, 1.6, -1.8, -1.75, -0.75, -1.75, -0.75, 1.6, 0.25, 1.6, 0.25, -1.75, 1.25, -1.75, 1.25, 1.6]
     checkpoint_route_heading_rad: [-1.5708, 0.0, 1.5708, 0.0, -1.5708, 0.0, 1.5708, 0.0]

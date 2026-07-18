@@ -26,10 +26,10 @@
 
 ## 2. 현재 상태 (Snapshot — 이 섹션만 최신값으로 덮어쓰기)
 
-- **현재 버전:** `v1.6.0`
-- **최종 업데이트:** 2026-07-17 22:42 (KST)
+- **현재 버전:** `v1.7.0`
+- **최종 업데이트:** 2026-07-18 17:43 (KST)
 - **최종 작업자:** `@AI`
-- **한 줄 요약:** 통합 벽 segmentation 모델과 boundary gate 기반 벽선 추출을 적용하고, 위치보정·회피·진단 흐름을 실주행 기준으로 보강했다.
+- **한 줄 요약:** 구역 분할·레인 전용 주행·개막 18초 release 흐름을 경기 실행 기준으로 단순화하고, IMU/SigLIP 안정화 튜닝을 보강했다.
 
 ---
 
@@ -119,6 +119,9 @@
 - [ ] v1.0.0 기준선 복구 상태에서 실제 경기장 맵/자기위치 추정이 이전 안정 수준으로 돌아오는지 재검증 — `@insik`
 - [ ] Set2/HSV/one-stroke inspection 기능은 v1.0.0 안정성 확인 후 별도 브랜치 또는 새 버전에서 단계적으로 재도입 여부 결정 — `@AI`
 - [ ] `motion_tuning.yaml` 값 수정 후 메인 런치 재시작만으로 perception/planning/control 파라미터 override가 적용되는지 실제 경기 실행에서 확인 — `@insik`
+- [ ] 개막 타임라인(3초 정지→개막 이동→18초 release→SCAN)이 실제 경기 실행 로그와 로봇 움직임에서 맞는지 확인 — `@insik`
+- [ ] `lane_simplify_enabled`/`direct_fallback_enabled` 조합을 바꿔 레인-only와 레인 우선+직선 fallback 주행을 실주행 비교 — `@insik`
+- [ ] `/localization/imu_motion_state`와 SigLIP square crop/prompt 보강이 pose 흔들림과 과일 분류 안정성에 주는 영향 확인 — `@insik`
 - [ ] ALIGN adaptive step의 `align_mid_error_m`, `align_step_fwd_mid_sec`, `align_step_strafe_mid_sec`를 실제 물체 접근 거리별로 튜닝 — `@insik`
 - [ ] Set2 FruitSlot 생성 기준(`set2_slot_birth_min_obs_wide`, `set2_slot_grid_lock_radius_m`)을 실제 경기장 오인식/누락 기준으로 재튜닝 — `@insik`
 - [ ] `/planning/obstacles` 공유 후 물체 사이 APPROACH에서 좌우 떨림과 멈춤이 줄었는지 실주행으로 확인 — `@insik`
@@ -135,6 +138,35 @@
 ## 5. 변경 이력 (Changelog) — ⛔ 삭제 금지 / 최신 항목이 맨 위
 
 <!-- 새 엔트리는 바로 이 줄 아래에 추가하세요. 기존 엔트리는 건드리지 마세요. -->
+
+### `v1.7.0` — 2026-07-18 17:43 (KST) · 작업자: `@AI` · ID: `2026-07-18-01`
+- **변경 요약:** 경기 실행용 구역/주행/개막 타이밍을 단순화하고, IMU 기반 보정 감쇠와 SigLIP crop 안정화를 추가했다.
+- **상세:**
+  - 4개 zone 경계를 격자 기준으로 재정의해 Z1/Z2는 각 9개 격자점, Z3/Z4는 각 12개 격자점을 포함하도록 하고 zone 간 중첩을 제거했다.
+  - target selector, mission FSM, world model, live map 표시의 zone bounds/anchor 기본값을 동일하게 맞춰 웹 맵과 실제 선택 로직이 같은 구역을 보도록 했다.
+  - Zone 1에서는 opening 이후 anchor 위치로 이동하지 않고, opening 후 정지한 위치에서 바로 목표를 선택하도록 FSM 흐름을 바꿨다.
+  - LanePlanner에 `lane_simplify_enabled`를 추가해 직선 shortcut/string-pull을 끄면 A*가 만든 상하좌우 4-connected 레인 waypoint를 그대로 따르도록 했다.
+  - `direct_fallback_enabled`를 추가해 레인 경로 실패 시 목표 직행을 끄고 현재 위치 hold를 선택할 수 있게 했다.
+  - 실험 baseline으로 front escape와 go-to-goal 반응형 회피를 끄고, 레인 차단/clearance 비용을 느슨하게 조정했다.
+  - opening 시작 전 대기를 18초에서 3초로 줄이고, 개막 이동 후에는 경기 시작 후 18초가 될 때까지 정지한 뒤 mapping/SCAN을 시작하도록 `opening_release_at_sec`를 추가했다.
+  - localizer에 IMU motion state 기반 translation gain 감쇠와 `/localization/imu_motion_state` 진단 토픽을 추가해 정지/회전/충격 상황에서 vision/wall 위치 보정 흔들림을 줄일 수 있게 했다.
+  - SigLIP fruit prompt를 보강하고 crop을 흰 배경 정사각형으로 padding하는 옵션을 추가해 길쭉하거나 비스듬한 과일 사진 crop 분류 안정성을 높였다.
+  - LanePlanner 테스트에 simplify 비활성 시 레인 waypoint가 상하좌우 인접 노드로 유지되는지 검증을 추가했다.
+- **변경 파일:**
+  - `ros2_ws/src/robot_bringup/config/motion_tuning.yaml` / 수정
+  - `ros2_ws/src/robot_bringup/config/perception.yaml` / 수정
+  - `ros2_ws/src/robot_bringup/config/test_field.yaml` / 수정
+  - `ros2_ws/src/robot_perception/robot_perception/nodes/localizer_node.py` / 수정
+  - `ros2_ws/src/robot_perception/robot_perception/nodes/recognition_viz_node.py` / 수정
+  - `ros2_ws/src/robot_perception/robot_perception/nodes/siglip_gate_node.py` / 수정
+  - `ros2_ws/src/robot_perception/robot_perception/nodes/world_model_node.py` / 수정
+  - `ros2_ws/src/robot_planning/robot_planning/lane_planner.py` / 수정
+  - `ros2_ws/src/robot_planning/robot_planning/nodes/mission_fsm_node.py` / 수정
+  - `ros2_ws/src/robot_planning/robot_planning/nodes/target_selector_node.py` / 수정
+  - `ros2_ws/src/robot_planning/test/test_lane_planner.py` / 수정
+  - `PROJECT_LOG.md` / 수정
+- **다음 할 일 반영:** opening 18초 release 실주행 확인, 레인-only/direct fallback 비교 주행, IMU motion/SigLIP crop 안정화 영향 확인 TODO를 추가했다.
+- **버전 근거:** zone 분할, LanePlanner 동작 모드, opening release gate, IMU motion smoothing, SigLIP crop 처리 등 경기 실행 흐름과 기능 파라미터가 함께 추가·변경되었으므로 `MINOR` 버전 증가로 `v1.7.0`으로 올렸다.
 
 ### `v1.6.0` — 2026-07-17 22:42 (KST) · 작업자: `@AI` · ID: `2026-07-17-02`
 - **변경 요약:** 통합 wall segmentation 모델을 기준으로 벽-바닥 경계 추출/검증을 재구성하고, 실주행 중 위치보정·회피·진단 튜닝을 보강했다.
