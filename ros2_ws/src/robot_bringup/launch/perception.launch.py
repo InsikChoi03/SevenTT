@@ -8,7 +8,7 @@ Brings up (all loading robot_bringup/config/perception.yaml):
     wall_localizer_node     (robot_perception)  -> /localization/wall_segments + corrections
     recognition_viz_node    (robot_perception)  -> live map + camera panels
     target_selector_node    (robot_planning)    -> /selected_target
-    mission_fsm_node        (robot_planning)    -> /mission_state, /base/goal_pose, /arm/pick_trigger
+    mission_fsm_node        (robot_planning)    -> /mission_state, /base_command, /arm/pick_trigger
 
 Cameras are launched separately (cameras.launch.py); this stack subscribes to their topics.
 Run cameras + this together via bringup.launch.py.
@@ -25,11 +25,7 @@ from launch_ros.actions import Node
 def generate_launch_description() -> LaunchDescription:
     bringup_share = get_package_share_directory("robot_bringup")
     default_params = os.path.join(bringup_share, "config", "perception.yaml")
-    installed_tuning = os.path.join(bringup_share, "config", "motion_tuning.yaml")
-    source_tuning = os.path.abspath(
-        os.path.join(bringup_share, "../../../../src/robot_bringup/config/motion_tuning.yaml")
-    )
-    default_tuning = source_tuning if os.path.exists(source_tuning) else installed_tuning
+    default_tuning = os.path.join(bringup_share, "config", "motion_tuning.yaml")
     params = LaunchConfiguration("params_file")
     motion_tuning = LaunchConfiguration("motion_tuning_file")
 

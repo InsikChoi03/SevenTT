@@ -26,10 +26,10 @@
 
 ## 2. 현재 상태 (Snapshot — 이 섹션만 최신값으로 덮어쓰기)
 
-- **현재 버전:** `v1.7.1`
-- **최종 업데이트:** 2026-07-19 15:52 (KST)
+- **현재 버전:** `v2.0.0`
+- **최종 업데이트:** 2026-07-19 17:28 (KST)
 - **최종 작업자:** `@AI`
-- **한 줄 요약:** 오프닝 이후 SCAN/goal 이동에서 순수 횡이동 명령을 차단하고 회전 후 전진 기반 주행으로 고정했다.
+- **한 줄 요약:** 경기 베이스 제어를 FSM 단일 `/base_command` 경로로 통합하고 설치본·카메라 복구 구조를 안정화해 오프닝 이후 SCAN/APPROACH 실주행을 정상화했다.
 
 ---
 
@@ -119,8 +119,10 @@
 - [ ] v1.0.0 기준선 복구 상태에서 실제 경기장 맵/자기위치 추정이 이전 안정 수준으로 돌아오는지 재검증 — `@insik`
 - [ ] Set2/HSV/one-stroke inspection 기능은 v1.0.0 안정성 확인 후 별도 브랜치 또는 새 버전에서 단계적으로 재도입 여부 결정 — `@AI`
 - [ ] `motion_tuning.yaml` 값 수정 후 메인 런치 재시작만으로 perception/planning/control 파라미터 override가 적용되는지 실제 경기 실행에서 확인 — `@insik`
-- [ ] 개막 타임라인(3초 정지→개막 이동→18초 release→SCAN)이 실제 경기 실행 로그와 로봇 움직임에서 맞는지 확인 — `@insik`
-- [ ] 오프닝 이후 SCAN/anchor 이동에서 `/base_command`가 `vy=0` 회전/전진 명령으로 나오는지 실제 메인 런치에서 확인 — `@insik`
+- [x] 개막 타임라인(3초 정지→개막 이동→18초 release→SCAN)이 실제 경기 실행 로그와 로봇 움직임에서 맞는지 확인 — `@insik` (2026-07-19 완료)
+- [x] 오프닝 이후 SCAN/anchor 이동에서 `/base_command`가 `vy=0` 회전/전진 명령으로 나오는지 실제 메인 런치에서 확인 — `@insik` (2026-07-19 완료)
+- [x] FSM 단일 `/base_command` 경로로 전환한 뒤 SCAN/APPROACH 메카넘 실주행 정상 동작 확인 — `@insik` (2026-07-19 완료)
+- [ ] v2.0.0 기준 전체 경기 반복 실행 3회 이상에서 단일 베이스 제어와 wide/body 카메라 자동 복구 회귀 확인 — `@insik`
 - [ ] `lane_simplify_enabled`/`direct_fallback_enabled` 조합을 바꿔 레인-only와 레인 우선+직선 fallback 주행을 실주행 비교 — `@insik`
 - [ ] `/localization/imu_motion_state`와 SigLIP square crop/prompt 보강이 pose 흔들림과 과일 분류 안정성에 주는 영향 확인 — `@insik`
 - [ ] ALIGN adaptive step의 `align_mid_error_m`, `align_step_fwd_mid_sec`, `align_step_strafe_mid_sec`를 실제 물체 접근 거리별로 튜닝 — `@insik`
@@ -139,6 +141,34 @@
 ## 5. 변경 이력 (Changelog) — ⛔ 삭제 금지 / 최신 항목이 맨 위
 
 <!-- 새 엔트리는 바로 이 줄 아래에 추가하세요. 기존 엔트리는 건드리지 마세요. -->
+
+### `v2.0.0` — 2026-07-19 17:28 (KST) · 작업자: `@AI` · ID: `2026-07-19-02`
+- **변경 요약:** 경기 메카넘 제어를 FSM 단일 명령 경로로 재구성하고 source/install 및 카메라 복구 구조를 안정화했다.
+- **상세:**
+  - 메인 경기와 field-test launch에서 `go_to_goal_node`를 제거하고, `mission_fsm_node`가 모든 상태의 `/base_command`를 단독 발행하도록 변경했다.
+  - FSM의 `/base/goal_pose` publisher와 우회 분기를 제거하고 OPENING, SCAN, APPROACH, 저장소 이동을 동일한 직접 회전·전진 명령 경로로 통일했다.
+  - 호출되지 않던 구형 `_step_approach()`와 body-stop 보조 함수, 관련 미사용 파라미터를 제거해 실제 APPROACH 경로를 하나로 정리했다.
+  - launch가 source YAML을 조건부로 직접 읽던 구조를 제거하고 설치된 `motion_tuning.yaml`만 사용하도록 해 Python 설치본과 설정 파일의 혼합 실행을 차단했다.
+  - `setuptools 81` 환경에서 문제가 된 symlink build 대신 일반 colcon build로 `robot_planning`과 `robot_bringup` 설치본을 갱신하고 source/install 해시 일치를 확인했다.
+  - `base_controller_node`에 런타임 파라미터 callback을 추가해 wheel minimum/boost/scale 변경이 캐시된 제어값에 즉시 적용되도록 했다.
+  - 일반 제자리 회전 최소 출력과 부스트를 오프닝에서 검증된 안전 범위로 맞추고, standalone `go_to_goal_node`에는 상태별 yield 및 횡이동 제한 설정을 유지했다.
+  - top/body CSI 카메라 노드에 timeout 기반 pipeline 재연결과 launch respawn을 추가해 간헐적인 wide no-frame 상태의 자동 복구 경로를 마련했다.
+  - Python compile, YAML parse, 일반 colcon build, 관련 planning 테스트 21개, 런타임 publisher introspection을 통과했으며 사용자가 오프닝 이후 SCAN/APPROACH 실주행이 문제없이 동작함을 확인했다.
+- **변경 파일:**
+  - `ros2_ws/src/robot_bringup/config/motion_tuning.yaml` / 수정
+  - `ros2_ws/src/robot_bringup/config/perception.yaml` / 수정
+  - `ros2_ws/src/robot_bringup/config/test_field.yaml` / 수정
+  - `ros2_ws/src/robot_bringup/launch/bringup.launch.py` / 수정
+  - `ros2_ws/src/robot_bringup/launch/cameras.launch.py` / 수정
+  - `ros2_ws/src/robot_bringup/launch/perception.launch.py` / 수정
+  - `ros2_ws/src/robot_bringup/launch/test_field.launch.py` / 수정
+  - `ros2_ws/src/robot_control/robot_control/nodes/base_controller_node.py` / 수정
+  - `ros2_ws/src/robot_control/robot_control/nodes/go_to_goal_node.py` / 수정
+  - `ros2_ws/src/robot_hardware/robot_hardware/nodes/camera_csi_node.py` / 수정
+  - `ros2_ws/src/robot_planning/robot_planning/nodes/mission_fsm_node.py` / 수정
+  - `PROJECT_LOG.md` / 수정
+- **다음 할 일 반영:** 개막 타임라인, 오프닝 이후 회전·전진 명령, SCAN/APPROACH 메카넘 실주행 확인 항목을 완료 처리하고 v2.0.0 전체 경기 3회 반복 회귀 확인을 추가했다.
+- **버전 근거:** 메인 경기의 `/base/goal_pose`·`go_to_goal_node` 제어 계약을 제거하고 FSM 단일 `/base_command` 구조로 전환해 기존 실행·파라미터 구성과 호환되지 않는 구조 변경이므로 `MAJOR` 버전을 `v2.0.0`으로 올렸다.
 
 ### `v1.7.1` — 2026-07-19 15:52 (KST) · 작업자: `@AI` · ID: `2026-07-19-01`
 - **변경 요약:** 오프닝 이후 goal 이동에서 메카넘 순수 횡이동을 막고 회전 후 전진 주행으로 제한했다.

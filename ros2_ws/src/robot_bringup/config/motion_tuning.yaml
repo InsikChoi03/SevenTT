@@ -179,22 +179,18 @@ mission_fsm_node:
     opening_release_at_sec: 18.0          # 경기 시작 후 18초가 되기 전에는 SCAN/타겟 주행으로 넘어가지 않는다.
     # SCAN
     scan_search_omega: -0.1             # SCAN에서 제자리 탐색 회전 명령.
+    direct_nav_speed: 0.12                # FSM 직접 waypoint 이동 전진 명령 세기.
+    direct_nav_kp_ang: 1.5                # FSM 직접 waypoint 이동 heading 비례 게인.
+    direct_nav_omega_max: 0.405           # FSM 직접 waypoint 이동 최대 회전 명령.
+    direct_nav_face_tol: 0.35             # 목표 방향을 이 각도 안으로 바라봐야 전진한다.
+    direct_nav_stop_radius_m: 0.08        # waypoint 근처에서 직접 이동 명령을 정지하는 거리.
     search_turn_sec: 0.5                  # 한 번에 회전하는 시간.
     search_look_sec: 2.5                  # 회전 후 멈춰서 인식하는 시간.
 
     # APPROACH
     approach_dist_m: 0.375                # 목표와 이 거리 이내면 APPROACH를 끝내고 ALIGN으로 넘어간다.
-    approach_face_tol: 0.25               # 목표 방향과 로봇 방향 차이가 이 rad 안이면 전진한다.
-    approach_speed: 0.1                   # APPROACH 전진 명령 세기.
-    approach_kp_ang: 1.0                  # 목표 방향으로 돌 때 heading 오차에 곱하는 비례 게인.
-    approach_omega_max: 0.18              # APPROACH 회전 명령 최대값.
-    approach_look_sec: 1.0                # APPROACH 중 멈춰서 목표를 다시 보는 시간.
-    approach_move_sec: 0.5                # APPROACH에서 한 번 회전/전진하는 시간.
     approach_lost_grace_sec: 2.5          # 목표가 잠깐 사라져도 같은 목표를 유지하는 유예 시간.
     approach_standoff_tol: 0.09           # 계획된 접근 지점에 도착했다고 보는 위치 허용오차.
-    approach_body_stop_enabled: true      # 가까운 거리에서는 맵 좌표 대신 body 상대거리로 APPROACH를 끝낸다.
-    approach_body_stop_x: 0.42            # body 기준 목표가 이 전방거리 안으로 들어오면 ALIGN으로 넘긴다.
-    approach_body_stop_max_age_sec: 0.6   # body detection이 이 시간보다 오래되면 접근 정지 기준으로 쓰지 않는다.
     classify_standoff_sec: 2.0            # Set2 과일 판별용 standoff 대기 시간. fruit_target_total=0이면 거의 미사용.
     opportunistic_set2_enabled: true       # Set1 진행 중 근처 목표 과일 큐브가 확정되면 잠깐 집고 Set1으로 복귀.
     opportunistic_set2_max_picks: 2        # 중간에 주울 Set2 목표 과일 최대 개수. 0이면 제한 없음.
@@ -354,6 +350,7 @@ go_to_goal_node:
     max_lin_speed: 0.12                 # 일반 목표 이동 중 최대 전진 명령 세기.
     min_lin_speed: 0.06                   # 전진 명령이 0이 아닐 때 적용하는 최소 명령 세기.
     max_ang_speed: 0.405                  # 목표 방향으로 회전할 때 최대 회전 명령.
+    yield_states: ["OPENING", "SCAN", "ZONE_STABILIZE", "SELECT_TARGET", "APPROACH", "ALIGN", "CLASSIFY", "PICK", "STORE_IN_TRAY", "DRIVE_TO_STORAGE", "ALIGN_OVER_BIN", "DUMP_ALL", "END"]  # FSM 직접 제어 모드에서는 go_to_goal이 stale goal 명령을 내지 않는다.
     lateral_motion_enabled: false         # 오프닝 이후 SCAN/goal 이동은 순수 횡이동 없이 회전 후 전진한다.
     fine_radius_m: 0.0                    # 경기 주행은 순수 횡이동 fine mode를 쓰지 않고 회전 후 전진한다.
     face_tol_rad: 0.35                    # 목표 방향을 이 각도 안으로 바라봐야 전진한다.
@@ -376,10 +373,10 @@ base_controller_node:
     strafe_left_scales: [0.867, 1.0, 1.0, 0.867]    # 왼쪽 횡이동 시 바퀴별 출력 보정.
     wheel_min: 0.42                       # 일반 주행에서 바퀴가 실제로 돌기 시작하는 최소 명령 보정.
     wheel_min_strafe: 0.42                # 일반 횡이동 유지 중 바퀴가 실제로 계속 움직이는 최소 명령 보정.
-    wheel_min_rot: 0.24                  # 일반 제자리 회전에서 바퀴가 실제로 돌기 시작하는 최소 명령 보정.
+    wheel_min_rot: 0.14                  # 일반 제자리 회전도 오프닝 검증값에 맞춰 낮춘다. 0.60은 드라이버/전원 보호로 무동작 가능.
     wheel_boost: 0.60                # 구버전 fallback. 실제 튜닝은 아래 strafe/rot 분리값을 사용한다.
     wheel_boost_strafe: 0.60              # 일반 횡이동 시작 시 순간 부스트 세기.
-    wheel_boost_rot: 0.45                 # 일반 제자리 회전 시작 시 순간 부스트 세기.
+    wheel_boost_rot: 0.35                 # 일반 제자리 회전 시작 시 순간 부스트 세기. 오프닝 회전과 같은 안전 범위.
     wheel_boost_ms: 150                  # 일반 시작 부스트 유지 시간(ms).
     opening_wheel_min: 0.10               # 개막 전진/복합 이동 전용 최소 바퀴 명령 보정.
     opening_wheel_min_strafe: 0.11        # 개막 횡이동 전용 최소 바퀴 명령 보정.

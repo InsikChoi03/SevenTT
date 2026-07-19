@@ -29,6 +29,8 @@ def generate_launch_description() -> LaunchDescription:
             "out_height": 960,
         }],
         output="screen",
+        respawn=True,
+        respawn_delay=2.0,
     )
     body = Node(
         package="robot_hardware",
@@ -48,5 +50,7 @@ def generate_launch_description() -> LaunchDescription:
             "out_height": 480,
         }],
         output="screen",
+        respawn=True,
+        respawn_delay=2.0,
     )
     return LaunchDescription([top, body])

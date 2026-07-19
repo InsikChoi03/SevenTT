@@ -57,6 +57,7 @@ class GoToGoalNode(Node):
         self.declare_parameter("pose_timeout_sec", 0.5)
         self.declare_parameter("use_world_model_fallback", True)
         self.declare_parameter("lateral_motion_enabled", True)
+        self.declare_parameter("yield_states", ["OPENING", "ALIGN", "PICK"])
         # Wall-collision guard: clamp every goal to the field minus the robot half-size so the base
         # never drives its 40x40 body into a wall. [xmin,xmax,ymin,ymax]; margin = half-robot + slack.
         self.declare_parameter("field_bounds_m", [0.0, 0.0, 0.0, 0.0])   # all-zero = disabled
@@ -77,6 +78,7 @@ class GoToGoalNode(Node):
         self.pose_timeout = float(self.get_parameter("pose_timeout_sec").value)
         self.use_wm_fallback = bool(self.get_parameter("use_world_model_fallback").value)
         self.lateral_motion_enabled = bool(self.get_parameter("lateral_motion_enabled").value)
+        self.yield_states = {str(v) for v in self.get_parameter("yield_states").value}
         fb = [float(v) for v in self.get_parameter("field_bounds_m").value]
         self.field_bounds = fb if len(fb) == 4 and any(v != 0.0 for v in fb) else None
         self.robot_margin = float(self.get_parameter("robot_margin_m").value)
@@ -136,7 +138,7 @@ class GoToGoalNode(Node):
             f"go_to_goal ready: kp(lin={self.kp_lin},ang={self.kp_ang}) "
             f"max(lin={self.max_lin}m/s,ang={self.max_ang}rad/s) "
             f"tol(pos={self.pos_tol}m,yaw={self.yaw_tol}rad) rate={rate}Hz "
-            f"wm_fallback={self.use_wm_fallback}"
+            f"wm_fallback={self.use_wm_fallback} yield_states={sorted(self.yield_states)}"
         )
 
     # ------------------------------------------------------------------ utils
@@ -205,10 +207,10 @@ class GoToGoalNode(Node):
 
     # --------------------------------------------------------------------- tick
     def tick(self) -> None:
-        # Yield only for the FSM's direct-drive states (opening move, ALIGN visual servo, PICK).
-        # SCAN (drive to map centre) and APPROACH (drive to target) are HOLONOMIC via go_to_goal so
-        # the mecanum base translates without spinning in place.
-        if self._mission_state in ("OPENING", "ALIGN", "PICK"):
+        # Yield /base_command ownership to the FSM in configured states. This is important when the
+        # FSM directly drives travel after OPENING: stale /base/goal_pose state must not keep this
+        # node publishing a second command stream.
+        if self._mission_state in self.yield_states:
             if not self._stopped:
                 self._publish(0.0, 0.0, 0.0)
             return

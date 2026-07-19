@@ -25,11 +25,7 @@ def generate_launch_description() -> LaunchDescription:
     bringup_share = get_package_share_directory("robot_bringup")
     launch_dir = os.path.join(bringup_share, "launch")
     params = os.path.join(bringup_share, "config", "perception.yaml")
-    installed_tuning = os.path.join(bringup_share, "config", "motion_tuning.yaml")
-    source_tuning = os.path.abspath(
-        os.path.join(bringup_share, "../../../../src/robot_bringup/config/motion_tuning.yaml")
-    )
-    default_tuning = source_tuning if os.path.exists(source_tuning) else installed_tuning
+    default_tuning = os.path.join(bringup_share, "config", "motion_tuning.yaml")
 
     with_control = LaunchConfiguration("with_control")
     motion_tuning = LaunchConfiguration("motion_tuning_file")
@@ -53,8 +49,6 @@ def generate_launch_description() -> LaunchDescription:
     control_layer = GroupAction(
         condition=IfCondition(with_control),
         actions=[
-            Node(package="robot_control", executable="go_to_goal_node",
-                 name="go_to_goal_node", parameters=[params, motion_tuning], output="screen"),
             Node(package="robot_control", executable="base_controller_node",
                  name="base_controller_node", parameters=[params, motion_tuning], output="screen"),
             Node(package="robot_control", executable="pick_sequencer_node",

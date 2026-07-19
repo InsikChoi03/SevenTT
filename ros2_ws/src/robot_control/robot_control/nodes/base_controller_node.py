@@ -12,6 +12,7 @@ from __future__ import annotations
 import math
 
 import rclpy
+from rcl_interfaces.msg import SetParametersResult
 from rclpy.node import Node
 from robot_interfaces.msg import BaseCommand, MissionState
 from std_msgs.msg import Bool, Float32MultiArray
@@ -124,6 +125,7 @@ class BaseControllerNode(Node):
 
         self.sub = self.create_subscription(BaseCommand, "/base_command", self.on_cmd, 10)
         self.pub = self.create_publisher(Float32MultiArray, "/base/wheel_speeds", 10)
+        self.add_on_set_parameters_callback(self._on_params)
         self.timer = self.create_timer(0.02, self.tick)  # 50 Hz
 
         self.get_logger().info(f"base IK lx={self.lx} ly={self.ly} watchdog={self.cmd_timeout}s")
@@ -131,6 +133,86 @@ class BaseControllerNode(Node):
     def on_cmd(self, msg: BaseCommand) -> None:
         self.last_cmd = (msg.vx, msg.vy, msg.omega)
         self.last_cmd_time = self.get_clock().now()
+
+    def _on_params(self, params) -> SetParametersResult:
+        """Apply runtime tuning changes immediately.
+
+        ROS 2 updates the parameter server value before this callback returns, but this node's control
+        loop uses cached attributes for speed. Keep those cached values in sync so live diagnostics like
+        `ros2 param set /base_controller_node wheel_min_rot ...` affect the next 50 Hz tick.
+        """
+        try:
+            for p in params:
+                name = p.name
+                if name == "lx":
+                    self.lx = float(p.value)
+                elif name == "ly":
+                    self.ly = float(p.value)
+                elif name == "cmd_timeout_sec":
+                    self.cmd_timeout = float(p.value)
+                elif name == "wheel_scales":
+                    vals = [float(v) for v in p.value]
+                    if len(vals) != 4:
+                        return SetParametersResult(
+                            successful=False,
+                            reason="wheel_scales must have 4 values",
+                        )
+                    self.wheel_scales = vals
+                elif name == "strafe_right_scales":
+                    vals = [float(v) for v in p.value]
+                    if len(vals) != 4:
+                        return SetParametersResult(
+                            successful=False,
+                            reason="strafe_right_scales must have 4 values",
+                        )
+                    self.strafe_right = vals
+                elif name == "strafe_left_scales":
+                    vals = [float(v) for v in p.value]
+                    if len(vals) != 4:
+                        return SetParametersResult(
+                            successful=False,
+                            reason="strafe_left_scales must have 4 values",
+                        )
+                    self.strafe_left = vals
+                elif name == "wheel_min":
+                    self.wheel_min = float(p.value)
+                elif name == "wheel_min_strafe":
+                    self.wheel_min_strafe = float(p.value)
+                elif name == "wheel_min_rot":
+                    self.wheel_min_rot = float(p.value)
+                elif name == "wheel_boost_strafe":
+                    self.wheel_boost_strafe = float(p.value)
+                elif name == "wheel_boost_rot":
+                    self.wheel_boost_rot = float(p.value)
+                elif name == "wheel_boost_ms":
+                    self.wheel_boost_ms = float(p.value)
+                elif name == "opening_wheel_min":
+                    self.opening_wheel_min = float(p.value)
+                elif name == "opening_wheel_min_strafe":
+                    self.opening_wheel_min_strafe = float(p.value)
+                elif name == "opening_wheel_min_rot":
+                    self.opening_wheel_min_rot = float(p.value)
+                elif name == "opening_wheel_boost_strafe":
+                    self.opening_wheel_boost_strafe = float(p.value)
+                elif name == "opening_wheel_boost_rot":
+                    self.opening_wheel_boost_rot = float(p.value)
+                elif name == "opening_wheel_boost_ms":
+                    self.opening_wheel_boost_ms = float(p.value)
+                elif name == "wheel_deadband":
+                    self.wheel_deadband = float(p.value)
+                elif name == "wheel_brake_ms":
+                    self.wheel_brake_ms = float(p.value)
+                elif name == "wheel_brake_scale":
+                    self.wheel_brake_scale = float(p.value)
+                elif name == "align_wheel_boost":
+                    self.align_wheel_boost = float(p.value)
+                elif name == "align_brake_off":
+                    self.align_brake_off = bool(p.value)
+                elif name == "wheel_slew_per_tick":
+                    self.wheel_slew = float(p.value)
+        except (TypeError, ValueError) as e:
+            return SetParametersResult(successful=False, reason=str(e))
+        return SetParametersResult(successful=True)
 
     def _on_mstate(self, msg: MissionState) -> None:
         self._mstate = str(msg.state)

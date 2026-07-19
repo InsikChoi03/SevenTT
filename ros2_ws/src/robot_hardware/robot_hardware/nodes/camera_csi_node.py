@@ -139,6 +139,8 @@ class CameraCsiNode(Node):
         self.declare_parameter("topic", "image_raw")
         self.declare_parameter("publish_rate", 30.0)
         self.declare_parameter("pull_timeout", 0.5)
+        self.declare_parameter("reconnect_delay_sec", 2.0)
+        self.declare_parameter("max_timeouts_before_reconnect", 5)
         # GPU-side downscale (nvvidconv VIC). 0 = passthrough (full sensor res). Setting these cuts
         # per-frame CPU ~linearly in pixel count — the lever for 15 Hz. Any consumer that projects
         # detection pixels (world_model/mission_fsm homographies, wide intrinsics) MUST scale to match.
@@ -174,15 +176,20 @@ class CameraCsiNode(Node):
         topic = str(self.get_parameter("topic").value)
         rate = float(self.get_parameter("publish_rate").value)
         self.pull_timeout = float(self.get_parameter("pull_timeout").value)
+        self.reconnect_delay = float(self.get_parameter("reconnect_delay_sec").value)
+        self.max_timeouts_before_reconnect = int(
+            self.get_parameter("max_timeouts_before_reconnect").value
+        )
+        self.pipeline = make_gst_pipeline(self.sensor_id, self.sensor_mode, self.width, self.height,
+                                          self.fps, self.flip, self.wbmode,
+                                          self.out_width, self.out_height,
+                                          self.exposuretimerange, self.gainrange,
+                                          self.aelock, self.awblock, self.nvargus_extra)
+        self.get_logger().info(f"GStreamer pipeline: {self.pipeline}")
 
-        pipeline = make_gst_pipeline(self.sensor_id, self.sensor_mode, self.width, self.height,
-                                     self.fps, self.flip, self.wbmode,
-                                     self.out_width, self.out_height,
-                                     self.exposuretimerange, self.gainrange,
-                                     self.aelock, self.awblock, self.nvargus_extra)
-        self.get_logger().info(f"GStreamer pipeline: {pipeline}")
-
-        self.cap = GstCsiCapture(pipeline)
+        self.cap = None
+        self._next_connect_s = 0.0
+        self._timeout_count = 0
         # SENSOR_DATA QoS (BEST_EFFORT, keep-last): a 6 MB frame at 30 Hz over RELIABLE to several
         # subscribers collapsed the delivered rate to ~1 Hz (retransmit storm). BEST_EFFORT lets each
         # consumer just take the freshest frame and drop the rest — the camera streams at full rate.
@@ -193,12 +200,67 @@ class CameraCsiNode(Node):
             f"sensor-id={self.sensor_id} mode={self.sensor_mode} "
             f"{self.width}x{self.height}@{self.fps}fps frame={self.frame_id} topic={topic} (gi/appsink)"
         )
+        self._connect()
+
+    def _now_s(self) -> float:
+        return self.get_clock().now().nanoseconds * 1e-9
+
+    def _drop_capture(self) -> None:
+        if self.cap is not None:
+            try:
+                self.cap.release()
+            except Exception as exc:  # noqa: BLE001 - best-effort cleanup
+                self.get_logger().warn(f"failed to release camera pipeline cleanly: {exc}")
+        self.cap = None
+
+    def _connect(self) -> bool:
+        now = self._now_s()
+        if now < self._next_connect_s:
+            return False
+        try:
+            self.cap = GstCsiCapture(self.pipeline)
+        except Exception as exc:  # noqa: BLE001 - keep node alive; launch respawn is last resort
+            self.cap = None
+            self._next_connect_s = now + max(0.5, self.reconnect_delay)
+            self.get_logger().error(
+                f"camera open failed for sensor-id={self.sensor_id}; "
+                f"retrying in {self.reconnect_delay:.1f}s: {exc}",
+                throttle_duration_sec=2.0,
+            )
+            return False
+        self._timeout_count = 0
+        self.get_logger().info(f"camera stream connected on sensor-id={self.sensor_id}")
+        return True
 
     def tick(self) -> None:
-        result = self.cap.read(self.pull_timeout)
-        if result is None:
-            self.get_logger().warn("frame pull timed out", throttle_duration_sec=2.0)
+        if self.cap is None and not self._connect():
             return
+        try:
+            result = self.cap.read(self.pull_timeout)
+        except Exception as exc:  # noqa: BLE001 - Argus/GStreamer can fail after startup
+            self.get_logger().error(
+                f"camera read failed; reconnecting: {exc}",
+                throttle_duration_sec=2.0,
+            )
+            self._drop_capture()
+            self._next_connect_s = self._now_s() + max(0.5, self.reconnect_delay)
+            return
+        if result is None:
+            self._timeout_count += 1
+            self.get_logger().warn(
+                f"frame pull timed out ({self._timeout_count}/"
+                f"{self.max_timeouts_before_reconnect})",
+                throttle_duration_sec=2.0,
+            )
+            if (
+                self.max_timeouts_before_reconnect > 0
+                and self._timeout_count >= self.max_timeouts_before_reconnect
+            ):
+                self.get_logger().warn("too many camera timeouts; reconnecting pipeline")
+                self._drop_capture()
+                self._next_connect_s = self._now_s() + max(0.5, self.reconnect_delay)
+            return
+        self._timeout_count = 0
         frame, w, h = result
         if self._wb_lut is not None:
             frame = cv2.LUT(frame, self._wb_lut)   # per-channel WB, SIMD (was a float32 whole-frame mul)
@@ -219,8 +281,7 @@ class CameraCsiNode(Node):
         self.pub.publish(msg)
 
     def destroy_node(self) -> bool:
-        if getattr(self, "cap", None) is not None:
-            self.cap.release()
+        self._drop_capture()
         return super().destroy_node()
 
 

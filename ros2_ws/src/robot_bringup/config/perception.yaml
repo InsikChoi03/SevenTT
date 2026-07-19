@@ -332,13 +332,6 @@ mission_fsm_node:
     # 탐색 = 스텝방식: 조금 돌고 → 멈춰서 식별 → 다시 돌고 (계속 돌면 모션블러로 트랙 유실)
     search_turn_sec: 0.5                  # 한 스텝 ~20~30° 회전(각도 크면 ↓)
     search_look_sec: 2.5                  # 한번 돌고 2~3초 대기하며 식별(자주 안 돌아도 됨)
-    # 접근 = 타겟쪽으로 천천히 돌려 마주본 뒤 전진(수렴하면 멈춤, 빙글빙글 안 함)
-    approach_face_tol: 0.25               # 이 heading오차(rad) 안이면 전진, 밖이면 제자리 회전으로 마주봄
-    approach_speed: 0.1716                # 출발/ALIGN 제외 일반 접근 속도: 0.2145의 0.8배
-    approach_kp_ang: 1.0
-    approach_omega_max: 0.345             # 접근 중 회전 상한 1.5배 상향: 0.23 -> 0.345
-    approach_look_sec: 1.0                # 접근도 스텝: 멈춰서 인식 1.0s → 짧게 이동 → 반복 (움직이며 인식 X)
-    approach_move_sec: 0.5                # 한 스텝 이동(회전 또는 전진) 시간
     approach_lost_grace_sec: 2.5          # 타겟 순간 사라져도 이 시간은 유지(튀는 재선택 방지)
     approach_standoff_tol: 0.09
     classify_standoff_sec: 2.0            # set2: stand-off서 SigLIP이 과일 타입 정할 때까지 대기(정렬 전). 오렌지 아니면 스킵

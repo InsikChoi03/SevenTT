@@ -16,7 +16,7 @@ States:
 
 Each periodic tick evaluates condition-driven transitions using the latest
 world model / selected target / classification messages, and drives the base
-(/base/goal_pose) and arm (/arm/pick_trigger). A manual /state_advance trigger
+(/base_command) and arm (/arm/pick_trigger). A manual /state_advance trigger
 still force-advances one transition for debug/dry-run exercising.
 
 Pick-gate (rulebook §6/§7, mispick on Set2 = -40, so be conservative):
@@ -33,7 +33,7 @@ import cv2
 import numpy as np
 import rclpy
 from rclpy.node import Node
-from geometry_msgs.msg import Pose, PoseArray, PoseStamped
+from geometry_msgs.msg import Pose, PoseArray
 from robot_interfaces.msg import BaseCommand, Classification, DetectionArray, MissionState, Object, WorldModel
 from std_msgs.msg import Bool, Empty, Float32MultiArray, Int8, String, UInt64
 
@@ -145,6 +145,12 @@ class MissionFsmNode(Node):
         # CLOCKWISE in place to sweep for objects. Negative omega = CW (REP-103 +z is up). The actual
         # turn speed is set by base_controller wheel_min_rot (this just needs to be non-zero CW).
         self.declare_parameter("scan_search_omega", -0.17)
+        # Direct travel uses the same /base_command ownership as OPENING for every waypoint.
+        self.declare_parameter("direct_nav_speed", 0.12)
+        self.declare_parameter("direct_nav_kp_ang", 1.5)
+        self.declare_parameter("direct_nav_omega_max", 0.405)
+        self.declare_parameter("direct_nav_face_tol", 0.35)
+        self.declare_parameter("direct_nav_stop_radius_m", 0.08)
         # When nothing is visible, DRIVE to the map centre for a better view instead of spinning in
         # place (the wide fisheye already sees all around; a central vantage just helps).
         self.declare_parameter("map_center_x", 0.0)
@@ -177,22 +183,10 @@ class MissionFsmNode(Node):
         # turn again. Continuous spinning motion-blurs the wide cam and churns tracks.
         self.declare_parameter("search_turn_sec", 0.5)    # rotate this long per step (~small angle)
         self.declare_parameter("search_look_sec", 1.6)    # then hold still this long to identify
-        # APPROACH (FSM-driven, not go_to_goal): first rotate slowly to FACE the target (so the body
-        # cam sees it), then drive forward. Proportional -> converges and stops (no endless spin).
-        self.declare_parameter("approach_face_tol", 0.25)  # rad; within this heading error -> drive
-        self.declare_parameter("approach_speed", 0.32)     # forward speed once facing
-        self.declare_parameter("approach_kp_ang", 1.0)     # omega = kp * heading-to-target (clamped)
-        self.declare_parameter("approach_omega_max", 0.23)
-        # APPROACH is also STEP-WISE (perceive from stop, then one short move) so motion never blurs
-        # the wide cam / churns the target track (that churn was the spin). And a grace window keeps
-        # the target latched through a momentary dropout instead of thrashing back to SELECT.
-        self.declare_parameter("approach_look_sec", 1.0)   # hold still + perceive the target
-        self.declare_parameter("approach_move_sec", 0.5)   # then one short rotate-or-forward step
+        # APPROACH uses the direct-navigation parameters above. Keep the target latched through a
+        # momentary dropout instead of thrashing back to SELECT.
         self.declare_parameter("approach_lost_grace_sec", 2.5)  # keep target this long if it drops out
         self.declare_parameter("approach_standoff_tol", 0.09)   # reached the stand-off within this -> ALIGN
-        self.declare_parameter("approach_body_stop_enabled", False)
-        self.declare_parameter("approach_body_stop_x", 0.42)
-        self.declare_parameter("approach_body_stop_max_age_sec", 0.6)
         # phase 2: at the stand-off, hold up to this long for SigLIP to type the fruit BEFORE aligning,
         # so we don't waste a full align on an apple/banana. Orange -> align now; typed non-orange ->
         # dropped by _nearest_phase_object; still untyped after this -> align closer for a better view.
@@ -356,6 +350,11 @@ class MissionFsmNode(Node):
         self.opening_wait_after_turn_sec = float(self.get_parameter("opening_wait_after_turn_sec").value)
         self.opening_release_at_sec = max(0.0, float(self.get_parameter("opening_release_at_sec").value))
         self.scan_search_omega = float(self.get_parameter("scan_search_omega").value)
+        self.direct_nav_speed = float(self.get_parameter("direct_nav_speed").value)
+        self.direct_nav_kp_ang = float(self.get_parameter("direct_nav_kp_ang").value)
+        self.direct_nav_omega_max = float(self.get_parameter("direct_nav_omega_max").value)
+        self.direct_nav_face_tol = float(self.get_parameter("direct_nav_face_tol").value)
+        self.direct_nav_stop_radius_m = float(self.get_parameter("direct_nav_stop_radius_m").value)
         self.map_center_x = float(self.get_parameter("map_center_x").value)
         self.map_center_y = float(self.get_parameter("map_center_y").value)
         wp = [float(v) for v in self.get_parameter("patrol_waypoints").value]
@@ -456,21 +455,8 @@ class MissionFsmNode(Node):
         self._coverage_idx = 0
         self.search_turn_sec = float(self.get_parameter("search_turn_sec").value)
         self.search_look_sec = float(self.get_parameter("search_look_sec").value)
-        self.approach_face_tol = float(self.get_parameter("approach_face_tol").value)
-        self.approach_speed = float(self.get_parameter("approach_speed").value)
-        self.approach_kp_ang = float(self.get_parameter("approach_kp_ang").value)
-        self.approach_omega_max = float(self.get_parameter("approach_omega_max").value)
-        self.approach_look_sec = float(self.get_parameter("approach_look_sec").value)
-        self.approach_move_sec = float(self.get_parameter("approach_move_sec").value)
         self.approach_lost_grace_sec = float(self.get_parameter("approach_lost_grace_sec").value)
         self.approach_standoff_tol = float(self.get_parameter("approach_standoff_tol").value)
-        self.approach_body_stop_enabled = bool(
-            self.get_parameter("approach_body_stop_enabled").value
-        )
-        self.approach_body_stop_x = float(self.get_parameter("approach_body_stop_x").value)
-        self.approach_body_stop_max_age_sec = float(
-            self.get_parameter("approach_body_stop_max_age_sec").value
-        )
         self.classify_standoff_sec = float(self.get_parameter("classify_standoff_sec").value)
         self.set2_require_fruit_label = bool(self.get_parameter("set2_require_fruit_label").value)
         self.set2_slot_enabled = bool(self.get_parameter("set2_slot_enabled").value)
@@ -547,8 +533,6 @@ class MissionFsmNode(Node):
         self._standoff_arrived_s = None
         self._search_phase = "look"     # step-wise search: look <-> turn
         self._search_t0 = self._now_s()
-        self._approach_phase = "look"   # step-wise approach: look <-> move
-        self._approach_t0 = self._now_s()
         self._appr_tgt_xy = None        # last-known target field xy (survives momentary dropout)
         self._appr_last_seen_s = 0.0
         rate = float(self.get_parameter("publish_rate_hz").value)
@@ -592,10 +576,9 @@ class MissionFsmNode(Node):
 
         self.pub_state = self.create_publisher(MissionState, "/mission_state", 10)
         self.pub_blacklist = self.create_publisher(UInt64, "/world_model/blacklist_add", 10)
-        self.pub_goal = self.create_publisher(PoseStamped, "/base/goal_pose", 10)
         self.pub_planning_obstacles = self.create_publisher(PoseArray, "/planning/obstacles", 10)
         self.pub_pick = self.create_publisher(Bool, "/arm/pick_trigger", 10)
-        self.pub_cmd = self.create_publisher(BaseCommand, "/base_command", 10)   # ALIGN visual servo
+        self.pub_cmd = self.create_publisher(BaseCommand, "/base_command", 10)   # sole base-motion owner
         # Current pick phase (1=Set1, 2=Set2) for the target selector's phase filter.
         self.pub_phase = self.create_publisher(Int8, "/planning/phase", 10)
         self.pub_zone = self.create_publisher(Int8, "/planning/zone", 10)
@@ -652,8 +635,6 @@ class MissionFsmNode(Node):
             self._yaw_scan_step = 0
             self._yaw_scan_omega_cmd = 0.0
         if new_state == "APPROACH":
-            self._approach_phase = "look"       # start each approach by perceiving from a stop
-            self._approach_t0 = self._now_s()
             self._appr_tgt_xy = (
                 (float(self.current_target.x), float(self.current_target.y))
                 if self.current_target is not None else None
@@ -735,7 +716,7 @@ class MissionFsmNode(Node):
         if not self.planner_enabled:
             wp = self._patrol_waypoints[self._patrol_idx]
             th = self.world.robot_theta if self.world is not None else 0.0
-            self._publish_goal(wp[0], wp[1], th)
+            self._drive_toward_direct(wp[0], wp[1], th)
             if (d := self._distance_to(wp[0], wp[1])) is not None and d < self.patrol_reach_tol:
                 self._patrol_idx = (self._patrol_idx + 1) % len(self._patrol_waypoints)
             return
@@ -1218,7 +1199,9 @@ class MissionFsmNode(Node):
             self._require_precise_heading_before_align = False
             self._precise_heading_retry_start_s = None
             return True
-        self._publish_goal(float(self.world.robot_x), float(self.world.robot_y), float(bearing))
+        self._drive_toward_direct(
+            float(self.world.robot_x), float(self.world.robot_y), float(bearing)
+        )
         return False
 
     def _retry_current_slot(self, reason: str) -> None:
@@ -1468,23 +1451,6 @@ class MissionFsmNode(Node):
                 best = (bx, by)
         return best
 
-    def _approach_body_stop_target(self) -> tuple[float, float] | None:
-        """Use fresh body-camera relative position to stop APPROACH before pose drift can overshoot."""
-        if (not self.approach_body_stop_enabled
-                or self._body_H is None
-                or not self._body_dets):
-            return None
-        now = self._now_s()
-        if now - self._body_dets_stamp_s > self.approach_body_stop_max_age_sec:
-            return None
-        base = self._body_target_base(self._body_label())
-        if base is None:
-            return None
-        bx, by = base
-        if bx <= max(0.0, self.approach_body_stop_x):
-            return bx, by
-        return None
-
     def _body_nearest_any(self) -> tuple[str, float, float] | None:
         """Nearest body detection of ANY label to the grab point -> (label, bx, by). Lets ALIGN spot
         a DISTRACTOR (e.g. a cube) sitting where the target was expected and skip that spot fast."""
@@ -1545,8 +1511,45 @@ class MissionFsmNode(Node):
     def _drive(self, vx: float, vy: float, omega: float = 0.0) -> None:
         c = BaseCommand()
         c.header.stamp = self.get_clock().now().to_msg()
+        c.header.frame_id = "base_link"
         c.vx, c.vy, c.omega = float(vx), float(vy), float(omega)
         self.pub_cmd.publish(c)
+
+    def _drive_toward_direct(self, dest_x: float, dest_y: float, yaw: float = 0.0) -> None:
+        """Drive to a field waypoint by publishing /base_command directly from the FSM.
+
+        This follows the same command ownership model as the OPENING routine: rotate in place until
+        the waypoint is in front of the robot, then drive forward.
+        """
+        if self.world is None:
+            self._drive(0.0, 0.0, 0.0)
+            return
+        base = self._to_base(dest_x, dest_y)
+        if base is None:
+            self._drive(0.0, 0.0, 0.0)
+            return
+        bx, by = base
+        dist = math.hypot(bx, by)
+        if dist <= self.direct_nav_stop_radius_m:
+            yaw_err = self._wrap_pi(float(yaw) - float(self.world.robot_theta))
+            if abs(yaw_err) <= self.direct_nav_face_tol:
+                self._drive(0.0, 0.0, 0.0)
+            else:
+                om = max(
+                    -self.direct_nav_omega_max,
+                    min(self.direct_nav_omega_max, self.direct_nav_kp_ang * yaw_err),
+                )
+                self._drive(0.0, 0.0, om)
+            return
+        heading_err = math.atan2(by, bx)
+        om = max(
+            -self.direct_nav_omega_max,
+            min(self.direct_nav_omega_max, self.direct_nav_kp_ang * heading_err),
+        )
+        if abs(heading_err) > self.direct_nav_face_tol:
+            self._drive(0.0, 0.0, om)
+        else:
+            self._drive(max(0.0, self.direct_nav_speed), 0.0, 0.0)
 
     @staticmethod
     def _wrap_pi(a: float) -> float:
@@ -1558,12 +1561,12 @@ class MissionFsmNode(Node):
         return (self.world.robot_x, self.world.robot_y)
 
     def _hold_current_goal(self, yaw: float | None = None) -> None:
-        """Hold position during go_to_goal-driven states without publishing base_command here."""
+        """Hold position, optionally turning in place to the requested field heading."""
         if self.world is None:
             self._drive(0.0, 0.0)
             return
         th = float(self.world.robot_theta) if yaw is None else float(yaw)
-        self._publish_goal(float(self.world.robot_x), float(self.world.robot_y), th)
+        self._drive_toward_direct(float(self.world.robot_x), float(self.world.robot_y), th)
 
     def _face_heading(self, tx: float, ty: float) -> float:
         """Field heading that points the robot (its forward/body cam) AT the target (tx,ty).
@@ -1651,20 +1654,6 @@ class MissionFsmNode(Node):
         self.get_logger().info(f"zone {prev} done -> phase sweep complete")
         self._decide(f"ZONE {prev} complete")
         self._advance_phase_or_end()
-
-    def _publish_goal(self, x: float, y: float, theta: float = 0.0) -> None:
-        msg = PoseStamped()
-        msg.header.stamp = self.get_clock().now().to_msg()
-        msg.header.frame_id = "field"
-        msg.pose.position.x = float(x)
-        msg.pose.position.y = float(y)
-        msg.pose.position.z = 0.0
-        # quaternion from yaw (REP-103): qz=sin(theta/2), qw=cos(theta/2), qx=qy=0
-        msg.pose.orientation.x = 0.0
-        msg.pose.orientation.y = 0.0
-        msg.pose.orientation.z = math.sin(theta / 2.0)
-        msg.pose.orientation.w = math.cos(theta / 2.0)
-        self.pub_goal.publish(msg)
 
     # ------------------------------------------------------ lane-graph planning
     def _obstacles_snapshot(self, exclude_id: int = 0,
@@ -1757,21 +1746,16 @@ class MissionFsmNode(Node):
         self.pub_planning_obstacles.publish(msg)
 
     def _drive_toward(self, dest_x: float, dest_y: float, yaw: float = 0.0, exclude_id: int = 0) -> None:
-        """Route to (dest_x,dest_y) via collision-free lane waypoints, publishing the ACTIVE via to
-        go_to_goal each tick and advancing on the FSM's own arrival test. The caller keeps its own
-        dest-arrival test to fire the state transition."""
+        """Route to (dest_x,dest_y) and directly command the active lane waypoint each tick."""
         dest = (float(dest_x), float(dest_y))
         obstacles = self._obstacles_snapshot(exclude_id, dest)
         self._publish_planning_obstacles(obstacles)
         if not self.planner_enabled:
-            self._publish_goal(dest_x, dest_y, yaw)
+            self._drive_toward_direct(dest_x, dest_y, yaw)
             return
         rxy = self._robot_xy()
         if rxy is None:
-            if self.direct_fallback_enabled:
-                self._publish_goal(dest_x, dest_y, yaw)
-            else:
-                self._hold_current_goal(yaw)
+            self._drive(0.0, 0.0, 0.0)
             return
         now = self._now_s()
         drifted = (self._plan_dest is None
@@ -1797,7 +1781,7 @@ class MissionFsmNode(Node):
             self._plan_dest = dest
             self._plan_stamp = now
         if not self._plan:                            # safety: never index a None/empty plan
-            self._hold_current_goal()
+            self._drive(0.0, 0.0, 0.0)
             return
         # advance monotonically past intermediate vias already reached
         while self._plan_idx < len(self._plan) - 1:
@@ -1813,14 +1797,12 @@ class MissionFsmNode(Node):
             if d_escape is not None and d_escape < self.wp_reach_tol_m:
                 self._plan = None
                 self._plan_escape = False
-                self._publish_goal(float(self.world.robot_x), float(self.world.robot_y),
-                                   self.world.robot_theta if self.world is not None else yaw)
+                self._drive(0.0, 0.0, 0.0)
                 return
         last = self._plan_idx == len(self._plan) - 1
-        # intermediate vias pass current heading (go_to_goal faces the via by position anyway); only the
-        # FINAL via carries the intended yaw (APPROACH: face the target; storage: as given).
+        # Intermediate vias keep the current heading target; the final via carries the requested yaw.
         via_yaw = yaw if last else (self.world.robot_theta if self.world is not None else yaw)
-        self._publish_goal(wx, wy, via_yaw)
+        self._drive_toward_direct(wx, wy, via_yaw)
 
     def _publish_pick(self, trigger: bool) -> None:
         self.pub_pick.publish(Bool(data=trigger))
@@ -2336,50 +2318,6 @@ class MissionFsmNode(Node):
             if dt >= self.search_turn_sec:
                 self._search_phase = "look"
                 self._search_t0 = now
-
-    def _step_approach(self, tgt_xy) -> None:
-        """STEP-WISE approach to a field xy: LOOK (hold still, perceive) then one short MOVE step
-        (rotate toward it if not facing, else drive forward), repeat. Perceiving only while stopped
-        keeps the wide cam sharp so the target track stays put — that motion churn was the spin."""
-        now = self._now_s()
-        dt = now - self._approach_t0
-        to = self._to_base(tgt_xy[0], tgt_xy[1])   # target in base_link (x fwd, y left)
-        if to is None:
-            self._drive(0.0, 0.0)
-            return
-        bx, by = to
-        dist = math.hypot(bx, by)
-        body_stop = self._approach_body_stop_target()
-        if body_stop is not None:
-            self._drive(0.0, 0.0)
-            self.get_logger().info(
-                f"APPROACH: body target at x={body_stop[0]:.2f}m y={body_stop[1]:+.2f}m "
-                "-> ALIGN",
-                throttle_duration_sec=1.0,
-            )
-            self._enter("ALIGN")
-            return
-        if dist < self.approach_dist_m:            # close enough -> hand off to ALIGN
-            self._drive(0.0, 0.0)
-            self._enter("ALIGN")
-            return
-        if self._approach_phase == "look":
-            self._drive(0.0, 0.0)                  # hold still + let perception settle the target
-            if dt >= self.approach_look_sec:
-                self._approach_phase = "move"
-                self._approach_t0 = now
-            return
-        # move: ONE short step toward the target, then back to look
-        heading_err = math.atan2(by, bx)           # + = target to the robot's left
-        om = max(-self.approach_omega_max, min(self.approach_omega_max, self.approach_kp_ang * heading_err))
-        if abs(heading_err) > self.approach_face_tol:
-            self._drive(0.0, 0.0, om)              # not facing: rotate a step toward it (slow)
-        else:
-            self._drive(self.approach_speed, 0.0, 0.0)   # facing: drive forward a step
-        if dt >= self.approach_move_sec:
-            self._drive(0.0, 0.0)
-            self._approach_phase = "look"
-            self._approach_t0 = now
 
     def _step_align(self) -> None:
         """Pulse+settle visual align: nudge the base briefly, let it FULLY STOP (inertia dissipates),

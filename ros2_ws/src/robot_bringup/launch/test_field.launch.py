@@ -6,10 +6,10 @@ pick ordering, DRY picks (logged, no arm motion). Adds the explorer (active SCAN
 recognition_viz node (2D map + YOLO camera panels + decision feed + event log).
 
 Launch args (for a safe / memory-bounded staged startup):
-    with_base   (default true)  -- explorer + go_to_goal + base_controller + mcu_bridge_base.
+    with_base   (default true)  -- FSM + base_controller + mcu_bridge_base.
                                    Set false for a STATIONARY run (robot does not move).
     with_fsm    (default true)  -- target selector + mission FSM. Set false when a manual/test
-                                   script owns /base/goal_pose.
+                                   script owns base motion.
     with_siglip (default true)  -- siglip_gate (fruit TYPE). Set false to save ~1.5 GB VRAM;
                                    YOLO still separates Set1 vs Set2 (fruit_photo_cube class).
 
@@ -63,11 +63,7 @@ def generate_launch_description() -> LaunchDescription:
     bringup_share = get_package_share_directory("robot_bringup")
     launch_dir = os.path.join(bringup_share, "launch")
     default_params = os.path.join(bringup_share, "config", "test_field.yaml")
-    installed_tuning = os.path.join(bringup_share, "config", "motion_tuning.yaml")
-    source_tuning = os.path.abspath(
-        os.path.join(bringup_share, "../../../../src/robot_bringup/config/motion_tuning.yaml")
-    )
-    default_tuning = source_tuning if os.path.exists(source_tuning) else installed_tuning
+    default_tuning = os.path.join(bringup_share, "config", "motion_tuning.yaml")
     route_overlay = _checkpoint_route_overrides(default_tuning)
     params = LaunchConfiguration("params_file")
     motion_tuning = LaunchConfiguration("motion_tuning_file")
@@ -80,14 +76,6 @@ def generate_launch_description() -> LaunchDescription:
     grid_prior_enabled = LaunchConfiguration("grid_prior_enabled")
     grid_track_lock_enabled = LaunchConfiguration("grid_track_lock_enabled")
     localizer_initial_theta = LaunchConfiguration("localizer_initial_theta")
-    goal_kp_lin = LaunchConfiguration("goal_kp_lin")
-    goal_max_lin_speed = LaunchConfiguration("goal_max_lin_speed")
-    goal_min_lin_speed = LaunchConfiguration("goal_min_lin_speed")
-    goal_max_ang_speed = LaunchConfiguration("goal_max_ang_speed")
-    goal_timeout_sec = LaunchConfiguration("goal_timeout_sec")
-    goal_avoid_radius = LaunchConfiguration("goal_avoid_radius")
-    goal_avoid_gain = LaunchConfiguration("goal_avoid_gain")
-    goal_avoid_goal_skip = LaunchConfiguration("goal_avoid_goal_skip")
     output_dir = LaunchConfiguration("output_dir")
     cam_yaw = LaunchConfiguration("cam_yaw")      # wide-cam mount rotation about base z (0/90/180/270)
     rot180 = LaunchConfiguration("rot180")        # optical-axis flip for the 180-rotated top image
@@ -106,9 +94,9 @@ def generate_launch_description() -> LaunchDescription:
 
     return LaunchDescription([
         DeclareLaunchArgument("with_base", default_value="true",
-                              description="start base drive (explorer + go_to_goal + base + bridge)"),
+                              description="start base drive (FSM + base controller + bridge)"),
         DeclareLaunchArgument("with_fsm", default_value="true",
-                              description="start target selector + mission FSM (/base/goal_pose owner)"),
+                              description="start target selector + mission FSM (/base_command owner)"),
         DeclareLaunchArgument("with_siglip", default_value="true",
                               description="start siglip_gate (fruit type); false saves VRAM"),
         DeclareLaunchArgument("with_arm", default_value="false",
@@ -121,22 +109,6 @@ def generate_launch_description() -> LaunchDescription:
                               description="lock confirmed game-object tracks to field grid points"),
         DeclareLaunchArgument("localizer_initial_theta", default_value="0.0",
                               description="initial robot heading override for localizer_node"),
-        DeclareLaunchArgument("goal_kp_lin", default_value="0.45",
-                              description="test-field go_to_goal linear gain override"),
-        DeclareLaunchArgument("goal_max_lin_speed", default_value="0.060",
-                              description="test-field go_to_goal max linear speed override"),
-        DeclareLaunchArgument("goal_min_lin_speed", default_value="0.035",
-                              description="test-field go_to_goal minimum moving command override"),
-        DeclareLaunchArgument("goal_max_ang_speed", default_value="0.22",
-                              description="test-field go_to_goal max angular speed override"),
-        DeclareLaunchArgument("goal_timeout_sec", default_value="0.40",
-                              description="test-field goal timeout; shorter lets waypoint tests stop cleanly"),
-        DeclareLaunchArgument("goal_avoid_radius", default_value="0.38",
-                              description="world-model obstacle repel radius for go_to_goal"),
-        DeclareLaunchArgument("goal_avoid_gain", default_value="0.16",
-                              description="world-model obstacle repel gain for go_to_goal"),
-        DeclareLaunchArgument("goal_avoid_goal_skip", default_value="0.12",
-                              description="ignore obstacles this close to the goal"),
         DeclareLaunchArgument("params_file", default_value=default_params,
                               description="YAML parameter file for stationary field testing"),
         DeclareLaunchArgument("motion_tuning_file", default_value=default_tuning,
@@ -169,7 +141,7 @@ def generate_launch_description() -> LaunchDescription:
              extra={"image_rotated_180": ParameterValue(rot180, value_type=bool)}),
         node("robot_perception", "recognition_viz_node", "recognition_viz_node",
              extra={"output_dir": output_dir, **route_overlay}),
-        # planning FSM (optional). Disable when a waypoint/test script owns /base/goal_pose.
+        # planning FSM (optional). Disable when a waypoint/test script owns base motion.
         node("robot_planning", "target_selector_node", "target_selector_node",
              condition=IfCondition(with_fsm)),
         node("robot_planning", "mission_fsm_node", "mission_fsm_node",
@@ -178,20 +150,9 @@ def generate_launch_description() -> LaunchDescription:
         node("robot_perception", "siglip_gate_node", "siglip_gate_node",
              condition=IfCondition(with_siglip)),
         # base drive layer (optional; robot moves only with this) -- NO arm nodes ever
-        # explorer_node DISABLED: the mission FSM's lane-coverage sweep is now the sole /base/goal_pose
-        # writer during SCAN (a second writer would race/fight the planner). Re-enable only if reverting.
+        # The mission FSM is the sole /base_command publisher in the field-test pipeline.
         # node("robot_planning", "explorer_node", "explorer_node",
         #      condition=IfCondition(with_base)),
-        node("robot_control", "go_to_goal_node", "go_to_goal_node",
-             condition=IfCondition(with_base),
-             extra={"kp_lin": ParameterValue(goal_kp_lin, value_type=float),
-                    "max_lin_speed": ParameterValue(goal_max_lin_speed, value_type=float),
-                    "min_lin_speed": ParameterValue(goal_min_lin_speed, value_type=float),
-                    "max_ang_speed": ParameterValue(goal_max_ang_speed, value_type=float),
-                    "goal_timeout_sec": ParameterValue(goal_timeout_sec, value_type=float),
-                    "avoid_radius_m": ParameterValue(goal_avoid_radius, value_type=float),
-                    "avoid_gain": ParameterValue(goal_avoid_gain, value_type=float),
-                    "avoid_goal_skip_m": ParameterValue(goal_avoid_goal_skip, value_type=float)}),
         node("robot_control", "base_controller_node", "base_controller_node",
              condition=IfCondition(with_base)),
         node("robot_hardware", "mcu_bridge_base_node", "mcu_bridge_base_node",
