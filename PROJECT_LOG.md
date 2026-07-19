@@ -26,10 +26,10 @@
 
 ## 2. 현재 상태 (Snapshot — 이 섹션만 최신값으로 덮어쓰기)
 
-- **현재 버전:** `v1.7.0`
-- **최종 업데이트:** 2026-07-18 17:43 (KST)
+- **현재 버전:** `v1.7.1`
+- **최종 업데이트:** 2026-07-19 15:52 (KST)
 - **최종 작업자:** `@AI`
-- **한 줄 요약:** 구역 분할·레인 전용 주행·개막 18초 release 흐름을 경기 실행 기준으로 단순화하고, IMU/SigLIP 안정화 튜닝을 보강했다.
+- **한 줄 요약:** 오프닝 이후 SCAN/goal 이동에서 순수 횡이동 명령을 차단하고 회전 후 전진 기반 주행으로 고정했다.
 
 ---
 
@@ -120,6 +120,7 @@
 - [ ] Set2/HSV/one-stroke inspection 기능은 v1.0.0 안정성 확인 후 별도 브랜치 또는 새 버전에서 단계적으로 재도입 여부 결정 — `@AI`
 - [ ] `motion_tuning.yaml` 값 수정 후 메인 런치 재시작만으로 perception/planning/control 파라미터 override가 적용되는지 실제 경기 실행에서 확인 — `@insik`
 - [ ] 개막 타임라인(3초 정지→개막 이동→18초 release→SCAN)이 실제 경기 실행 로그와 로봇 움직임에서 맞는지 확인 — `@insik`
+- [ ] 오프닝 이후 SCAN/anchor 이동에서 `/base_command`가 `vy=0` 회전/전진 명령으로 나오는지 실제 메인 런치에서 확인 — `@insik`
 - [ ] `lane_simplify_enabled`/`direct_fallback_enabled` 조합을 바꿔 레인-only와 레인 우선+직선 fallback 주행을 실주행 비교 — `@insik`
 - [ ] `/localization/imu_motion_state`와 SigLIP square crop/prompt 보강이 pose 흔들림과 과일 분류 안정성에 주는 영향 확인 — `@insik`
 - [ ] ALIGN adaptive step의 `align_mid_error_m`, `align_step_fwd_mid_sec`, `align_step_strafe_mid_sec`를 실제 물체 접근 거리별로 튜닝 — `@insik`
@@ -138,6 +139,21 @@
 ## 5. 변경 이력 (Changelog) — ⛔ 삭제 금지 / 최신 항목이 맨 위
 
 <!-- 새 엔트리는 바로 이 줄 아래에 추가하세요. 기존 엔트리는 건드리지 마세요. -->
+
+### `v1.7.1` — 2026-07-19 15:52 (KST) · 작업자: `@AI` · ID: `2026-07-19-01`
+- **변경 요약:** 오프닝 이후 goal 이동에서 메카넘 순수 횡이동을 막고 회전 후 전진 주행으로 제한했다.
+- **상세:**
+  - 오프닝 동작은 `mission_fsm_node`가 `/base_command`를 직접 발행하고, 오프닝 이후 SCAN/anchor 이동은 `go_to_goal_node`가 `/base/goal_pose`를 `/base_command`로 변환한다는 제어 경로 차이를 확인했다.
+  - `go_to_goal_node`에 `lateral_motion_enabled` 파라미터를 추가해 `false`일 때 waypoint 추종 중 `vy` 명령을 발행하지 않도록 했다.
+  - lateral motion 비활성 시 목표가 옆/뒤에 있으면 먼저 `omega` 회전만 수행하고, 목표 방향을 충분히 바라본 뒤 `vx` 전진만 수행하도록 했다.
+  - 경기 실행 튜닝에서 `lateral_motion_enabled: false`를 적용해 오프닝 이후 SCAN/goal 이동의 기본값을 회전/전진 기반으로 고정했다.
+  - 일반 주행 stiction 보정을 상향하고 direct fallback을 켜서 레인 경로 실패 시 정지 hold 대신 목표 방향으로 주행을 시도하도록 유지했다.
+- **변경 파일:**
+  - `ros2_ws/src/robot_control/robot_control/nodes/go_to_goal_node.py` / 수정
+  - `ros2_ws/src/robot_bringup/config/motion_tuning.yaml` / 수정
+  - `PROJECT_LOG.md` / 수정
+- **다음 할 일 반영:** 오프닝 이후 SCAN/anchor 이동에서 `/base_command`가 `vy=0` 회전/전진 명령으로 나오는지 실제 메인 런치에서 확인하는 TODO를 추가했다.
+- **버전 근거:** 오프닝 이후 주행 제어 방식의 버그성 동작을 막는 소규모 제어 수정과 튜닝 변경이므로 `PATCH` 버전 증가로 `v1.7.1`로 올렸다.
 
 ### `v1.7.0` — 2026-07-18 17:43 (KST) · 작업자: `@AI` · ID: `2026-07-18-01`
 - **변경 요약:** 경기 실행용 구역/주행/개막 타이밍을 단순화하고, IMU 기반 보정 감쇠와 SigLIP crop 안정화를 추가했다.

@@ -1,13 +1,13 @@
-"""Holonomic go-to-goal controller: drives the mecanum base toward /base/goal_pose.
+"""Go-to-goal controller: drives the base toward /base/goal_pose.
 
 Closes the gap between the FSM and the base controller:
     mission_fsm_node  --/base/goal_pose (PoseStamped, field frame)-->  [THIS NODE]
     [THIS NODE]       --/base_command  (BaseCommand vx,vy,omega base_link)--> base_controller_node
 
-The base is holonomic (mecanum), so the field-frame position error is rotated into the
-base frame and driven with a proportional law; yaw is driven to the goal orientation in
-parallel. Robot pose comes from /localization/pose (preferred) with /world_model as a
-fallback so the node is usable even while the localizer VO path is still partial.
+The base is mecanum, but competition travel can be forced to car-like motion: rotate
+toward the waypoint, then drive forward. Robot pose comes from /localization/pose
+(preferred) with /world_model as a fallback so the node is usable even while the
+localizer VO path is still partial.
 
 Safety:
   - goal_timeout_sec: if the FSM stops publishing goals the node commands a single zero and
@@ -56,6 +56,7 @@ class GoToGoalNode(Node):
         self.declare_parameter("goal_timeout_sec", 1.0)
         self.declare_parameter("pose_timeout_sec", 0.5)
         self.declare_parameter("use_world_model_fallback", True)
+        self.declare_parameter("lateral_motion_enabled", True)
         # Wall-collision guard: clamp every goal to the field minus the robot half-size so the base
         # never drives its 40x40 body into a wall. [xmin,xmax,ymin,ymax]; margin = half-robot + slack.
         self.declare_parameter("field_bounds_m", [0.0, 0.0, 0.0, 0.0])   # all-zero = disabled
@@ -75,6 +76,7 @@ class GoToGoalNode(Node):
         self.goal_timeout = float(self.get_parameter("goal_timeout_sec").value)
         self.pose_timeout = float(self.get_parameter("pose_timeout_sec").value)
         self.use_wm_fallback = bool(self.get_parameter("use_world_model_fallback").value)
+        self.lateral_motion_enabled = bool(self.get_parameter("lateral_motion_enabled").value)
         fb = [float(v) for v in self.get_parameter("field_bounds_m").value]
         self.field_bounds = fb if len(fb) == 4 and any(v != 0.0 for v in fb) else None
         self.robot_margin = float(self.get_parameter("robot_margin_m").value)
@@ -238,6 +240,30 @@ class GoToGoalNode(Node):
             return
 
         c, s = math.cos(rtheta), math.sin(rtheta)
+
+        if not self.lateral_motion_enabled:
+            # Competition baseline: never command mecanum lateral travel from this waypoint
+            # follower. If the waypoint is beside/behind the robot, rotate first; only drive
+            # forward once the body is facing the waypoint. This keeps post-opening SCAN/anchor
+            # movement on the same forward/turn axes that have proven reliable on the floor.
+            if dist >= self.pos_tol:
+                bearing = math.atan2(ey, ex)
+                head_err = wrap_pi(bearing - rtheta)
+                if abs(head_err) < self.travel_yaw_db:
+                    omega = 0.0
+                else:
+                    omega = max(-self.max_ang, min(self.max_ang, self.kp_ang * head_err))
+                if abs(head_err) < self.face_tol:
+                    vx = min(self.max_lin, self.kp_lin * dist)
+                    vx = max(vx, self.min_lin)
+                    vx *= max(0.0, math.cos(head_err))
+                else:
+                    vx = 0.0
+                self._publish(vx, 0.0, omega)
+                return
+            omega = max(-self.max_ang, min(self.max_ang, self.kp_ang * yaw_err))
+            self._publish(0.0, 0.0, omega)
+            return
 
         if dist > self.fine_radius:
             # ---- TRAVEL: usually face the goal, then drive FORWARD. If obstacle repulsion bends the
