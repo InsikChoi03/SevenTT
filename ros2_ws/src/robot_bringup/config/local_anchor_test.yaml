@@ -1,0 +1,93 @@
+# Isolated local-anchor test overrides.
+# This file is loaded only by local_anchor_test.launch.py; the competition mission does not read it.
+
+local_anchor_test_node:
+  ros__parameters:
+    # Safety gates.  For a real rotation test set both true, keep the deadman command running,
+    # and make sure mission_fsm_node is not running.
+    drive_enabled: false
+    armed: false
+    require_deadman: true
+    deadman_timeout_sec: 0.75
+    require_competition_running: true
+    check_base_command_publishers: true
+    relative_topic_timeout_sec: 1.0
+    use_imu_yaw: true            # 회전 폐루프는 pose가 아닌 물리 IMU yaw 증분을 직접 누적.
+    imu_timeout_sec: 0.5         # IMU가 끊기면 START를 대기시킨다.
+    publish_rate_hz: 20.0
+    placement_seed: 1             # 실물 배치 사진/좌표 기록에 같이 적을 반복시험 번호.
+    single_lap_inspection: true   # 시작 heading부터 시계방향 누적 360도 안에서만 판별.
+    initial_inventory_observe_sec: 2.0 # 출발 전 정지 상태로 광각 후보를 먼저 확정한다.
+
+    # Nearby inventory.  Objects outside 12~40 cm are ignored.  Two observations are required
+    # before a candidate survives the inventory freeze.
+    candidate_labels: [cube, octahedron, dodecahedron, icosahedron, fruit_photo_cube,
+      apple, orange, banana, pineapple]
+    fruit_inspection_labels: [fruit_photo_cube, apple, orange, banana, pineapple]
+    candidate_radius_min_m: 0.12
+    candidate_radius_max_m: 0.40
+    candidate_merge_radius_m: 0.14
+    candidate_merge_bearing_deg: 12.0
+    candidate_merge_radial_m: 0.10
+    candidate_min_hits: 2
+    inventory_max_candidates: 4
+    fruit_cube_override_confidence: 0.60 # cube와 함께 검출되면 이 이상은 과일큐브로 확정.
+    expected_candidates_min: 3
+    expected_candidates_max: 4
+
+    # Rotation pulse tuning.  Change ONE value at a time and repeat the same placement seed.
+    scan_step_deg: 45.0
+    scan_positions: 8
+    turn_omega: 0.07             # 기존 0.14의 절반. 테스트 전용 base floor도 함께 낮춘다.
+    turn_pulse_sec: 0.12         # 최초 로컬 앵커 테스트의 회전 펄스 시간으로 원복.
+    turn_settle_sec: 0.70        # 감속 후 완전 정지와 IMU 안정화를 기다린다.
+    turn_tolerance_deg: 3.0
+    max_turn_pulses: 60          # 느린 회전에서도 각 45도 목표에 충분히 도달할 여유.
+    scan_observe_sec: 1.00       # single_lap=false인 기존 45도 스캔 모드 전용.
+    face_observe_sec: 2.00       # 과일 정면 도달 후 2초 완전 정지한 뒤 SigLIP을 받는다.
+
+    # Fruit decision.  A new candidate needs the same label for three fresh classification frames.
+    target_fruit_label: banana
+    classify_min_confidence: 0.08
+    classify_stable_frames: 3
+    classify_timeout_sec: 8.0
+    classify_hold_on_failure: true # 판별 실패 시 UNRESOLVED로 넘기지 않고 그 자리에서 정지.
+
+    # Keep false until scan/order/classification passes repeatedly.  When enabled, the closest
+    # target fruit alone gets pulse+settle ALIGN; no real arm command is emitted by this test.
+    enable_align: false
+    body_align_labels: [fruit_photo_cube, cube, apple, orange, banana, pineapple]
+    body_ground_homography_path: /home/seventt/seventt/workspace/data/calib/body_ground.npz
+    body_px_scale_x: 2.5625
+    body_px_scale_y: 2.566667
+    body_cam_nadir_x: 0.055
+    body_cam_height_m: 0.155
+    object_center_height_m: 0.04
+    grab_x_m: 0.19
+    grab_y_m: 0.0
+    grab_min_x_m: 0.17
+    align_fwd_tolerance_m: 0.02
+    align_lateral_tolerance_m: 0.02
+    align_fwd_duty: 0.27
+    align_fwd_pulse_sec: 0.15
+    align_strafe_duty: 0.315
+    align_strafe_pulse_sec: 0.30
+    align_settle_sec: 0.60
+    align_target_timeout_sec: 2.0
+    align_timeout_sec: 12.0
+
+# Test-only base profile.  These override motion_tuning.yaml only in local_anchor_test.launch.py.
+base_controller_node:
+  ros__parameters:
+    wheel_min_rot: 0.07          # 테스트 초기값으로 원복(0.04 적용 전 값).
+    wheel_boost_rot: 0.35        # 오프닝에서 검증된 정지마찰 탈출 출력.
+    wheel_boost_ms: 100          # 출발만 보조하고 이후 0.14 floor로 낮춘다.
+    wheel_brake_ms: 120          # Reverse stop pulse.  Lower if the robot rebounds after stopping.
+    wheel_brake_scale: 0.315
+    wheel_slew_per_tick: 0.06    # 100ms boost 안에 실제 시동 출력까지 도달.
+
+# Read-only dashboard for this isolated test.  Port 8080 belongs to the main recognition UI.
+local_anchor_web_node:
+  ros__parameters:
+    web_port: 8082
+    web_fps: 8.0

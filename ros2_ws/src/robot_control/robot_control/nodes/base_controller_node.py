@@ -18,6 +18,16 @@ from robot_interfaces.msg import BaseCommand, MissionState
 from std_msgs.msg import Bool, Float32MultiArray
 
 
+def below_motion_deadband(
+    wheel_magnitude: float,
+    wheel_deadband: float,
+    *,
+    pure_rotation: bool,
+) -> bool:
+    """Keep an intentional low-speed rotation alive for the rotation stiction floor."""
+    return wheel_magnitude <= wheel_deadband and not pure_rotation
+
+
 class BaseControllerNode(Node):
     def __init__(self) -> None:
         super().__init__("base_controller_node")
@@ -281,7 +291,14 @@ class BaseControllerNode(Node):
         )
         align_profile = aligning or opening_align_strafe
         kick = False                                  # boost/brake pulse this tick -> bypass slew
-        if m <= self.wheel_deadband:
+        # For pure rotation, mecanum IK scales omega by (lx + ly).  With k=0.2, an intentional
+        # omega=0.07 becomes a 0.014 wheel command, below the generic 0.02 wheel deadband.  Do not
+        # erase that command before wheel_min_rot can lift it to the calibrated moving floor.
+        if below_motion_deadband(
+            m,
+            self.wheel_deadband,
+            pure_rotation=is_rot,
+        ):
             if self._moving:                          # transition move -> rest: start the brake pulse
                 self._moving = False
                 brake = self.wheel_brake_ms > 0.0 and self.wheel_brake_scale > 0.0
