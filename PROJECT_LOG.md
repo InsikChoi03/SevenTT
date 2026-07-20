@@ -26,10 +26,10 @@
 
 ## 2. 현재 상태 (Snapshot — 이 섹션만 최신값으로 덮어쓰기)
 
-- **현재 버전:** `v1.0.0`
-- **최종 업데이트:** 2026-07-13 18:17 (KST)
+- **현재 버전:** `v3.0.0`
+- **최종 업데이트:** 2026-07-20 15:09 (KST)
 - **최종 작업자:** `@AI`
-- **한 줄 요약:** 정십이면체 실전 미션 기준으로 구역 중첩, 주행/ALIGN fallback, body 보정, 모델 교체 상태를 통합했다.
+- **한 줄 요약:** 버튼 기반 3단계 경기 시작과 Opening 프로파일 전개를 통합하고, 팔·ALIGN·통합 벽 segmentation 보정을 현장 테스트 기준으로 안정화했다.
 
 ---
 
@@ -113,12 +113,49 @@
 - [ ] body 카메라 각도 변경 후 `body_ground.npz`를 재캘리브하고 body 검출 기반 물체 거리/맵 표시가 맞는지 확인 — `@insik`
 - [ ] 구역 미션 실주행에서 zone center 도착 후 6초 타이머와 구역 전환 로그가 의도대로 작동하는지 확인 — `@insik`
 - [ ] 정이십면체 단독 목표 설정으로 실제 픽업 1회 성공 여부와 ALIGN 소요 시간을 확인 — `@insik`
+- [x] A1 내부 풀업 버튼과 D10/D11/D12 상태 LED를 통합 펌웨어 및 독립 테스트 스케치에 반영 — `@AI` (2026-07-20 완료)
+- [x] 메인 경기에서 STANDBY→READY→RUNNING 3단계 시작 게이트와 주행·팔·YOLO 안전 차단 연결 — `@AI` (2026-07-20 완료)
+- [x] RUNNING 후 실제 OPENING 진입 시 Arduino D13을 2초 구동하고 이후 LOW로 강제 유지 — `@AI` (2026-07-20 완료)
+- [x] 통합 `wall_surface`/`wall_floor_boundary` 모델 기반 floor-side 벽선 추출과 완화된 boundary gate 적용 — `@AI` (2026-07-20 완료)
+- [ ] v2.0.0의 encoder motion constraint, mapping gate, grid track lock을 현재 v3 주행 파이프라인에 선택 이식 — `@AI`
+- [ ] MPU6050 정지 가속도 norm을 시작 시 자동 보정한 뒤 IMU motion smoothing 활성화 여부 재검증 — `@AI`
 
 ---
 
 ## 5. 변경 이력 (Changelog) — ⛔ 삭제 금지 / 최신 항목이 맨 위
 
 <!-- 새 엔트리는 바로 이 줄 아래에 추가하세요. 기존 엔트리는 건드리지 마세요. -->
+
+### `v3.0.0` — 2026-07-20 15:09 (KST) · 작업자: `@AI` · ID: `2026-07-20-01`
+- **변경 요약:** 버튼 2회로 경기 준비·주행을 시작하고 Opening 프로파일 전개까지 자동 수행하는 실전 구동 구조와 통합 벽 보정을 적용했다.
+- **상세:**
+  - Arduino A1 버튼을 내부 풀업 active-low 입력으로 구성하고 D10/D11/D12의 빨강·초록·노랑 LED로 STANDBY/READY/RUNNING 상태를 표시하도록 통합 펌웨어를 확장했다.
+  - Jetson MCU bridge가 버튼 sequence를 받아 첫 입력은 READY, 두 번째 입력은 RUNNING으로 전환하고, RUNNING 전에는 베이스와 팔 명령을 차단하도록 했다.
+  - mission FSM을 STANDBY에서 시작해 READY에서는 정지 상태로 YOLO만 준비하고, RUNNING 수신 시 기존 OPENING 및 주행 알고리즘을 처음부터 시작하도록 연결했다.
+  - RUNNING 이후 실제 MissionState가 OPENING에 들어갈 때 Arduino D13에 2초 펄스를 한 번만 보내고, Arduino 자체 timeout과 Jetson의 `<LIFT,0>` 재명령으로 출력을 이중 차단하도록 했다.
+  - start-panel 독립 LED/버튼 테스트 스케치, 업로드·모니터 스크립트, D13 프로파일 단독 안전 테스트 도구를 추가했다.
+  - 메인 실행 스크립트에 이전 launch PID 종료, 상태·맵·로그 초기화, 안전한 base/arm 기본 비활성화와 실시간 MJPEG 안내를 통합했다.
+  - 팔 이동 시간을 4.0초에서 1.5초로 단축하고 그리퍼 열림각을 115도에서 120도로 확대했으며, ALIGN 횡이동 1회 시간을 기존의 1.5배로 조정했다.
+  - `wall_surface`와 `wall_floor_boundary`를 함께 출력하는 통합 segmentation 모델을 사용하고, surface의 floor-side edge 중 boundary mask 내부 후보만 벽선으로 채택하도록 변경했다.
+  - 얇은 boundary 검출을 허용하도록 confidence·overlap·dilation 관문을 완화하고, 최근 5프레임 median/EMA와 부호 전환 초기화로 벽 보정 흔들림을 줄였다.
+  - 벽 기반 heading 보정은 0으로 차단하고 위치 보정 gain과 1회 이동량을 보수적으로 제한해 IMU heading과 벽 위치 보정이 서로 싸우지 않도록 했다.
+- **변경 파일:**
+  - `firmware/base_arm_combined/base_arm_combined.ino` / 수정
+  - `firmware/shape4_start_panel_v1_0_0/shape4_start_panel_v1_0_0.ino` / 신규
+  - `ros2_ws/src/robot_bringup/config/perception.yaml` / 수정
+  - `ros2_ws/src/robot_bringup/config/test_field.yaml` / 수정
+  - `ros2_ws/src/robot_control/robot_control/nodes/go_to_goal_node.py` / 수정
+  - `ros2_ws/src/robot_control/robot_control/nodes/pick_sequencer_node.py` / 수정
+  - `ros2_ws/src/robot_hardware/robot_hardware/nodes/mcu_bridge_base_node.py` / 수정
+  - `ros2_ws/src/robot_perception/robot_perception/nodes/wall_localizer_node.py` / 수정
+  - `ros2_ws/src/robot_perception/robot_perception/nodes/yolo_detector_node.py` / 수정
+  - `ros2_ws/src/robot_planning/robot_planning/nodes/mission_fsm_node.py` / 수정
+  - `scripts/run_shape4_v1_test.sh` / 신규
+  - `scripts/shape4_profile_test_v1_0_0.py` / 신규
+  - `scripts/shape4_start_panel_test_v1_0_0.sh` / 신규
+  - `PROJECT_LOG.md` / 수정
+- **다음 할 일 반영:** 버튼·LED, 3단계 시작 게이트, Opening D13 펄스, 통합 벽선 추출 항목을 완료 처리하고 v2 위치추정 선택 이식과 IMU 가속도 기준 자동 보정을 신규 TODO로 추가했다.
+- **버전 근거:** 경기 시작 하드웨어 인터페이스와 전체 런타임 상태 흐름이 STANDBY/READY/RUNNING 구조로 바뀌고 프로파일 전개·안전 게이트까지 통합되어 기존 실행 계약이 크게 변경되었으므로 `MAJOR` 버전을 `v3.0.0`으로 올렸다.
 
 ### `v1.0.0` — 2026-07-13 18:17 (KST) · 작업자: `@AI` · ID: `2026-07-13-01`
 - **변경 요약:** 정십이면체 4개 실전 경기 흐름을 기준으로 인식/구역/주행/ALIGN 튜닝과 모델 교체 상태를 1.0.0 기준선으로 정리했다.

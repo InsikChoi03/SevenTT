@@ -9,6 +9,10 @@
 //   송신 <ODOM,fl,fr,rl,rr,t_ms>\n   10Hz 엔코더 실측 휠 속도(m/s)
 //   송신 <ENC,e1,e2,e3,e4,t_ms>\n       2Hz 엔코더 raw tick(매핑 검증용)
 //   송신 <ARMACK,a,b,c>\n       <ARM> 수신 echo (최대 5Hz)
+//   송신 <START,n>\n             시작 패널 버튼을 누른 횟수(sequence)
+//   수신 <STARTACK,n>\n          Jetson이 시작 신호를 수락하면 실행(초록) 표시
+//   수신 <STATUS,STANDBY|READY|RUNNING|DONE|ERROR>\n  시작 패널 상태 표시
+//   수신 <LIFT,ms>\n              Arduino D13 프로파일 출력. 최대 10초 후 자동 OFF
 //   송신 <BANNER,...>           부팅 시 1회
 //
 // PCA9685 둘(같은 I2C 버스, 주소 다름): 베이스 0x60@1600Hz(MX1508 H-브리지), 팔 0x40@50Hz(서보 500~2500us).
@@ -73,14 +77,77 @@ unsigned long lastUpd = 0, lastAck = 0;
 char buf[80];
 uint8_t idx = 0;
 bool inFrame = false;
-const int LED = 13;
+// D13 is reserved for the profile/lift driver control input, so the old
+// heartbeat LED toggle must remain disabled.
+const int LED = -1;
 
-// ---- 광각 리프트 모터 MOSFET (핀 9, on/off 스위치) ----
-// D9는 QGPMaker 기본 Encoder1 B상과 충돌한다. 엔코더 테스트 중에는 리프트를 비활성화한다.
-const int LIFT_PIN = -1;
+// ---- 시작 패널 (공통 GND 3색 LED + 내부 풀업 active-low 버튼) ----
+// D10~D12와 A1은 현재 엔코더/초음파/I2C/USB Serial 핀과 겹치지 않는다.
+const uint8_t LED_RED_PIN    = 10;
+const uint8_t LED_GREEN_PIN  = 11;
+const uint8_t LED_YELLOW_PIN = 12;
+const uint8_t START_SW_PIN   = A1;
+const unsigned long START_DEBOUNCE_MS = 50;
+
+enum PanelState : uint8_t {
+  PANEL_OFF,
+  PANEL_STANDBY,
+  PANEL_READY,
+  PANEL_RUNNING,
+  PANEL_DONE,
+  PANEL_ERROR,
+};
+
+PanelState panelState = PANEL_OFF;
+bool startRaw = false;
+bool startStable = false;
+unsigned long startRawChangedAt = 0;
+uint16_t startSequence = 0;
+
+// ---- 프로파일/광각 리프트 모터 MOSFET (Arduino D13, active-high) ----
+// D13 drives only the MOSFET/relay logic input. Never power the motor directly from this pin.
+const int LIFT_PIN = 13;
 const unsigned long MAX_LIFT_MS = 10000;   // 스톨 번아웃 방지: 최대 on 시간 후 자동 off
 bool liftOn = false;
 unsigned long liftOffAt = 0;
+
+void setPanelState(PanelState state) {
+  panelState = state;
+  digitalWrite(LED_RED_PIN,    (state == PANEL_STANDBY || state == PANEL_DONE || state == PANEL_ERROR) ? HIGH : LOW);
+  digitalWrite(LED_GREEN_PIN,  state == PANEL_RUNNING ? HIGH : LOW);
+  digitalWrite(LED_YELLOW_PIN, state == PANEL_READY ? HIGH : LOW);
+}
+
+void setupStartPanel() {
+  pinMode(LED_RED_PIN, OUTPUT);
+  pinMode(LED_GREEN_PIN, OUTPUT);
+  pinMode(LED_YELLOW_PIN, OUTPUT);
+  pinMode(START_SW_PIN, INPUT_PULLUP);  // 내부 풀업: 놓음=HIGH, 누름=LOW
+  startRaw = digitalRead(START_SW_PIN) == LOW;
+  startStable = startRaw;
+  startRawChangedAt = millis();
+  setPanelState(PANEL_STANDBY);
+}
+
+void updateStartPanel(unsigned long now) {
+  bool raw = digitalRead(START_SW_PIN) == LOW;
+  if (raw != startRaw) {
+    startRaw = raw;
+    startRawChangedAt = now;
+  }
+  if (raw == startStable || now - startRawChangedAt < START_DEBOUNCE_MS) return;
+
+  startStable = raw;
+  Serial.print("<SW,");
+  Serial.print(startStable ? 1 : 0);
+  Serial.println(">");
+  if (!startStable) return;  // 누르는 순간(LOW)만 1회 처리하고 손을 뗄 때는 무시
+
+  startSequence++;
+  Serial.print("<START,");
+  Serial.print(startSequence);
+  Serial.println(">");
+}
 
 void updateEncoder(uint8_t e) {
   uint8_t state = encState[e] & 3;
@@ -277,7 +344,7 @@ void parseFrame() {
       Serial.print("<ARMACK,"); Serial.print((int)tgtA[0]); Serial.print(',');
       Serial.print((int)tgtA[1]); Serial.print(','); Serial.print((int)tgtA[2]); Serial.println(">");
     }
-  } else if (strncmp(buf, "LIFT,", 5) == 0) {   // 광각 리프트 모터 MOSFET (핀9)
+  } else if (strncmp(buf, "LIFT,", 5) == 0) {   // 프로파일/광각 리프트 MOSFET (Arduino D13)
     long ms = atol(buf + 5);
     if (ms <= 0) {                               // <LIFT,0> = 즉시 off
       setLift(false); liftOn = false;
@@ -293,11 +360,24 @@ void parseFrame() {
   } else if (strncmp(buf, "ENCZERO", 7) == 0) {
     resetEncoders();
     Serial.println("<ENCZERO,OK>");
+  } else if (strncmp(buf, "STARTACK,", 9) == 0) {
+    setPanelState(PANEL_RUNNING);
+  } else if (strcmp(buf, "STATUS,STANDBY") == 0) {
+    setPanelState(PANEL_STANDBY);
+  } else if (strcmp(buf, "STATUS,READY") == 0) {
+    setPanelState(PANEL_READY);
+  } else if (strcmp(buf, "STATUS,RUNNING") == 0) {
+    setPanelState(PANEL_RUNNING);
+  } else if (strcmp(buf, "STATUS,DONE") == 0) {
+    setPanelState(PANEL_DONE);
+  } else if (strcmp(buf, "STATUS,ERROR") == 0) {
+    setPanelState(PANEL_ERROR);
   }
 }
 
 void setup() {
-  pinMode(LED, OUTPUT);
+  if (LED >= 0) pinMode(LED, OUTPUT);
+  setupStartPanel();
   if (LIFT_PIN >= 0) { pinMode(LIFT_PIN, OUTPUT); setLift(false); }   // 부팅 시 리프트 모터 off
   Serial.begin(115200);
   Wire.begin();
@@ -314,7 +394,7 @@ void setup() {
   for (int i = 0; i < 3; i++) { curA[i] = 90; tgtA[i] = 90; }   // 팔은 boot-limp (아래 loop서 armActive 전엔 미구동)
   delay(200);
   resetEncoders();
-  Serial.println("<BANNER,base_arm_combined_v2,base0x60/arm0x40,enc4320,115200>");
+  Serial.println("<BANNER,base_arm_combined_v2,panel3stage,base0x60/arm0x40,profileD13,enc4320,115200>");
   lastCmdMs = millis();
 }
 
@@ -326,6 +406,7 @@ void loop() {
     else if (inFrame && idx < sizeof(buf) - 1) { buf[idx++] = c; }
   }
   unsigned long now = millis();
+  updateStartPanel(now);
 
   // 광각 리프트 모터 자동 off (MAX_LIFT_MS 스톨 방지)
   if (liftOn && (long)(now - liftOffAt) >= 0) {
@@ -359,7 +440,7 @@ void loop() {
   // 베이스 HB 5Hz
   if (now - lastHb >= 200) {
     lastHb = now;
-    digitalWrite(LED, !digitalRead(LED));
+    if (LED >= 0) digitalWrite(LED, !digitalRead(LED));
     Serial.print("<HB,");
     Serial.print(wheelCmd[0], 3); Serial.print(',');
     Serial.print(wheelCmd[1], 3); Serial.print(',');

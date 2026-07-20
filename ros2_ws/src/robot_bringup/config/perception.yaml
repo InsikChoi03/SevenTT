@@ -48,11 +48,11 @@ localizer_node:
     freeze_pose_when_stationary: true
     wall_anchor_gain: 0.50
     wall_anchor_max_step_m: 0.03
-    wall_anchor_max_step_rad: 0.03
+    wall_anchor_max_step_rad: 0.0          # 벽 검출 흔들림이 heading을 바꾸지 않게 IMU heading만 사용
     wall_anchor_deadband_m: 0.005
-    wall_field_gain: 0.35
-    wall_field_max_step_m: 0.05
-    wall_field_max_step_rad: 0.04
+    wall_field_gain: 0.18                  # 통합 벽 검출의 위치 보정을 보수적으로 반영
+    wall_field_max_step_m: 0.02            # 한 프레임 벽 위치 보정 상한을 2cm로 제한
+    wall_field_max_step_rad: 0.0           # 벽 선분은 heading을 보정하지 않음
     wall_field_deadband_m: 0.005
     wall_correction_stale_sec: 1.5
     use_imu_heading: true                 # IMU heading 보정 ON: 벽 보정 OFF 조건 비교 테스트
@@ -81,20 +81,38 @@ wall_localizer_node:
     ignore_robot_rect: [0.34, 0.25, 0.66, 0.88]
     max_range_m: 2.3
     use_segmentation_mask: true
-    segmentation_model_path: "/home/seventt/seventt/workspace/models/wall_floor_boundary_seg_v3.pt"
+    segmentation_model_path: "/home/seventt/seventt/shape4_v1_test/models/wall_seg_v1.pt" # class0=wall_surface, class1=wall_floor_boundary
     segmentation_input_size: 640
-    segmentation_min_confidence: 0.30
+    segmentation_min_confidence: 0.25
     segmentation_run_rate_hz: 1.0
     segmentation_morph_kernel: 5
+    wall_boundary_verify_enabled: true    # boundary와 겹치는 surface 밑변만 벽으로 사용
+    wall_surface_class_id: 0
+    wall_boundary_class_id: 1
+    wall_boundary_model_path: ""          # 두 클래스가 한 모델에 있으므로 별도 모델 미사용
+    wall_boundary_min_confidence: 0.15
+    wall_boundary_overlap_min: 0.25       # 약한/얇은 boundary도 통과하도록 겹침 관문 완화
+    wall_boundary_dilate_px: 22           # surface-boundary 사이 픽셀 오차 허용 확대
+    wall_boundary_sample_spacing_px: 5.0
+    wall_boundary_verify_fail_open: false # boundary가 없으면 검증 안 된 surface 선분을 버림
     segmentation_min_component_area: 120
     segmentation_max_components: 6
     segmentation_min_line_length_px: 55
+    segmentation_mask_line_mode: "floor_side_edge"
+    wall_surface_edge_approx_epsilon_ratio: 0.012
+    wall_surface_edge_refine_px: 7.0
+    wall_surface_inner_edge_band_m: 0.18
+    wall_surface_inner_edge_percentile: 35.0
+    wall_surface_max_edges_per_component: 4
+    wall_surface_edge_min_length_m: 0.12
     wall_image_edge_reject_ratio: 0.05    # 노란 선분 중점이 화면 가장자리 5% 안이면 보정에서 제외
     wall_anchor_enabled: false
     wall_anchor_min_lines: 2
     wall_anchor_smoothing: 0.20
     field_half_extent_m: 2.0
     wall_field_max_residual_m: 0.80
+    wall_field_fast_smoothing: 1.0
+    wall_field_filter_window: 5            # 최근 5개 벽 보정값 median으로 단일 프레임 흔들림 억제
     wall_field_smoothing: 0.25
 
 yolo_detector_node:
@@ -315,7 +333,7 @@ mission_fsm_node:
     align_step_fwd_duty: 0.27             # 전진/후진 duty. 직전 저속값 대비 1.5배
     align_step_fwd_sec: 0.15              # 한 번 전/후진 보정 거리: 직전값 대비 1.5배
     align_step_strafe_duty: 0.315         # ALIGN 미세조정 횡이동 duty: 0.45의 0.7배
-    align_step_strafe_sec: 0.1575         # 한 번 좌/우 보정 거리: 직전 0.225의 0.7배
+    align_step_strafe_sec: 0.23625        # 한 번 좌/우 보정 거리: 기존 0.1575초의 1.5배
     align_body_lost_backoff_enabled: true # ALIGN에서 wide/world에는 있는데 body에 없으면 후진 후 재탐지
     align_body_lost_backoff_speed: 0.189  # body lost 후진 duty: 0.27의 0.7배
     align_body_lost_backoff_sec: 0.54     # 속도 0.7배 기준 약 10cm 후진
@@ -332,9 +350,9 @@ pick_sequencer_node:
     init_pose: [110.0, 30.0, 50.0]        # 주행 대기: 보관함 쪽 상단, 그리퍼 닫힘
     pick_shoulder_wrist: [25.0, 150.0]    # 집기 도달: 어깨·손목
     place_shoulder_wrist: [110.0, 30.0]   # 놓기: 닫은 채 이동 후 이 위치에서 열기
-    grip_open: 115.0                      # 열림/놓기
+    grip_open: 120.0                      # 열림/놓기: 기존 115도에서 5도만 더 벌림
     grip_closed: 50.0                     # 닫힘/잡기
-    move_sec: 4.0                         # 팔 이동 단계 램프 시간(REACH/LIFT/TO_PLACE). 내림 속도 완화
+    move_sec: 1.5                         # 최근 성공 튜닝값: 팔 이동 단계(REACH/LIFT/TO_PLACE) 속도 향상
     grasp_sec: 1.0                        # 그리퍼 열림/닫힘 단계 램프 시간
 
 go_to_goal_node:
@@ -395,6 +413,8 @@ mcu_bridge_base_node:
   ros__parameters:
     port: "/dev/ttyUSB0"                  # base = CH340 (arm ACM is NOT launched)
     baud: 115200
+    opening_profile_enabled: true          # RUNNING 후 실제 OPENING 진입 시 D13 1회 구동
+    opening_profile_ms: 2000               # 프로파일 전개 신호 2초 후 Arduino+Jetson 이중 OFF
     publish_encoder_odom: true            # <ODOM,...> 실제 엔코더 기반 휠속도만 odom으로 사용
     publish_heartbeat_as_odom: false      # <HB,...>는 명령 echo라 pose drift 원인이므로 기본 차단
     odom_deadband_mps: 0.005

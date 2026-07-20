@@ -346,9 +346,11 @@ class MissionFsmNode(Node):
         rate = float(self.get_parameter("publish_rate_hz").value)
 
         # --- runtime state ---
-        # Start with the hardcoded opening move, then fall into SCAN. Disable via param.
-        self.state = "OPENING" if self.opening_enabled else "SCAN"
-        self._opening_leg = "wait"      # wait -> forward -> strafe_right -> turn -> settle -> SCAN
+        # Competition start panel owns the launch gate. Nothing moves until RUNNING arrives.
+        self.state = "STANDBY"
+        self._competition_state = "STANDBY"
+        self._competition_started = False
+        self._opening_leg = "forward"   # RUNNING -> forward -> strafe_right -> turn -> settle -> SCAN
         self._opening_turn_start_theta: float | None = None
         self._got_world = False         # set on first /world_model (perception up)
         self._node_start_s = self._now_s()
@@ -376,6 +378,7 @@ class MissionFsmNode(Node):
         self.create_subscription(DetectionArray, "/camera_body/detections", self.on_body_dets, 10)
         self.create_subscription(Range, "/ultrasonic/range", self.on_range, 10)   # front grab distance
         self.create_subscription(Empty, "/state_advance", self.on_advance, 10)
+        self.create_subscription(String, "/competition/state", self.on_competition_state, 10)
 
         self.pub_state = self.create_publisher(MissionState, "/mission_state", 10)
         self.pub_blacklist = self.create_publisher(UInt64, "/world_model/blacklist_add", 10)
@@ -785,8 +788,42 @@ class MissionFsmNode(Node):
         self.shape = msg
         self.shape_stamp_s = self._now_s()
 
+    def on_competition_state(self, msg: String) -> None:
+        stage = str(msg.data).strip().upper()
+        if stage not in {"STANDBY", "READY", "RUNNING", "DONE", "ERROR"}:
+            return
+        if stage == self._competition_state:
+            return
+        previous = self._competition_state
+        self._competition_state = stage
+        if stage == "STANDBY":
+            self._competition_started = False
+            self.current_target = None
+            self.set_type = 0
+            self._drive(0.0, 0.0)
+            self._enter("STANDBY")
+        elif stage == "READY" and not self._competition_started:
+            self._drive(0.0, 0.0)
+            self._enter("READY")
+        elif stage == "RUNNING" and not self._competition_started:
+            self._competition_started = True
+            self._node_start_s = self._now_s()
+            self._opening_leg = "forward"
+            self._opening_turn_start_theta = None
+            self.current_target = None
+            self.set_type = 0
+            self._enter("OPENING" if self.opening_enabled else "SCAN")
+            self.get_logger().info("competition RUNNING -> original driving algorithm starts now")
+        elif stage in {"DONE", "ERROR"}:
+            self._drive(0.0, 0.0)
+            self._enter("END")
+        self.get_logger().info(f"competition stage {previous} -> {stage}")
+
     def on_advance(self, _: Empty) -> None:
         """Manual debug/dry-run override: force one transition along the chain."""
+        if self.state in {"STANDBY", "READY"}:
+            self.get_logger().warn("state_advance ignored until the panel reaches RUNNING")
+            return
         idx = STATES.index(self.state)
         if self.state == "STORE_IN_TRAY":
             self._do_store_in_tray()
@@ -1291,7 +1328,10 @@ class MissionFsmNode(Node):
     # --------------------------------------------------------------------- tick
     def tick(self) -> None:
         # 1) drive condition-based transitions
-        self._step()
+        if self._competition_state == "RUNNING" and self._competition_started:
+            self._step()
+        else:
+            self._drive(0.0, 0.0)
 
         # 2) publish mission state every tick
         msg = MissionState()

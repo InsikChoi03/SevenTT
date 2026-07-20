@@ -194,7 +194,7 @@ class GoToGoalNode(Node):
         # Yield only for the FSM's direct-drive states (opening move, ALIGN visual servo, PICK).
         # SCAN (drive to map centre) and APPROACH (drive to target) are HOLONOMIC via go_to_goal so
         # the mecanum base translates without spinning in place.
-        if self._mission_state in ("OPENING", "ALIGN", "PICK"):
+        if self._mission_state in ("STANDBY", "READY", "OPENING", "ALIGN", "PICK", "END"):
             if not self._stopped:
                 self._publish(0.0, 0.0, 0.0)
             return

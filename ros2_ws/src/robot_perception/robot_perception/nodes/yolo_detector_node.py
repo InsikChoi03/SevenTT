@@ -27,7 +27,7 @@ from cv_bridge import CvBridge
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import Image
-from std_msgs.msg import Header
+from std_msgs.msg import Header, String
 from robot_interfaces.msg import Classification, Detection, DetectionArray
 
 # Heavy deps guarded for dry-run. On ImportError the node still runs (idle).
@@ -95,6 +95,7 @@ class YoloDetectorNode(Node):
         self._model_lock = threading.Lock()
         self._last_top = 0.0
         self._last_body = 0.0
+        self._competition_state = "STANDBY"
 
         # Load only the model(s) this instance serves.
         self.top_model = self._load_model(self.top_model_path, "top") if self._want_top else None
@@ -122,6 +123,7 @@ class YoloDetectorNode(Node):
         if self._want_body:
             self.create_subscription(Image, "/camera_body/image_raw", self.on_body_image,
                                      qos_profile_sensor_data)
+        self.create_subscription(String, "/competition/state", self.on_competition_state, 10)
 
         streams = "+".join([s for s, on in (("top", self._want_top), ("body", self._want_body)) if on])
         self.get_logger().info(
@@ -173,7 +175,17 @@ class YoloDetectorNode(Node):
         return self.get_clock().now().nanoseconds * 1e-9
 
     # ------------------------------------------------------------- callbacks
+    def on_competition_state(self, msg: String) -> None:
+        stage = str(msg.data).strip().upper()
+        if stage == self._competition_state:
+            return
+        previous = self._competition_state
+        self._competition_state = stage
+        self.get_logger().info(f"competition gate {previous} -> {stage}")
+
     def on_top_image(self, msg: Image) -> None:
+        if self._competition_state not in {"READY", "RUNNING"}:
+            return
         now = self._now_sec()
         if (now - self._last_top) < self.top_min_interval:
             return
@@ -181,6 +193,8 @@ class YoloDetectorNode(Node):
         self._process(msg, "camera_top", self.pub_top, self.top_model, self.top_imgsz)
 
     def on_body_image(self, msg: Image) -> None:
+        if self._competition_state not in {"READY", "RUNNING"}:
+            return
         now = self._now_sec()
         if (now - self._last_body) < self.body_min_interval:
             return

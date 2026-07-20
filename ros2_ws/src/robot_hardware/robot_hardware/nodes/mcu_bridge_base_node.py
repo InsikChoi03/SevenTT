@@ -22,8 +22,10 @@ import rclpy
 import serial
 from rcl_interfaces.msg import SetParametersResult
 from rclpy.node import Node
+from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
+from robot_interfaces.msg import MissionState
 from sensor_msgs.msg import Range
-from std_msgs.msg import Float32MultiArray
+from std_msgs.msg import Float32MultiArray, String, UInt32
 
 
 class McuBridgeBaseNode(Node):
@@ -38,6 +40,8 @@ class McuBridgeBaseNode(Node):
         self.declare_parameter("odom_deadband_mps", 0.005)
         self.declare_parameter("odom_scale", 1.0)
         self.declare_parameter("odom_wheel_scales", [1.0, 1.0, 1.0, 1.0])
+        self.declare_parameter("opening_profile_enabled", True)
+        self.declare_parameter("opening_profile_ms", 2000)
 
         self.port = str(self.get_parameter("port").value)
         self.baud = int(self.get_parameter("baud").value)
@@ -48,9 +52,20 @@ class McuBridgeBaseNode(Node):
         self.odom_scale = float(self.get_parameter("odom_scale").value)
         wheel_scales = [float(v) for v in self.get_parameter("odom_wheel_scales").value]
         self.odom_wheel_scales = wheel_scales if len(wheel_scales) == 4 else [1.0, 1.0, 1.0, 1.0]
+        self.opening_profile_enabled = bool(
+            self.get_parameter("opening_profile_enabled").value
+        )
+        self.opening_profile_ms = max(
+            100, min(10000, int(self.get_parameter("opening_profile_ms").value))
+        )
 
         self.ser: serial.Serial | None = None
         self.ser_lock = threading.Lock()
+        self.competition_state = "STANDBY"
+        self._last_button_sequence: int | None = None
+        self._last_status_sync_s = 0.0
+        self._opening_profile_triggered = False
+        self._profile_force_off_at_s: float | None = None
 
         self.sub = self.create_subscription(
             Float32MultiArray, "/base/wheel_speeds", self.on_wheel_speeds, 10
@@ -61,19 +76,96 @@ class McuBridgeBaseNode(Node):
         self.sub_arm = self.create_subscription(
             Float32MultiArray, "/arm2r/target", self.on_arm_target, 10
         )
+        self.sub_mission_state = self.create_subscription(
+            MissionState, "/mission_state", self.on_mission_state, 10
+        )
+        state_qos = QoSProfile(
+            depth=1,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        )
+        self.pub_competition_state = self.create_publisher(
+            String, "/competition/state", state_qos
+        )
+        self.pub_panel_button = self.create_publisher(UInt32, "/start_panel/button", 10)
         self.pub_odom = self.create_publisher(Float32MultiArray, "/base/wheel_odom", 10)
         self.pub_range = self.create_publisher(Range, "/ultrasonic/range", 10)   # front HC-SR04
 
         self._open_serial()
         self.read_thread = threading.Thread(target=self._read_loop, daemon=True)
         self.read_thread.start()
+        self.panel_timer = self.create_timer(0.2, self._publish_panel_state)
         self.add_on_set_parameters_callback(self._on_params)
 
         self.get_logger().info(
             f"port={self.port} baud={self.baud} encoder_odom={self.publish_encoder_odom} "
             f"hb_as_odom={self.publish_heartbeat_as_odom} deadband={self.odom_deadband:.4f}m/s "
-            f"odom_scale={self.odom_scale:.4f} wheel_scales={self.odom_wheel_scales}"
+            f"odom_scale={self.odom_scale:.4f} wheel_scales={self.odom_wheel_scales} "
+            "panel=STANDBY(red)->READY(yellow)->RUNNING(green) "
+            f"opening_profile={self.opening_profile_enabled}:{self.opening_profile_ms}ms@D13"
         )
+
+    def _write_serial_line(self, line: str, label: str) -> bool:
+        with self.ser_lock:
+            if self.ser is None:
+                self._open_serial()
+            if self.ser is None:
+                return False
+            try:
+                self.ser.write((line + "\n").encode("ascii"))
+                return True
+            except (serial.SerialException, OSError) as exc:
+                self.get_logger().warn(f"{label} serial write failed ({exc}); closing")
+                try:
+                    self.ser.close()
+                finally:
+                    self.ser = None
+                return False
+
+    def _publish_panel_state(self) -> None:
+        self.pub_competition_state.publish(String(data=self.competition_state))
+        now = self.get_clock().now().nanoseconds * 1e-9
+        if self._profile_force_off_at_s is not None and now >= self._profile_force_off_at_s:
+            if self._write_serial_line("<LIFT,0>", "opening profile OFF"):
+                self.get_logger().info("opening profile D13 forced LOW after timed pulse")
+                self._profile_force_off_at_s = None
+            else:
+                self._profile_force_off_at_s = now + 0.5
+        if now - self._last_status_sync_s >= 1.0:
+            self._last_status_sync_s = now
+            self._write_serial_line(f"<STATUS,{self.competition_state}>", "panel status")
+
+    def _set_competition_state(self, state: str, sequence: int) -> None:
+        if state == self.competition_state:
+            return
+        previous = self.competition_state
+        self.competition_state = state
+        if state != "RUNNING":
+            self._opening_profile_triggered = False
+            self._profile_force_off_at_s = None
+            self._write_serial_line("<LIFT,0>", "profile safety OFF")
+        self.pub_competition_state.publish(String(data=state))
+        self._write_serial_line(f"<STATUS,{state}>", "panel status")
+        self.get_logger().info(
+            f"start panel button #{sequence}: {previous} -> {state}"
+        )
+
+    def on_mission_state(self, msg: MissionState) -> None:
+        if (
+            not self.opening_profile_enabled
+            or self.competition_state != "RUNNING"
+            or str(msg.state) != "OPENING"
+            or self._opening_profile_triggered
+        ):
+            return
+        duration_ms = self.opening_profile_ms
+        if self._write_serial_line(f"<LIFT,{duration_ms}>", "opening profile ON"):
+            self._opening_profile_triggered = True
+            now = self.get_clock().now().nanoseconds * 1e-9
+            self._profile_force_off_at_s = now + duration_ms / 1000.0 + 0.15
+            self.get_logger().info(
+                f"OPENING detected: profile D13 HIGH for {duration_ms}ms (one shot)"
+            )
 
     def _on_params(self, params) -> SetParametersResult:
         for p in params:
@@ -108,6 +200,8 @@ class McuBridgeBaseNode(Node):
             self.get_logger().warn(f"expected 4 wheel speeds, got {len(msg.data)}")
             return
         fl, fr, rl, rr = msg.data
+        if self.competition_state != "RUNNING":
+            fl = fr = rl = rr = 0.0
         line = f"<BASE,{fl:.3f},{fr:.3f},{rl:.3f},{rr:.3f}>\n"
         with self.ser_lock:
             if self.ser is None:
@@ -124,6 +218,8 @@ class McuBridgeBaseNode(Node):
                     self.ser = None
 
     def on_arm_target(self, msg: Float32MultiArray) -> None:
+        if self.competition_state != "RUNNING":
+            return
         if len(msg.data) < 3:
             self.get_logger().warn(f"arm target expected >=3 (shoulder,wrist,gripper), got {len(msg.data)}")
             return
@@ -166,6 +262,30 @@ class McuBridgeBaseNode(Node):
 
     def _handle_line(self, line: str) -> None:
         if not line.endswith(">"):
+            return
+        if line.startswith("<START,"):
+            try:
+                sequence = int(line[7:-1])
+            except ValueError:
+                return
+            if sequence == self._last_button_sequence:
+                return
+            self._last_button_sequence = sequence
+            self.pub_panel_button.publish(UInt32(data=sequence))
+            if self.competition_state == "STANDBY":
+                self._set_competition_state("READY", sequence)
+            elif self.competition_state == "READY":
+                self._set_competition_state("RUNNING", sequence)
+            else:
+                self.get_logger().info(
+                    f"start panel button #{sequence} ignored in {self.competition_state}"
+                )
+            return
+        if line.startswith("<SW,"):
+            self.get_logger().info(f"start panel electrical state {line}")
+            return
+        if line.startswith("<LIFTACK,") or line == "<LIFT,done>":
+            self.get_logger().info(f"profile controller {line}")
             return
         # <US,cm> front HC-SR04 (cm; -1 = no echo / beyond range) -> sensor_msgs/Range (metres).
         if line.startswith("<US,"):

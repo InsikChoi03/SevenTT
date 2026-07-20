@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import rclpy
 from rclpy.node import Node
-from std_msgs.msg import Bool, Float32MultiArray
+from std_msgs.msg import Bool, Float32MultiArray, String
 
 
 class PickSequencerNode(Node):
@@ -49,6 +49,7 @@ class PickSequencerNode(Node):
 
         self.pub = self.create_publisher(Float32MultiArray, "/arm2r/target", 10)
         self.create_subscription(Bool, "/arm/pick_trigger", self.on_trigger, 10)
+        self.create_subscription(String, "/competition/state", self.on_competition_state, 10)
 
         # sequence state
         self.seq: list[tuple[str, float, tuple[float, float, float]]] = []
@@ -61,6 +62,8 @@ class PickSequencerNode(Node):
         self._last_step = ""
         self._last_trigger: bool | None = None
         self.current_pose = self.stow_pose
+        self._competition_state = "STANDBY"
+        self._activated = False
 
         # Absorb the boot-limp snap: hold INIT for the first ~1.5 s before accepting triggers.
         self._init_until = self._now_s() + 1.5
@@ -95,7 +98,25 @@ class PickSequencerNode(Node):
         )
 
     # -------------------------------------------------------------- callbacks
+    def on_competition_state(self, msg: String) -> None:
+        stage = str(msg.data).strip().upper()
+        if stage == self._competition_state:
+            return
+        self._competition_state = stage
+        if stage == "RUNNING" and not self._activated:
+            self._activated = True
+            self.running = False
+            self._last_trigger = None
+            self.current_pose = tuple(self.init_pose)
+            self._init_until = self._now_s() + 1.5
+            self.get_logger().info("RUNNING received: arm enabled, INIT hold starts")
+        elif stage != "RUNNING":
+            self._activated = False
+            self.running = False
+
     def on_trigger(self, msg: Bool) -> None:
+        if not self._activated or self._competition_state != "RUNNING":
+            return
         trig = bool(msg.data)
         if self.running or self._now_s() < self._init_until:
             return
@@ -150,6 +171,8 @@ class PickSequencerNode(Node):
 
     # --------------------------------------------------------------------- tick
     def tick(self) -> None:
+        if not self._activated or self._competition_state != "RUNNING":
+            return
         if not self.running:
             if self._now_s() < self._init_until:
                 self._publish(tuple(self.init_pose))   # snap-absorb: hold INIT on boot
