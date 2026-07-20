@@ -92,9 +92,9 @@ class LocalAnchorConfig:
     scan_observe_sec: float = 1.00
     single_lap_inspection: bool = True
     initial_inventory_observe_sec: float = 2.00
-    face_observe_sec: float = 2.00
+    face_observe_sec: float = 0.75
     candidate_radius_min_m: float = 0.12
-    candidate_radius_max_m: float = 0.40
+    candidate_radius_max_m: float = 0.50
     candidate_merge_radius_m: float = 0.14
     candidate_merge_bearing_rad: float = math.radians(12.0)
     candidate_merge_radial_m: float = 0.10
@@ -111,11 +111,20 @@ class LocalAnchorConfig:
         "pineapple",
     )
     classify_min_confidence: float = 0.08
-    classify_stable_frames: int = 3
-    classify_timeout_sec: float = 8.0
+    classify_stable_frames: int = 2
+    classify_timeout_sec: float = 4.0
     classify_hold_on_failure: bool = True
+    visual_heading_enabled: bool = True
+    visual_heading_min_confidence: float = 0.60
+    visual_heading_center_x_px: float = 320.0
+    visual_heading_center_tolerance_px: float = 40.0
+    visual_heading_confirm_frames: int = 3
+    visual_heading_coarse_gate_rad: float = math.radians(20.0)
+    visual_heading_max_correction_rad: float = math.radians(20.0)
     target_fruit_label: str = "banana"
     enable_align: bool = False
+    enable_pick: bool = False
+    pick_duration_sec: float = 9.0
     grab_x_m: float = 0.19
     grab_y_m: float = 0.0
     grab_min_x_m: float = 0.17
@@ -125,6 +134,10 @@ class LocalAnchorConfig:
     align_fwd_pulse_sec: float = 0.15
     align_strafe_duty: float = 0.315
     align_strafe_pulse_sec: float = 0.30
+    align_adaptive_steps_enabled: bool = True
+    align_mid_error_m: float = 0.06
+    align_fwd_mid_pulse_sec: float = 0.25
+    align_strafe_mid_pulse_sec: float = 0.60
     align_settle_sec: float = 0.60
     align_target_timeout_sec: float = 2.0
     align_timeout_sec: float = 12.0
@@ -193,6 +206,12 @@ class LocalAnchorFruitFsm:
         self._align_pulse_sec = 0.0
         self._last_wrapped_yaw = 0.0
         self._unwrapped_yaw = 0.0
+        # Camera-derived correction is deliberately separate from physical IMU lap
+        # travel.  It may refine candidate-facing turns, but never shortens 360 deg.
+        self._heading_correction = 0.0
+        self._turn_uses_heading_correction = False
+        self._visual_center_hits = 0
+        self._visual_lock_count = 0
 
     @property
     def active_candidate(self) -> Candidate | None:
@@ -223,6 +242,10 @@ class LocalAnchorFruitFsm:
         current_yaw = wrap_angle(current_yaw)
         self._last_wrapped_yaw = current_yaw
         self._unwrapped_yaw = 0.0
+        self._heading_correction = 0.0
+        self._turn_uses_heading_correction = False
+        self._visual_center_hits = 0
+        self._visual_lock_count = 0
         self._turn_target_unwrapped = None
         if self.config.single_lap_inspection:
             self.scan_targets = [current_yaw]
@@ -257,12 +280,15 @@ class LocalAnchorFruitFsm:
         detail: str,
         *,
         unwrapped_target: float | None = None,
+        use_heading_correction: bool = False,
     ) -> None:
         self._turn_target = wrap_angle(target)
         self._turn_target_unwrapped = unwrapped_target
         self._turn_return_state = return_state
+        self._turn_uses_heading_correction = bool(use_heading_correction)
         self._turn_pulses = 0
         self._pulse_sign = 0.0
+        self._visual_center_hits = 0
         self._enter("TURN_MEASURE", now, detail)
 
     def _begin_pulse(self, now: float, error: float) -> None:
@@ -441,7 +467,90 @@ class LocalAnchorFruitFsm:
                     if clean == self.config.target_fruit_label.strip().lower()
                     else "NON_TARGET_FRUIT"
                 )
+                if candidate.status == "TARGET_FRUIT" and self.config.enable_align:
+                    self._begin_target_align(candidate, now)
+                    return
             self._advance_candidate(now)
+
+    def _begin_target_align(self, candidate: Candidate, now: float) -> None:
+        """Stop candidate inspection and immediately align the first target fruit."""
+        self._align_target_id = candidate.candidate_id
+        self._align_start_s = float(now)
+        self._align_last_xy = None
+        self._align_last_seen_s = -math.inf
+        self.route = [candidate.candidate_id]
+        self.route_index = 0
+        candidate.status = "ALIGNING"
+        self._enter(
+            "ALIGN_SETTLE_INITIAL",
+            now,
+            f"target fruit {candidate.candidate_id} confirmed; begin ALIGN",
+        )
+
+    def note_visual_fruit_center(
+        self,
+        x_center_px: float | None,
+        confidence: float,
+        now: float,
+        current_yaw: float,
+    ) -> bool:
+        """Lock a fruit-facing heading from stable body-camera centre observations.
+
+        The visual lock is only an alternative completion condition for a current
+        candidate-facing turn.  The raw IMU revolution counter is never modified.
+        """
+        cfg = self.config
+        eligible = (
+            cfg.visual_heading_enabled
+            and self._turn_uses_heading_correction
+            and self._turn_return_state == "FACE_SETTLE"
+            and self.state in {"TURN_MEASURE", "TURN_PULSE", "TURN_SETTLE"}
+            and self.active_candidate is not None
+            and x_center_px is not None
+            and math.isfinite(float(x_center_px))
+            and float(confidence) >= cfg.visual_heading_min_confidence
+        )
+        if not eligible:
+            self._visual_center_hits = 0
+            return False
+
+        current_yaw = wrap_angle(current_yaw)
+        if self._turn_target_unwrapped is None:
+            corrected = wrap_angle(current_yaw + self._heading_correction)
+            coarse_error = angle_error(self._turn_target, corrected)
+        else:
+            corrected = self._unwrapped_yaw + self._heading_correction
+            coarse_error = self._turn_target_unwrapped - corrected
+        centered = abs(float(x_center_px) - cfg.visual_heading_center_x_px) <= (
+            cfg.visual_heading_center_tolerance_px
+        )
+        if not centered or abs(coarse_error) > cfg.visual_heading_coarse_gate_rad:
+            self._visual_center_hits = 0
+            return False
+
+        self._visual_center_hits += 1
+        if self._visual_center_hits < max(1, int(cfg.visual_heading_confirm_frames)):
+            return False
+
+        if self._turn_target_unwrapped is None:
+            proposed = angle_error(self._turn_target, current_yaw)
+        else:
+            proposed = self._turn_target_unwrapped - self._unwrapped_yaw
+        delta = proposed - self._heading_correction
+        if abs(delta) > cfg.visual_heading_max_correction_rad:
+            self._visual_center_hits = 0
+            return False
+
+        self._heading_correction = proposed
+        self._visual_lock_count += 1
+        candidate = self.active_candidate
+        candidate_id = candidate.candidate_id if candidate is not None else 0
+        self._enter(
+            "FACE_SETTLE",
+            now,
+            f"body-centered candidate {candidate_id}; visual heading locked",
+        )
+        return True
 
     def note_align_target(self, x: float, y: float, now: float) -> None:
         """Provide the latest body-camera target point in base_link metres."""
@@ -504,6 +613,7 @@ class LocalAnchorFruitFsm:
             now,
             f"face candidate {candidate.candidate_id}",
             unwrapped_target=unwrapped_target,
+            use_heading_correction=True,
         )
 
     def _advance_candidate(self, now: float) -> None:
@@ -558,23 +668,36 @@ class LocalAnchorFruitFsm:
         ey = float(y) - cfg.grab_y_m
         if abs(ex) <= cfg.align_fwd_tolerance_m and abs(ey) <= cfg.align_lateral_tolerance_m:
             target = self._candidate_by_id(self._align_target_id)
-            if target is not None:
-                target.status = "PICKED_DRY"
-            self._enter("COMPLETE", now, "target aligned; dry pick complete")
+            if cfg.enable_pick:
+                if target is not None:
+                    target.status = "PICKING"
+                self._enter("PICK_TRIGGER", now, "target aligned; trigger real pick")
+            else:
+                if target is not None:
+                    target.status = "PICKED_DRY"
+                self._enter("COMPLETE", now, "target aligned; dry pick complete")
             return
         # Move one axis per pulse.  Normalised excess makes unlike tolerances comparable.
         fwd_excess = max(0.0, abs(ex) - cfg.align_fwd_tolerance_m)
         lat_excess = max(0.0, abs(ey) - cfg.align_lateral_tolerance_m)
         if lat_excess >= fwd_excess:
             self._align_pulse = MotionCommand(vy=math.copysign(cfg.align_strafe_duty, ey))
-            self._align_pulse_sec = cfg.align_strafe_pulse_sec
+            self._align_pulse_sec = (
+                cfg.align_strafe_mid_pulse_sec
+                if cfg.align_adaptive_steps_enabled and abs(ey) >= cfg.align_mid_error_m
+                else cfg.align_strafe_pulse_sec
+            )
         else:
             vx = math.copysign(cfg.align_fwd_duty, ex)
             if x < cfg.grab_min_x_m and vx > 0.0:
                 self.fault(now, f"unsafe forward pulse blocked at target x={x:.3f}m")
                 return
             self._align_pulse = MotionCommand(vx=vx)
-            self._align_pulse_sec = cfg.align_fwd_pulse_sec
+            self._align_pulse_sec = (
+                cfg.align_fwd_mid_pulse_sec
+                if cfg.align_adaptive_steps_enabled and abs(ex) >= cfg.align_mid_error_m
+                else cfg.align_fwd_pulse_sec
+            )
         self._enter("ALIGN_PULSE", now, "align unit pulse")
 
     def tick(self, now: float, current_yaw: float) -> MotionCommand:
@@ -588,9 +711,15 @@ class LocalAnchorFruitFsm:
 
         if self.state == "TURN_MEASURE":
             if self._turn_target_unwrapped is None:
-                error = angle_error(self._turn_target, current_yaw)
+                measured_yaw = current_yaw
+                if self._turn_uses_heading_correction:
+                    measured_yaw = wrap_angle(measured_yaw + self._heading_correction)
+                error = angle_error(self._turn_target, measured_yaw)
             else:
-                error = self._turn_target_unwrapped - self._unwrapped_yaw
+                measured_yaw = self._unwrapped_yaw
+                if self._turn_uses_heading_correction:
+                    measured_yaw += self._heading_correction
+                error = self._turn_target_unwrapped - measured_yaw
             if abs(error) <= cfg.turn_tolerance_rad:
                 self._enter(self._turn_return_state, now, self.detail)
             else:
@@ -683,6 +812,18 @@ class LocalAnchorFruitFsm:
                 self._enter("ALIGN_MEASURE", now, "remeasure body target")
             return MotionCommand()
 
+        if self.state == "PICK_TRIGGER":
+            self._enter("PICK_WAIT", now, "real pick sequence running; base locked")
+            return MotionCommand(request_pick=True)
+
+        if self.state == "PICK_WAIT":
+            if now - self.state_enter_s >= cfg.pick_duration_sec:
+                target = self._candidate_by_id(self._align_target_id)
+                if target is not None:
+                    target.status = "PICKED"
+                self._enter("COMPLETE", now, "one target fruit picked; test complete")
+            return MotionCommand()
+
         self.fault(now, f"unknown state {self.state}")
         return MotionCommand()
 
@@ -711,6 +852,10 @@ class LocalAnchorFruitFsm:
             "route_index": self.route_index,
             "turn_target_deg": round(math.degrees(turn_target), 2),
             "turn_pulses": self._turn_pulses,
+            "heading_correction_deg": round(math.degrees(self._heading_correction), 2),
+            "visual_center_hits": self._visual_center_hits,
+            "visual_lock_count": self._visual_lock_count,
+            "candidate_radius_max_m": self.config.candidate_radius_max_m,
             "active_candidate": (
                 self.active_candidate.candidate_id if self.active_candidate is not None else None
             ),

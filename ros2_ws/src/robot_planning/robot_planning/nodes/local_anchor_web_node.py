@@ -74,7 +74,7 @@ th { color:#8fa2b8; position:sticky; top:0; background:#111923; }
     <img id="wide" src="/wide.mjpg" alt="wide camera stream">
   </section>
   <section class="card">
-    <div class="title">로컬 앵커 맵 · 반경 40 cm</div>
+    <div class="title">로컬 앵커 맵 · 반경 50 cm</div>
     <canvas id="anchor" width="620" height="620"></canvas>
     <div class="content kv">
       <div class="key">현재 단계</div><div id="detail" class="value">-</div>
@@ -117,21 +117,23 @@ function statusClass(state) {
 }
 function drawMap(d) {
   const c=$('anchor'), x=c.getContext('2d'), w=c.width, h=c.height;
-  const cx=w/2, cy=h/2, scale=(Math.min(w,h)*0.43)/0.40;
+  const maxRadius=Number(d.candidate_radius_max_m||0.50);
+  const cx=w/2, cy=h/2, scale=(Math.min(w,h)*0.43)/maxRadius;
   x.fillStyle='#0b1118'; x.fillRect(0,0,w,h);
-  for (const r of [0.1,0.2,0.3,0.4]) {
+  for (const r of [0.1,0.2,0.3,0.4,0.5].filter(v=>v<=maxRadius+0.001)) {
     x.beginPath(); x.arc(cx,cy,r*scale,0,Math.PI*2);
-    x.strokeStyle=r===0.4?'#60758c':'#29394a'; x.lineWidth=r===0.4?3:1; x.stroke();
+    x.strokeStyle=Math.abs(r-maxRadius)<0.001?'#60758c':'#29394a';
+    x.lineWidth=Math.abs(r-maxRadius)<0.001?3:1; x.stroke();
     x.fillStyle='#7890a8'; x.font='13px sans-serif';
     x.fillText(Math.round(r*100)+'cm',cx+5,cy-r*scale+15);
   }
   x.strokeStyle='#34475b'; x.lineWidth=1;
-  x.beginPath(); x.moveTo(cx,cy-0.43*scale); x.lineTo(cx,cy+0.43*scale); x.stroke();
-  x.beginPath(); x.moveTo(cx-0.43*scale,cy); x.lineTo(cx+0.43*scale,cy); x.stroke();
+  x.beginPath(); x.moveTo(cx,cy-maxRadius*scale); x.lineTo(cx,cy+maxRadius*scale); x.stroke();
+  x.beginPath(); x.moveTo(cx-maxRadius*scale,cy); x.lineTo(cx+maxRadius*scale,cy); x.stroke();
   const yaw=(d.relative_yaw_deg||0)*Math.PI/180;
   arrow(x,cx,cy,cx+0.11*scale*Math.cos(yaw),cy-0.11*scale*Math.sin(yaw),'#54b7ff',5);
   const target=(d.turn_target_deg||0)*Math.PI/180;
-  arrow(x,cx,cy,cx+0.39*scale*Math.cos(target),cy-0.39*scale*Math.sin(target),'#ffe173',2);
+  arrow(x,cx,cy,cx+(maxRadius-.01)*scale*Math.cos(target),cy-(maxRadius-.01)*scale*Math.sin(target),'#ffe173',2);
   for (const o of d.relative_objects||[]) {
     const px=cx+o.anchor_x*scale, py=cy-o.anchor_y*scale;
     x.strokeStyle='#d6e3f0'; x.lineWidth=1;
@@ -141,7 +143,8 @@ function drawMap(d) {
   const colors={
     UNINSPECTED:'#a5b2c0',FACING:'#ffe173',TARGET_FRUIT:'#48df8b',
     NON_TARGET_FRUIT:'#ff9a58',WAITING_CLASSIFICATION:'#ff6675',
-    IGNORED_NON_FRUIT:'#687685',PICKED_DRY:'#74d8ff'
+    IGNORED_NON_FRUIT:'#687685',ALIGNING:'#ffe173',PICKING:'#ff9a58',
+    PICKED:'#48df8b',PICKED_DRY:'#74d8ff'
   };
   for (const q of d.candidates||[]) {
     const px=cx+q.x*scale, py=cy-q.y*scale;
@@ -182,7 +185,10 @@ async function update() {
     const headingSource=d.heading_source==='imu_delta'?'IMU':'POSE';
     $('turn').textContent='['+headingSource+'] yaw '+
       Number(d.relative_yaw_deg||0).toFixed(1)+'° → '+
-      Number(d.turn_target_deg||0).toFixed(1)+'° · pulses '+(d.turn_pulses||0);
+      Number(d.turn_target_deg||0).toFixed(1)+'° · 보정 '+
+      Number(d.heading_correction_deg||0).toFixed(1)+'° · visual hit/lock '+
+      (d.visual_center_hits||0)+'/'+(d.visual_lock_count||0)+
+      ' · pulses '+(d.turn_pulses||0);
     const m=d.base_command||{};
     $('cmd').textContent='vx '+Number(m.vx||0).toFixed(3)+' · vy '+
       Number(m.vy||0).toFixed(3)+' · ω '+Number(m.omega||0).toFixed(3);

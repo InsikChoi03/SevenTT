@@ -12,7 +12,7 @@ set -e -o pipefail
 TEST_MODE="${1:-safe}"
 if [[ "$TEST_MODE" == "live" ]]; then
   shift
-  set -- drive_enabled:=true armed:=true "$@"
+  set -- drive_enabled:=true armed:=true with_arm:=true pick_enabled:=true "$@"
 else
   TEST_MODE="safe"
 fi
@@ -23,6 +23,9 @@ TEST_PID_FILE="$TEST_RUN_ROOT/.launcher.pid"
 mkdir -p "$TEST_RUN_ROOT"
 source /opt/ros/humble/setup.bash
 source "$TEST_WS/ros2_ws/install/setup.bash"
+# The Humble workspace currently has a mixed install/symlink layout.  Prefer the
+# edited local-test sources so a tuning trial never runs an older installed copy.
+export PYTHONPATH="$TEST_WS/ros2_ws/src/robot_perception:$TEST_WS/ros2_ws/src/robot_planning:${PYTHONPATH:-}"
 set -u
 
 if [[ -f "$TEST_PID_FILE" ]]; then
@@ -60,6 +63,7 @@ if [[ -z "${NOBAG:-}" ]]; then
     /imu/data /localization/imu_yaw_delta /localization/motion_mode \
     /world_model/wide_relative_objects /camera_body/detections \
     /classification/siglip /base_command /base/wheel_speeds /base/wheel_odom \
+    /arm/pick_trigger /arm2r/target \
     > "$TEST_RUN_DIR/bag.log" 2>&1 &
   TEST_BAG_PID=$!
 fi

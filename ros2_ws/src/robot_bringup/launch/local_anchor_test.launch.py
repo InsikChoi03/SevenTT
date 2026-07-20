@@ -25,6 +25,8 @@ def generate_launch_description() -> LaunchDescription:
     armed = LaunchConfiguration("armed")
     with_base = LaunchConfiguration("with_base")
     with_siglip = LaunchConfiguration("with_siglip")
+    with_arm = LaunchConfiguration("with_arm")
+    pick_enabled = LaunchConfiguration("pick_enabled")
     cam_yaw = LaunchConfiguration("cam_yaw")
     rot180 = LaunchConfiguration("rot180")
     web_port = LaunchConfiguration("web_port")
@@ -51,6 +53,8 @@ def generate_launch_description() -> LaunchDescription:
             DeclareLaunchArgument("armed", default_value="false"),
             DeclareLaunchArgument("with_base", default_value="true"),
             DeclareLaunchArgument("with_siglip", default_value="true"),
+            DeclareLaunchArgument("with_arm", default_value="false"),
+            DeclareLaunchArgument("pick_enabled", default_value="false"),
             DeclareLaunchArgument("cam_yaw", default_value="90"),
             DeclareLaunchArgument("rot180", default_value="true"),
             DeclareLaunchArgument("web_port", default_value="8082"),
@@ -80,6 +84,7 @@ def generate_launch_description() -> LaunchDescription:
                 "robot_perception",
                 "siglip_gate_node",
                 "siglip_gate_node",
+                files=[params, motion, local],
                 condition=IfCondition(with_siglip),
             ),
             node(
@@ -96,6 +101,12 @@ def generate_launch_description() -> LaunchDescription:
                 condition=IfCondition(with_base),
             ),
             node(
+                "robot_control",
+                "pick_sequencer_node",
+                "pick_sequencer_node",
+                condition=IfCondition(with_arm),
+            ),
+            node(
                 "robot_planning",
                 "local_anchor_test_node",
                 "local_anchor_test_node",
@@ -103,6 +114,7 @@ def generate_launch_description() -> LaunchDescription:
                 extra={
                     "drive_enabled": ParameterValue(drive_enabled, value_type=bool),
                     "armed": ParameterValue(armed, value_type=bool),
+                    "pick_enabled": ParameterValue(pick_enabled, value_type=bool),
                 },
             ),
             node(

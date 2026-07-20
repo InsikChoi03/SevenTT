@@ -250,3 +250,116 @@ def test_single_lap_unwraps_clockwise_motion_across_minus_pi():
     fsm.tick(1.0, math.radians(-170))
     fsm.tick(2.0, math.radians(170))
     assert fsm.summary()["scan_completed_deg"] == 190.0
+
+
+def test_default_candidate_radius_accepts_objects_out_to_fifty_cm():
+    fsm = LocalAnchorFruitFsm(LocalAnchorConfig(candidate_min_hits=1))
+    fsm.start(0.0)
+    fsm.add_observations(
+        [
+            LocalObservation(0.49, 0.0, "fruit_photo_cube", 0.9),
+            LocalObservation(0.51, 0.0, "fruit_photo_cube", 0.9),
+        ]
+    )
+    assert len(fsm.candidates) == 1
+    assert math.isclose(fsm.candidates[0].radius, 0.49)
+
+
+def test_body_center_lock_corrects_candidate_heading_but_not_imu_lap_progress():
+    cfg = LocalAnchorConfig(
+        visual_heading_confirm_frames=3,
+        visual_heading_coarse_gate_rad=math.radians(20.0),
+        visual_heading_max_correction_rad=math.radians(20.0),
+    )
+    fsm = LocalAnchorFruitFsm(cfg)
+    fsm.candidates = [candidate(1, -45)]
+    fsm.route = [1]
+    fsm.route_index = 0
+    fsm._face_current_candidate(0.0)
+    fsm.tick(0.1, math.radians(-35.0))
+
+    assert not fsm.note_visual_fruit_center(320.0, 0.90, 0.2, math.radians(-35.0))
+    assert not fsm.note_visual_fruit_center(321.0, 0.90, 0.3, math.radians(-35.0))
+    assert fsm.note_visual_fruit_center(319.0, 0.90, 0.4, math.radians(-35.0))
+
+    summary = fsm.summary()
+    assert fsm.state == "FACE_SETTLE"
+    assert summary["heading_correction_deg"] == -10.0
+    assert summary["scan_completed_deg"] == 35.0
+    assert summary["visual_lock_count"] == 1
+
+
+def test_body_center_lock_rejects_low_confidence_and_large_imu_disagreement():
+    cfg = LocalAnchorConfig(visual_heading_confirm_frames=1)
+    fsm = LocalAnchorFruitFsm(cfg)
+    fsm.candidates = [candidate(1, -90)]
+    fsm.route = [1]
+    fsm.route_index = 0
+    fsm._face_current_candidate(0.0)
+    fsm.tick(0.1, 0.0)
+
+    assert not fsm.note_visual_fruit_center(320.0, 0.59, 0.2, 0.0)
+    assert not fsm.note_visual_fruit_center(320.0, 0.90, 0.3, 0.0)
+    assert fsm.state in {"TURN_MEASURE", "TURN_PULSE"}
+    assert fsm.summary()["visual_lock_count"] == 0
+
+
+def test_first_target_classification_cancels_remaining_route_and_starts_align():
+    cfg = LocalAnchorConfig(
+        enable_align=True,
+        classify_stable_frames=2,
+        target_fruit_label="banana",
+    )
+    fsm = LocalAnchorFruitFsm(cfg)
+    fsm.candidates = [candidate(1, -30), candidate(2, -120)]
+    fsm.route = [1, 2]
+    fsm.route_index = 0
+    fsm._enter("CLASSIFY", 1.0, "test")
+
+    fsm.note_classification("banana", 0.2, True, 1.1)
+    fsm.note_classification("banana", 0.2, True, 1.2)
+
+    assert fsm.state == "ALIGN_SETTLE_INITIAL"
+    assert fsm.route == [1]
+    assert fsm.route_index == 0
+    assert fsm.candidates[0].status == "ALIGNING"
+    assert fsm.candidates[1].status == "UNINSPECTED"
+
+
+def test_aligned_target_triggers_one_real_pick_then_completes():
+    cfg = LocalAnchorConfig(enable_align=True, enable_pick=True, pick_duration_sec=9.0)
+    fsm = LocalAnchorFruitFsm(cfg)
+    target = candidate(1, 0)
+    fsm.candidates = [target]
+    fsm.route = [1]
+    fsm._align_target_id = 1
+    fsm._align_start_s = 0.0
+    fsm._enter("ALIGN_MEASURE", 0.0, "test")
+    fsm.note_align_target(cfg.grab_x_m, cfg.grab_y_m, 0.1)
+
+    assert not fsm.tick(0.1, 0.0).request_pick
+    trigger = fsm.tick(0.2, 0.0)
+    assert trigger.request_pick
+    assert fsm.state == "PICK_WAIT"
+    assert target.status == "PICKING"
+    assert not fsm.tick(9.1, 0.0).request_pick
+    assert fsm.state == "PICK_WAIT"
+    fsm.tick(9.21, 0.0)
+    assert fsm.state == "COMPLETE"
+    assert target.status == "PICKED"
+
+
+def test_align_uses_motion_tuning_long_pulse_for_large_error():
+    cfg = LocalAnchorConfig(
+        align_adaptive_steps_enabled=True,
+        align_mid_error_m=0.06,
+        align_fwd_pulse_sec=0.15,
+        align_fwd_mid_pulse_sec=0.25,
+    )
+    fsm = LocalAnchorFruitFsm(cfg)
+    fsm._align_start_s = 0.0
+    fsm._enter("ALIGN_MEASURE", 0.0, "test")
+    fsm.note_align_target(cfg.grab_x_m + 0.10, 0.0, 0.1)
+    fsm.tick(0.1, 0.0)
+    assert fsm.state == "ALIGN_PULSE"
+    assert fsm._align_pulse_sec == 0.25

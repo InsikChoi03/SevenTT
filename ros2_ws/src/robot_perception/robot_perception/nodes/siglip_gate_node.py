@@ -104,6 +104,8 @@ class SiglipGateNode(Node):
         # pass. 0 -> fall back to the old per-detection synchronous path.
         self.declare_parameter("classify_rate_hz", 1.5)
         self.declare_parameter("max_batch", 4)            # cap crops per forward pass (VRAM)
+        self.declare_parameter("prefer_centered_crop", False)
+        self.declare_parameter("crop_center_x_px", 320.0)
 
         self.model_id = str(self.get_parameter("model_id").value)
         self.set2_label = str(self.get_parameter("set2_label").value)
@@ -126,6 +128,10 @@ class SiglipGateNode(Node):
         self.square_pad_crops = bool(self.get_parameter("square_pad_crops").value)
         self.classify_rate_hz = float(self.get_parameter("classify_rate_hz").value)
         self.max_batch = int(self.get_parameter("max_batch").value)
+        self.prefer_centered_crop = bool(
+            self.get_parameter("prefer_centered_crop").value
+        )
+        self.crop_center_x_px = float(self.get_parameter("crop_center_x_px").value)
 
         self.bridge = CvBridge()
         self.latest_frame: Optional[np.ndarray] = None
@@ -242,6 +248,11 @@ class SiglipGateNode(Node):
         if pending is None or self.model is None or self.processor is None:
             return
         frame, dets, stamp = pending
+        if self.prefer_centered_crop:
+            dets = sorted(
+                dets,
+                key=lambda det: abs(float(det.x_center) - self.crop_center_x_px),
+            )
         h, w = frame.shape[:2]
         crops = []
         for det in dets:

@@ -27,7 +27,7 @@ from robot_planning.local_anchor_fsm import (
     wrap_angle,
 )
 from sensor_msgs.msg import Imu
-from std_msgs.msg import Empty, Float32, String
+from std_msgs.msg import Bool, Empty, Float32, String
 
 
 def quaternion_yaw(msg: PoseStamped) -> float:
@@ -84,6 +84,7 @@ class LocalAnchorTestNode(Node):
         self.pub_cmd = self.create_publisher(BaseCommand, "/base_command", 10)
         self.pub_state = self.create_publisher(MissionState, "/mission_state", 10)
         self.pub_status = self.create_publisher(String, "/local_anchor_test/status", 10)
+        self.pub_pick = self.create_publisher(Bool, "/arm/pick_trigger", 10)
         self.create_subscription(
             WorldModel,
             "/world_model/wide_relative_objects",
@@ -160,9 +161,9 @@ class LocalAnchorTestNode(Node):
         self.declare_parameter("scan_observe_sec", 1.00)
         self.declare_parameter("single_lap_inspection", True)
         self.declare_parameter("initial_inventory_observe_sec", 2.00)
-        self.declare_parameter("face_observe_sec", 2.00)
+        self.declare_parameter("face_observe_sec", 0.75)
         self.declare_parameter("candidate_radius_min_m", 0.12)
-        self.declare_parameter("candidate_radius_max_m", 0.40)
+        self.declare_parameter("candidate_radius_max_m", 0.50)
         self.declare_parameter("candidate_merge_radius_m", 0.14)
         self.declare_parameter("candidate_merge_bearing_deg", 12.0)
         self.declare_parameter("candidate_merge_radial_m", 0.10)
@@ -172,11 +173,20 @@ class LocalAnchorTestNode(Node):
         self.declare_parameter("expected_candidates_min", 3)
         self.declare_parameter("expected_candidates_max", 4)
         self.declare_parameter("classify_min_confidence", 0.08)
-        self.declare_parameter("classify_stable_frames", 3)
-        self.declare_parameter("classify_timeout_sec", 8.0)
+        self.declare_parameter("classify_stable_frames", 2)
+        self.declare_parameter("classify_timeout_sec", 4.0)
         self.declare_parameter("classify_hold_on_failure", True)
+        self.declare_parameter("visual_heading_enabled", True)
+        self.declare_parameter("visual_heading_min_confidence", 0.60)
+        self.declare_parameter("visual_heading_center_x_px", 320.0)
+        self.declare_parameter("visual_heading_center_tolerance_px", 40.0)
+        self.declare_parameter("visual_heading_confirm_frames", 3)
+        self.declare_parameter("visual_heading_coarse_gate_deg", 20.0)
+        self.declare_parameter("visual_heading_max_correction_deg", 20.0)
         self.declare_parameter("target_fruit_label", "banana")
         self.declare_parameter("enable_align", False)
+        self.declare_parameter("pick_enabled", False)
+        self.declare_parameter("pick_duration_sec", 9.0)
         self.declare_parameter("grab_x_m", 0.19)
         self.declare_parameter("grab_y_m", 0.0)
         self.declare_parameter("grab_min_x_m", 0.17)
@@ -186,6 +196,10 @@ class LocalAnchorTestNode(Node):
         self.declare_parameter("align_fwd_pulse_sec", 0.15)
         self.declare_parameter("align_strafe_duty", 0.315)
         self.declare_parameter("align_strafe_pulse_sec", 0.30)
+        self.declare_parameter("align_adaptive_steps_enabled", True)
+        self.declare_parameter("align_mid_error_m", 0.06)
+        self.declare_parameter("align_fwd_mid_pulse_sec", 0.25)
+        self.declare_parameter("align_strafe_mid_pulse_sec", 0.60)
         self.declare_parameter("align_settle_sec", 0.60)
         self.declare_parameter("align_target_timeout_sec", 2.0)
         self.declare_parameter("align_timeout_sec", 12.0)
@@ -238,8 +252,25 @@ class LocalAnchorTestNode(Node):
             classify_stable_frames=int(value("classify_stable_frames")),
             classify_timeout_sec=float(value("classify_timeout_sec")),
             classify_hold_on_failure=bool(value("classify_hold_on_failure")),
+            visual_heading_enabled=bool(value("visual_heading_enabled")),
+            visual_heading_min_confidence=float(
+                value("visual_heading_min_confidence")
+            ),
+            visual_heading_center_x_px=float(value("visual_heading_center_x_px")),
+            visual_heading_center_tolerance_px=float(
+                value("visual_heading_center_tolerance_px")
+            ),
+            visual_heading_confirm_frames=int(value("visual_heading_confirm_frames")),
+            visual_heading_coarse_gate_rad=math.radians(
+                float(value("visual_heading_coarse_gate_deg"))
+            ),
+            visual_heading_max_correction_rad=math.radians(
+                float(value("visual_heading_max_correction_deg"))
+            ),
             target_fruit_label=str(value("target_fruit_label")),
             enable_align=bool(value("enable_align")),
+            enable_pick=bool(value("pick_enabled")),
+            pick_duration_sec=float(value("pick_duration_sec")),
             grab_x_m=float(value("grab_x_m")),
             grab_y_m=float(value("grab_y_m")),
             grab_min_x_m=float(value("grab_min_x_m")),
@@ -249,6 +280,12 @@ class LocalAnchorTestNode(Node):
             align_fwd_pulse_sec=float(value("align_fwd_pulse_sec")),
             align_strafe_duty=float(value("align_strafe_duty")),
             align_strafe_pulse_sec=float(value("align_strafe_pulse_sec")),
+            align_adaptive_steps_enabled=bool(
+                value("align_adaptive_steps_enabled")
+            ),
+            align_mid_error_m=float(value("align_mid_error_m")),
+            align_fwd_mid_pulse_sec=float(value("align_fwd_mid_pulse_sec")),
+            align_strafe_mid_pulse_sec=float(value("align_strafe_mid_pulse_sec")),
             align_settle_sec=float(value("align_settle_sec")),
             align_target_timeout_sec=float(value("align_target_timeout_sec")),
             align_timeout_sec=float(value("align_timeout_sec")),
@@ -344,6 +381,30 @@ class LocalAnchorTestNode(Node):
         return bx, by
 
     def _on_body_detections(self, msg: DetectionArray) -> None:
+        now = self._now()
+        visual_best = None
+        visual_confidence = 0.0
+        if self.config.visual_heading_enabled:
+            for detection in msg.detections:
+                if str(detection.label).strip().lower() != "fruit_photo_cube":
+                    continue
+                confidence = float(detection.confidence)
+                if confidence < self.config.visual_heading_min_confidence:
+                    continue
+                center_error = abs(
+                    float(detection.x_center) - self.config.visual_heading_center_x_px
+                )
+                score = (center_error, -confidence)
+                if visual_best is None or score < visual_best[0]:
+                    visual_best = (score, float(detection.x_center))
+                    visual_confidence = confidence
+            self.fsm.note_visual_fruit_center(
+                None if visual_best is None else visual_best[1],
+                visual_confidence,
+                now,
+                self._relative_yaw(),
+            )
+
         if not self.fsm.state.startswith("ALIGN"):
             return
         best = None
@@ -362,7 +423,7 @@ class LocalAnchorTestNode(Node):
                 best = base
                 best_distance = distance
         if best is not None:
-            self.fsm.note_align_target(best[0], best[1], self._now())
+            self.fsm.note_align_target(best[0], best[1], now)
 
     def _other_base_publishers(self) -> list[str]:
         others = []
@@ -394,6 +455,11 @@ class LocalAnchorTestNode(Node):
                 return f"another /base_command publisher is active: {publishers}"
         if self.config.enable_align and self.body_h is None:
             return "enable_align=true but body homography is unavailable"
+        if self.config.enable_pick:
+            if not self.drive_enabled:
+                return "pick_enabled=true requires drive_enabled=true"
+            if not self.get_subscriptions_info_by_topic("/arm/pick_trigger"):
+                return "pick sequencer is not subscribed to /arm/pick_trigger"
         return None
 
     def _config_error(self) -> str | None:
@@ -431,6 +497,10 @@ class LocalAnchorTestNode(Node):
             (
                 0.03 <= cfg.align_strafe_pulse_sec <= 0.80,
                 "align_strafe_pulse_sec must be in [0.03, 0.80]",
+            ),
+            (
+                1.0 <= cfg.pick_duration_sec <= 20.0,
+                "pick_duration_sec must be in [1.0, 20.0]",
             ),
         ]
         for valid, reason in checks:
@@ -553,6 +623,7 @@ class LocalAnchorTestNode(Node):
                 ),
                 "competition_state": self.competition_state,
                 "placement_seed": self.placement_seed,
+                "pick_enabled": self.config.enable_pick,
                 "relative_yaw_deg": round(math.degrees(self._relative_yaw()), 2),
                 "heading_source": "imu_delta" if self.use_imu_yaw else "localization_pose",
                 "imu_age_sec": (
@@ -577,6 +648,9 @@ class LocalAnchorTestNode(Node):
         command = MotionCommand()
         if self._active:
             command = self.fsm.tick(now, self._relative_yaw())
+            if command.request_pick and self.config.enable_pick:
+                self.pub_pick.publish(Bool(data=True))
+                self.get_logger().warn("real /arm/pick_trigger sent; base remains locked")
             if self.fsm.state in TERMINAL_STATES:
                 self._active = False
                 self._stop_publish_until_s = now + 1.0
