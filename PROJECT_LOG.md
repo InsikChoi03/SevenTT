@@ -26,10 +26,10 @@
 
 ## 2. 현재 상태 (Snapshot — 이 섹션만 최신값으로 덮어쓰기)
 
-- **현재 버전:** `v2.1.0` (`new` 브랜치 릴리스 커밋 `faddd69`, Git 태그 없음)
-- **최종 업데이트:** 2026-07-20 18:27 (KST)
+- **현재 버전:** `v4.0.0` (`new` 브랜치 릴리스 커밋 `a7b5b77`, Git 태그 없음)
+- **최종 업데이트:** 2026-07-20 21:27 (KST)
 - **최종 작업자:** `@AI`
-- **한 줄 요약:** 오프닝 후 고정 pose 주입을 제거하고 벽 heading과 x/y 잔차 수렴으로 초기 pose를 확정했으며, 이후 앵커 주행의 좌우 흔들림은 미해결 상태다.
+- **한 줄 요약:** 독립 로컬 앵커 시험에서 반경 50cm 후보를 IMU·body 시각 heading으로 한 바퀴 조사하고, 첫 타겟 과일을 즉시 ALIGN·실제 집기한 뒤 종료하는 v4.0.0 흐름을 구현했다.
 
 ---
 
@@ -137,12 +137,42 @@
 - [ ] parking 테스트 패키지(`robot_parking_test`)를 실제 arrival 표식 촬영 데이터와 연결해 독립 검증할지 결정 — `@AI`
 - [x] 오프닝을 전진→우측 횡이동→시계 45도 상대 회전으로 복원하고, 종료 후 벽 heading 및 x/y 수렴으로 초기 pose를 확정 — `@AI` (2026-07-20 완료, 사용자 실주행 확인)
 - [ ] 벽 초기 pose 확정 이후 K1 앵커 주행에서 남아 있는 좌우 흔들림의 `/base_command`, Object flow pose, wall x/y 보정 기여도를 분리 측정하고 단순 LanePlanner 경로 주행을 안정화 — `@AI`, `@insik`
+- [x] 독립 로컬 앵커 시험에 50cm 후보 inventory, IMU 누적 360도 제한, body 중앙 시각 heading 보정, 3Hz 중앙 우선 SigLIP 판정을 구현 — `@AI` (2026-07-20 완료)
+- [x] 첫 타겟 과일 확정 시 남은 후보 조사를 취소하고 motion tuning 기반 ALIGN 후 실제 2R PICK_PLACE 1회를 실행해 종료하도록 연결 — `@AI` (2026-07-20 완료)
+- [ ] `v4.0.0` 로컬 앵커 실주행에서 50cm inventory 중복 수, 시각 heading lock, body 좌표 ALIGN 및 실제 과일 1회 집기 성공 여부를 반복 검증 — `@insik`
 
 ---
 
 ## 5. 변경 이력 (Changelog) — ⛔ 삭제 금지 / 최신 항목이 맨 위
 
 <!-- 새 엔트리는 바로 이 줄 아래에 추가하세요. 기존 엔트리는 건드리지 마세요. -->
+
+### `v4.0.0` — 2026-07-20 21:27 (KST) · 작업자: `@AI` · ID: `2026-07-20-03`
+- **변경 요약:** 독립 로컬 앵커 시험을 50cm 단일 회전 탐색부터 첫 타겟 과일의 즉시 ALIGN·실제 집기·종료까지 수행하는 새 end-to-end 흐름으로 확장했다.
+- **상세:**
+  - 후보 탐색 반경을 40cm에서 50cm로 확장하고 웹 로컬 맵의 범위·눈금도 50cm 기준으로 동기화했다.
+  - 물리 IMU 누적 회전량과 body 카메라 기반 global heading 보정을 분리해, 시각 보정이 후보 방향에는 반영되지만 실제 360도 한 바퀴 종료량을 줄이지 않도록 했다.
+  - `fruit_photo_cube` confidence 0.60 이상이 body 영상 중앙 ±40px에 3프레임 연속 들어오고 IMU 목표와 20도 이내일 때만 후보 heading을 시각 lock하도록 제한했다.
+  - 로컬 시험에서 SigLIP을 1.5Hz에서 3Hz로 높이고 중앙 crop을 우선해 한 개만 추론하며, 정면 안정화 0.75초와 동일 결과 2회 조건으로 판정 지연과 다른 과일 crop 혼선을 줄였다.
+  - 첫 타겟 과일이 확정되면 남은 후보 route를 즉시 폐기하고 body 관측 기반 `ALIGN_SETTLE_INITIAL → ALIGN_MEASURE/PULSE`로 전환하도록 순서를 변경했다.
+  - `motion_tuning.yaml`의 `grab_x=0.19m`, 전후·좌우 허용오차 0.02m, 전후/횡이동 duty 0.27/0.315, adaptive 중간 펄스 0.25/0.60초와 안정화 1.0초를 로컬 ALIGN에 반영했다.
+  - ALIGN 완료 시 `/arm/pick_trigger=True`를 한 번 발행하고 기존 2R `PICK_PLACE` 시퀀스를 실행하며, 9초 동안 base를 잠근 뒤 첫 과일 하나만 `PICKED`로 확정하고 전체 시험을 종료하도록 했다.
+  - 안전 실행에서는 팔과 실제 pick을 끄고, `bash scripts/run_local_anchor_test.sh live`에서만 `with_arm=true`, `pick_enabled=true`를 주입하도록 분리했다.
+  - 로컬 웹에 visual hit/lock, heading correction, ALIGNING/PICKING/PICKED 상태를 표시하고 rosbag에 `/arm/pick_trigger`, `/arm2r/target`을 추가했다.
+  - 핵심 FSM 23개 테스트, Python·Bash 문법, YAML/diff 검사와 ROS launch 인자 로딩을 통과했다.
+  - `new` 브랜치에 코드 릴리스 커밋 `a7b5b77`(`release: add one-pick local anchor workflow v4.0.0`)을 생성했다.
+- **변경 파일:**
+  - `ros2_ws/src/robot_bringup/config/local_anchor_test.yaml` / 수정
+  - `ros2_ws/src/robot_bringup/launch/local_anchor_test.launch.py` / 수정
+  - `ros2_ws/src/robot_perception/robot_perception/nodes/siglip_gate_node.py` / 수정
+  - `ros2_ws/src/robot_planning/robot_planning/local_anchor_fsm.py` / 수정
+  - `ros2_ws/src/robot_planning/robot_planning/nodes/local_anchor_test_node.py` / 수정
+  - `ros2_ws/src/robot_planning/robot_planning/nodes/local_anchor_web_node.py` / 수정
+  - `ros2_ws/src/robot_planning/test/test_local_anchor_fsm.py` / 수정
+  - `scripts/run_local_anchor_test.sh` / 수정
+  - `PROJECT_LOG.md` / 수정
+- **다음 할 일 반영:** 50cm inventory·시각 heading lock·body ALIGN·실제 과일 1회 집기의 실주행 반복 검증 항목을 추가하고, 구현 완료 항목 2개를 `[x]` 처리했다.
+- **버전 근거:** 기존 메인 경기 FSM의 앵커 이동을 단순 보완한 수준이 아니라 독립 상태기계 중심의 단일 회전 inventory, 복합 heading 추정, 중앙 우선 분류, 즉시 ALIGN 및 실제 pick 종료로 실행 구조와 시험 목적이 크게 바뀌었다. 사용자가 지정한 메이저 릴리스 번호에 따라 `v4.0.0`으로 확정했으며, 저장소의 기존 릴리스 방식대로 별도 Git 태그는 생성하지 않았다.
 
 ### `v2.1.0` — 2026-07-20 18:27 (KST) · 작업자: `@AI` · ID: `2026-07-20-02`
 - **변경 요약:** 벽 기반 오프닝 초기화와 3단계 경기 시작 기능을 포함한 현재 작업 25개 파일을 `v2.1.0` 릴리스 커밋으로 확정했다.
