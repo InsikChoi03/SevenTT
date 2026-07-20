@@ -20,7 +20,7 @@ Subscribes:
   /mission_state            robot_interfaces/MissionState   — state/tray counts/current target
   /planning/phase           std_msgs/Int8                   — Set1/Set2 pick phase (HUD)
   /planning/zone            std_msgs/Int8                   — active 2x2m mission zone (HUD/map)
-  /planning/object_slots    std_msgs/String                 — persistent Set2 slot inventory (JSON)
+  /planning/object_slots    std_msgs/String                 — Set2 or anchor-slot inventory (JSON)
 
 Artefacts under output_dir/<YYYYmmdd_HHMMSS>/:
   events.csv / events.jsonl   — one row per first-seen object, per pick, and per state change
@@ -122,6 +122,22 @@ _COL_TEXT = (235, 235, 235)
 _COL_SLOT = (205, 90, 200)
 _COL_SLOT_RETRY = (0, 165, 255)
 _COL_SLOT_DONE = (100, 100, 100)
+_ANCHOR_SLOT_COLORS = {
+    "UNMAPPED": (105, 105, 105),
+    "EMPTY": (90, 90, 90),
+    "OCCUPIED": (0, 165, 255),
+    "UNCONFIRMED": (0, 215, 255),
+    "CHECKED": (255, 190, 70),
+    "PICKED": (80, 210, 90),
+}
+_ANCHOR_SLOT_CODES = {
+    "UNMAPPED": "?",
+    "EMPTY": "E",
+    "OCCUPIED": "O",
+    "UNCONFIRMED": "U",
+    "CHECKED": "C",
+    "PICKED": "P",
+}
 _ZONE_COLORS = {
     1: (70, 120, 220),
     2: (60, 170, 120),
@@ -352,6 +368,9 @@ class RecognitionVizNode(Node):
         self.zone = 0
         self.object_slots: list[dict] = []
         self.current_slot_id = 0
+        self.object_slots_schema = ""
+        self.anchors: list[dict] = []
+        self.current_anchor_id = 0
         self.siglip: Classification | None = None
         self.shape: Classification | None = None
         # Latest raw camera image msgs + their detections (converted at draw time, ~redraw rate).
@@ -548,10 +567,26 @@ class RecognitionVizNode(Node):
     def on_object_slots(self, msg: String) -> None:
         try:
             payload = json.loads(msg.data)
+            if not isinstance(payload, dict):
+                return
             slots = payload.get("slots", [])
             if not isinstance(slots, list):
                 return
-            self.object_slots = [slot for slot in slots if isinstance(slot, dict)]
+            parsed_slots = [slot for slot in slots if isinstance(slot, dict)]
+            schema = str(payload.get("schema", ""))
+            if schema == "anchor_slots_v1":
+                anchors = payload.get("anchors", [])
+                if not isinstance(anchors, list):
+                    return
+                self.anchors = [anchor for anchor in anchors if isinstance(anchor, dict)]
+                self.current_anchor_id = int(payload.get("current_anchor_id", 0))
+                self.object_slots_schema = schema
+            else:
+                # Legacy Set2 inventory has no schema/anchors. Keep its display unchanged.
+                self.anchors = []
+                self.current_anchor_id = 0
+                self.object_slots_schema = schema
+            self.object_slots = parsed_slots
             self.current_slot_id = int(payload.get("current_slot_id", 0))
         except (TypeError, ValueError, json.JSONDecodeError):
             return
@@ -635,6 +670,9 @@ class RecognitionVizNode(Node):
             return list(self.extent)
         xs = [float(slot.get("x", 0.0)) for slot in self.object_slots]
         ys = [float(slot.get("y", 0.0)) for slot in self.object_slots]
+        if self.object_slots_schema == "anchor_slots_v1":
+            xs += [float(anchor.get("x", 0.0)) for anchor in self.anchors]
+            ys += [float(anchor.get("y", 0.0)) for anchor in self.anchors]
         if self.world is not None:
             xs += [o.x for o in self.world.objects] + [self.world.robot_x]
             ys += [o.y for o in self.world.objects] + [self.world.robot_y]
@@ -1113,9 +1151,16 @@ class RecognitionVizNode(Node):
                     cv2.LINE_AA)
 
     def _draw_slots(self, canvas) -> None:
-        """Draw persistent Set2 inspection IDs as compact rings around their fixed positions."""
+        """Draw either the three-anchor inventory or the legacy Set2 slot inventory."""
         if not self.show_set2_slots:
             return
+        if self.object_slots_schema == "anchor_slots_v1":
+            self._draw_anchor_inventory(canvas)
+            return
+        self._draw_set2_slots(canvas)
+
+    def _draw_set2_slots(self, canvas) -> None:
+        """Draw legacy persistent Set2 inspection IDs without changing its visual contract."""
         for slot in self.object_slots:
             try:
                 slot_id = int(slot.get("id", 0))
@@ -1137,6 +1182,77 @@ class RecognitionVizNode(Node):
             cv2.putText(canvas, f"F{slot_id}", (px - 12, py - 18), cv2.FONT_HERSHEY_SIMPLEX,
                         0.38, _COL_TARGET if active else col, 1, cv2.LINE_AA)
 
+    @staticmethod
+    def _anchor_slot_state(slot: dict) -> str:
+        state = str(slot.get("slot_state", slot.get("state", "UNMAPPED"))).upper()
+        return state if state in _ANCHOR_SLOT_COLORS else "UNMAPPED"
+
+    def _draw_anchor_inventory(self, canvas) -> None:
+        """Draw K1..K3 and their immutable four-slot one-shot snapshots."""
+        anchor_points: list[tuple[int, int]] = []
+        for anchor in self.anchors:
+            try:
+                anchor_id = int(anchor.get("id", 0))
+                px, py = self._w2p(float(anchor["x"]), float(anchor["y"]))
+            except (KeyError, TypeError, ValueError):
+                continue
+            anchor_points.append((px, py))
+            active = anchor_id != 0 and anchor_id == self.current_anchor_id
+            locked = bool(anchor.get("snapshot_locked")) or str(
+                anchor.get("state", "")
+            ).upper() == "LOCKED"
+            col = _COL_TARGET if active else ((80, 210, 90) if locked else (155, 155, 155))
+            cv2.drawMarker(
+                canvas, (px, py), col, cv2.MARKER_TILTED_CROSS, 22 if active else 18,
+                3 if active else 2, cv2.LINE_AA,
+            )
+            cv2.circle(canvas, (px, py), 14 if active else 11, col, 3 if active else 1,
+                       cv2.LINE_AA)
+            status = "LOCKED" if locked else "WAIT"
+            cv2.putText(
+                canvas, f"K{anchor_id} {status}", (px + 14, py - 12),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.44, col, 2 if active else 1, cv2.LINE_AA,
+            )
+        for i in range(1, len(anchor_points)):
+            cv2.line(canvas, anchor_points[i - 1], anchor_points[i], (90, 90, 90), 1,
+                     cv2.LINE_AA)
+
+        for slot in self.object_slots:
+            try:
+                slot_id = int(slot.get("id", 0))
+                anchor_id = int(slot.get("anchor_id", 0))
+                slot_index = int(slot.get("slot_index", 0))
+                px, py = self._w2p(float(slot["x"]), float(slot["y"]))
+            except (KeyError, TypeError, ValueError):
+                continue
+            state = self._anchor_slot_state(slot)
+            col = _ANCHOR_SLOT_COLORS[state]
+            active = slot_id != 0 and slot_id == self.current_slot_id
+            radius = 13 if active else 10
+            thickness = 3 if active else 2
+            if state in {"OCCUPIED", "PICKED"}:
+                cv2.circle(canvas, (px, py), radius, col, -1, cv2.LINE_AA)
+                cv2.circle(canvas, (px, py), radius, (25, 25, 25), 1, cv2.LINE_AA)
+            else:
+                cv2.circle(canvas, (px, py), radius, col, thickness, cv2.LINE_AA)
+            if state == "EMPTY":
+                cv2.line(canvas, (px - 5, py - 5), (px + 5, py + 5), col, 1, cv2.LINE_AA)
+                cv2.line(canvas, (px - 5, py + 5), (px + 5, py - 5), col, 1, cv2.LINE_AA)
+            elif state == "CHECKED":
+                cv2.line(canvas, (px - 5, py), (px - 1, py + 4), col, 2, cv2.LINE_AA)
+                cv2.line(canvas, (px - 1, py + 4), (px + 6, py - 5), col, 2, cv2.LINE_AA)
+            elif state == "PICKED":
+                cv2.drawMarker(canvas, (px, py), (20, 20, 20), cv2.MARKER_TILTED_CROSS,
+                               13, 2, cv2.LINE_AA)
+            if active:
+                cv2.circle(canvas, (px, py), radius + 5, _COL_TARGET, 3, cv2.LINE_AA)
+            code = _ANCHOR_SLOT_CODES[state]
+            label = f"K{anchor_id}.S{slot_index} {code}"
+            cv2.putText(
+                canvas, label, (px - 20, py - radius - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.34,
+                _COL_TARGET if active else col, 2 if active else 1, cv2.LINE_AA,
+            )
+
     def _draw_robot(self, canvas, x: float, y: float, theta: float) -> None:
         px, py = self._w2p(x, y)
         # heading arrow (0.3 m long) in field frame
@@ -1153,7 +1269,49 @@ class RecognitionVizNode(Node):
             f"objects={n_obj} (picked/bl={n_bl})  tray shape={self.tray_shape} fruit={self.tray_fruit}",
             f"det wide={len(self.top_dets)} body={len(self.body_dets)}",
         ]
-        if self.show_set2_slots and self.object_slots:
+        if self.show_set2_slots and self.object_slots_schema == "anchor_slots_v1":
+            anchor_id = self.current_anchor_id
+            selected_slots = [
+                slot for slot in self.object_slots
+                if anchor_id <= 0 or int(slot.get("anchor_id", 0)) == anchor_id
+            ]
+            state_counts = {
+                state: sum(self._anchor_slot_state(slot) == state for slot in selected_slots)
+                for state in ("EMPTY", "OCCUPIED", "UNCONFIRMED", "CHECKED", "PICKED")
+            }
+            anchor = next(
+                (item for item in self.anchors if int(item.get("id", 0)) == anchor_id), None
+            )
+            anchor_state = (
+                "LOCKED"
+                if anchor is not None and (
+                    bool(anchor.get("snapshot_locked"))
+                    or str(anchor.get("state", "")).upper() == "LOCKED"
+                )
+                else "WAIT"
+            )
+            current_slot = next(
+                (slot for slot in self.object_slots
+                 if int(slot.get("id", 0)) == self.current_slot_id),
+                None,
+            )
+            current_label = "-"
+            if current_slot is not None:
+                current_label = (
+                    f"K{int(current_slot.get('anchor_id', 0))}."
+                    f"S{int(current_slot.get('slot_index', 0))}"
+                )
+            anchor_label = f"K{anchor_id}/3" if anchor_id > 0 else "K-/3"
+            lines.append(
+                f"anchor {anchor_label} {anchor_state}  current={current_label}"
+            )
+            lines.append(
+                f"slot states: EMPTY={state_counts['EMPTY']} "
+                f"OCCUPIED={state_counts['OCCUPIED']} "
+                f"UNCONF={state_counts['UNCONFIRMED']} CHECKED={state_counts['CHECKED']} "
+                f"PICKED={state_counts['PICKED']}"
+            )
+        elif self.show_set2_slots and self.object_slots:
             unresolved = sum(
                 1 for slot in self.object_slots
                 if not bool(slot.get("picked")) and not bool(slot.get("non_target"))

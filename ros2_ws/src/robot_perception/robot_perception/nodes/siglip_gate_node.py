@@ -24,8 +24,15 @@ import numpy as np
 import rclpy
 from cv_bridge import CvBridge
 from rclpy.node import Node
-from rclpy.qos import qos_profile_sensor_data
+from rclpy.qos import (
+    DurabilityPolicy,
+    HistoryPolicy,
+    QoSProfile,
+    ReliabilityPolicy,
+    qos_profile_sensor_data,
+)
 from sensor_msgs.msg import Image
+from std_msgs.msg import String
 
 from robot_interfaces.msg import Classification, Detection, DetectionArray
 
@@ -48,6 +55,13 @@ except Exception as exc:  # ImportError or any transitive failure
 # Discriminator prompts (Set1 cube vs Set2 fruit-printed cube share the same shell).
 PROMPT_IMAGE_FACE = "a white cube with a fruit picture on it"
 PROMPT_PLAIN_CUBE = "a plain white cube with no image"
+
+COMPETITION_QOS = QoSProfile(
+    history=HistoryPolicy.KEEP_LAST,
+    depth=1,
+    reliability=ReliabilityPolicy.RELIABLE,
+    durability=DurabilityPolicy.TRANSIENT_LOCAL,
+)
 
 
 class SiglipGateNode(Node):
@@ -115,6 +129,7 @@ class SiglipGateNode(Node):
 
         self.bridge = CvBridge()
         self.latest_frame: Optional[np.ndarray] = None
+        self._competition_state = "STANDBY"
         # Latest fruit-cube candidates awaiting a (throttled, batched) SigLIP pass: (frame, dets, stamp).
         self._pending: Optional[tuple] = None
 
@@ -138,6 +153,9 @@ class SiglipGateNode(Node):
         self.create_subscription(Image, "/camera_body/image_raw", self.on_image,
                                  qos_profile_sensor_data)  # match camera BEST_EFFORT
         self.create_subscription(DetectionArray, "/camera_body/detections", self.on_detections, 10)
+        self.create_subscription(
+            String, "/competition/state", self.on_competition_state, COMPETITION_QOS
+        )
         self.pub = self.create_publisher(Classification, "/classification/siglip", 10)
 
         # Throttle: SigLIP fires on a timer over the freshest pending crops, not per detection msg.
@@ -187,7 +205,16 @@ class SiglipGateNode(Node):
         except Exception as exc:
             self.get_logger().warn(f"image conversion failed: {exc}", throttle_duration_sec=2.0)
 
+    def on_competition_state(self, msg: String) -> None:
+        state = str(msg.data).strip().upper()
+        if state in {"STANDBY", "READY", "RUNNING", "DONE", "ERROR"}:
+            self._competition_state = state
+            if state != "RUNNING":
+                self._pending = None
+
     def on_detections(self, msg: DetectionArray) -> None:
+        if self._competition_state != "RUNNING":
+            return
         if self.model is None or self.processor is None:
             self.get_logger().warn(
                 "detection received but SigLIP unavailable; skipping",
@@ -208,6 +235,9 @@ class SiglipGateNode(Node):
 
     def _tick_classify(self) -> None:
         """Timer: crop every pending fruit cube and score them in one batched SigLIP pass."""
+        if self._competition_state != "RUNNING":
+            self._pending = None
+            return
         pending, self._pending = self._pending, None
         if pending is None or self.model is None or self.processor is None:
             return
@@ -332,7 +362,10 @@ class SiglipGateNode(Node):
 
         _, label, margin, best_soft, image_face_visible, is_target = best
         out = Classification()
-        out.header.stamp = self.get_clock().now().to_msg()
+        # Preserve the DetectionArray capture stamp so downstream slot logic can bind this
+        # batched result to the exact Body boxes that produced the crops.  Inference completion
+        # time cannot distinguish a delayed previous-slot crop from the current slot.
+        out.header.stamp = stamp
         out.header.frame_id = "camera_body"
         out.label = label
         out.set_type = 2

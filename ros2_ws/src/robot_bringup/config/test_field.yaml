@@ -1,6 +1,7 @@
 # Parameters for the MOCK FIELD TEST (recognition-performance verification, OUTSIDE the arena).
 # Overrides only; started by test_field.launch.py. The arm is NOT used in this test — PICK is
-# logged only (mission_fsm dry_pick:true), and no arm nodes are launched.
+# Competition run configuration. Base and verified 2R arm are launched by default; the shared MCU
+# bridge blocks both until /competition/state reaches RUNNING.
 #
 # !!! FILL IN before running !!!
 #   set1_label / set2_label : the shape and fruit you actually place out

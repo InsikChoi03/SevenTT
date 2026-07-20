@@ -26,10 +26,10 @@
 
 ## 2. 현재 상태 (Snapshot — 이 섹션만 최신값으로 덮어쓰기)
 
-- **현재 버전:** `v2.0.0`
-- **최종 업데이트:** 2026-07-19 17:28 (KST)
+- **현재 버전:** `v2.1.0` (작업 트리 기준, Git 커밋·태그 전)
+- **최종 업데이트:** 2026-07-20 18:24 (KST)
 - **최종 작업자:** `@AI`
-- **한 줄 요약:** 경기 베이스 제어를 FSM 단일 `/base_command` 경로로 통합하고 설치본·카메라 복구 구조를 안정화해 오프닝 이후 SCAN/APPROACH 실주행을 정상화했다.
+- **한 줄 요약:** 오프닝 후 고정 pose 주입을 제거하고 벽 heading과 x/y 잔차 수렴으로 초기 pose를 확정했으며, 이후 앵커 주행의 좌우 흔들림은 미해결 상태다.
 
 ---
 
@@ -135,12 +135,38 @@
 - [ ] 엔코더 motion constraint 적용 후 `/localization/motion_mode`, `/localization/is_stationary`, `/base/wheel_odom`을 정지/스톨/전진/횡이동 상황에서 비교 기록 — `@insik`
 - [ ] body 카메라 저조도 원인을 `scripts/lighting_compare.py`로 exposure/gain/조명 조건별 비교 후 카메라 파라미터를 확정 — `@insik`
 - [ ] parking 테스트 패키지(`robot_parking_test`)를 실제 arrival 표식 촬영 데이터와 연결해 독립 검증할지 결정 — `@AI`
+- [x] 오프닝을 전진→우측 횡이동→시계 45도 상대 회전으로 복원하고, 종료 후 벽 heading 및 x/y 수렴으로 초기 pose를 확정 — `@AI` (2026-07-20 완료, 사용자 실주행 확인)
+- [ ] 벽 초기 pose 확정 이후 K1 앵커 주행에서 남아 있는 좌우 흔들림의 `/base_command`, Object flow pose, wall x/y 보정 기여도를 분리 측정하고 단순 LanePlanner 경로 주행을 안정화 — `@AI`, `@insik`
 
 ---
 
 ## 5. 변경 이력 (Changelog) — ⛔ 삭제 금지 / 최신 항목이 맨 위
 
 <!-- 새 엔트리는 바로 이 줄 아래에 추가하세요. 기존 엔트리는 건드리지 마세요. -->
+
+### `v2.1.0` — 2026-07-20 18:24 (KST) · 작업자: `@AI` · ID: `2026-07-20-01`
+- **변경 요약:** 오프닝 종료의 고정 pose 주입을 없애고 벽 관측 수렴으로 초기 위치·방향을 확정하는 절차를 추가했다.
+- **상세:**
+  - 경기 오프닝을 기존 의도인 `전진 → 우측 횡이동 → 현재 heading 기준 시계방향 45도 회전` 순서로 복원했다.
+  - `opening_end_x`, `opening_end_y`, `opening_end_theta`와 오프닝 종료 강제 pose reset을 제거해 오프닝 후 위치·방향을 미리 지정하지 않도록 했다.
+  - 정지 상태에서 벽 heading raw 오차, 유효 선분 수, 각도 분산을 검증하고 `HEADING_ONLY` 보정을 먼저 수렴시킨 뒤에만 `TRANSLATION_ONLY` x/y 보정을 허용하도록 초기화 단계를 분리했다.
+  - 벽 heading은 유효 선분 2개 이상, 약 2도 이내, 표준편차 약 5도 이내 조건을 연속 3프레임 만족해야 확정하며, x/y는 양축 관측 confidence 0.9 이상과 각 축 잔차 4cm 이내를 연속 3프레임 만족해야 확정한다.
+  - 상대 격자 회전에는 물리 IMU 증분만 사용해 global wall heading correction이 로봇의 실제 회전으로 중복 반영되지 않도록 분리했다.
+  - 초기 pose 확정 전에는 물체 map과 Object flow를 차단하고, 벽 기반 heading 및 x/y가 모두 수렴한 뒤 새 물체 프레임부터 활성화하도록 했다.
+  - 벽 heading 부호 검증 도우미와 `관측 벽 +10도 → 적용 보정 -10도` 단위 테스트를 추가하고 `/localization/wall_heading_debug`에 raw/filtered/applied 값, 선분 수, 각도 분산, confidence, 적용 모드를 발행하도록 했다.
+  - 초기 위치 보정은 사용자가 실제 실행에서 정상 동작한다고 확인했다.
+  - 오프닝 이후 앵커 주행은 상대 격자 추종을 끄고 고정 LanePlanner 경로를 한 번 계산해 유지하도록 변경했으나, 실제 주행의 좌우 흔들림은 여전히 남아 있어 완료로 판단하지 않았다.
+  - Python compile, 관련 ROS 패키지 build, launch 파싱과 관련 기능 테스트 63개를 통과했다.
+- **변경 파일:**
+  - `ros2_ws/src/robot_bringup/config/motion_tuning.yaml` / 수정
+  - `ros2_ws/src/robot_perception/robot_perception/nodes/localizer_node.py` / 수정
+  - `ros2_ws/src/robot_perception/robot_perception/nodes/wall_localizer_node.py` / 수정
+  - `ros2_ws/src/robot_perception/robot_perception/wall_heading.py` / 신규
+  - `ros2_ws/src/robot_perception/test/test_wall_heading.py` / 신규
+  - `ros2_ws/src/robot_planning/robot_planning/nodes/mission_fsm_node.py` / 수정
+  - `PROJECT_LOG.md` / 수정
+- **다음 할 일 반영:** 오프닝 후 벽 기반 초기 pose 확정 항목을 완료 처리하고, K1 앵커 주행의 좌우 흔들림에서 명령·Object flow·wall correction 기여도를 분리해 LanePlanner 주행을 안정화하는 항목을 추가했다.
+- **버전 근거:** 고정 오프닝 종료 pose를 벽 관측 기반 단계적 초기 위치·방향 확정 구조로 교체하고 새 진단 토픽·부호 테스트를 추가한 기능 확장이므로 `MINOR` 버전을 올려 `v2.1.0`으로 기록했다. 이 버전은 현재 문서/작업 트리 기준이며 Git 커밋·태그는 아직 없다.
 
 ### `v2.0.0` — 2026-07-19 17:28 (KST) · 작업자: `@AI` · ID: `2026-07-19-02`
 - **변경 요약:** 경기 메카넘 제어를 FSM 단일 명령 경로로 재구성하고 source/install 및 카메라 복구 구조를 안정화했다.

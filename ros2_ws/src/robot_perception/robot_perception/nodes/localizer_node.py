@@ -38,7 +38,7 @@ from geometry_msgs.msg import PoseStamped, Vector3
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import Image, Imu
-from std_msgs.msg import Bool, Float32MultiArray, String
+from std_msgs.msg import Bool, Float32, Float32MultiArray, String
 
 # tf2 broadcasting is optional: guard the import so the node runs without tf2_ros.
 try:
@@ -157,6 +157,7 @@ class LocalizerNode(Node):
         self.declare_parameter("wall_field_fast_max_step_rad", 0.0)
         self.declare_parameter("wall_field_deadband_m", 0.005)
         self.declare_parameter("wall_correction_stale_sec", 1.5)
+        self.declare_parameter("wall_translation_heading_gate_rad", 0.05235987756)
         enabled = [bool(v) for v in self.get_parameter("wheel_odom_enabled_wheels").value]
         self.wheel_odom_enabled = enabled if len(enabled) == 4 else [True, True, True, True]
         self.wheel_odom_deadband = float(self.get_parameter("wheel_odom_deadband_mps").value)
@@ -256,6 +257,9 @@ class LocalizerNode(Node):
         self.wall_field_deadband_m = float(self.get_parameter("wall_field_deadband_m").value)
         self.wall_correction_stale_sec = float(
             self.get_parameter("wall_correction_stale_sec").value
+        )
+        self.wall_translation_heading_gate_rad = max(
+            0.0, float(self.get_parameter("wall_translation_heading_gate_rad").value)
         )
         self._wheel_rows_all = np.array(
             [
@@ -389,6 +393,9 @@ class LocalizerNode(Node):
         self._imu_accel_norm_window = deque(maxlen=self.imu_motion_accel_window)
         self.last_wall_correction_time = None
         self.wall_fast_correction = False
+        # Mission-owned gate. Heading correction is enabled only during the post-opening
+        # stationary alignment; normal driving remains translation-only for this rollout.
+        self.wall_correction_mode = "TRANSLATION_ONLY"
 
         self.fx = float(self.get_parameter("top_fx").value)
         self.fy = float(self.get_parameter("top_fy").value)
@@ -456,6 +463,12 @@ class LocalizerNode(Node):
             Bool, "/localization/wall_fast_correction", self.on_wall_fast_correction, 10
         )
         self.create_subscription(
+            String, "/localization/wall_correction_mode", self.on_wall_correction_mode, 10
+        )
+        self.create_subscription(
+            PoseStamped, "/localization/reset_pose", self.on_reset_pose, 10
+        )
+        self.create_subscription(
             Float32MultiArray, "/localization/object_odom", self.on_object_odom, 10
         )
         self.pub = self.create_publisher(PoseStamped, "/localization/pose", 10)
@@ -466,6 +479,12 @@ class LocalizerNode(Node):
         )
         self.pub_wall_map_transform = self.create_publisher(
             Float32MultiArray, "/localization/wall_map_transform", 10
+        )
+        self.pub_wall_heading_debug = self.create_publisher(
+            Float32MultiArray, "/localization/wall_heading_debug", 10
+        )
+        self.pub_imu_yaw_delta = self.create_publisher(
+            Float32, "/localization/imu_yaw_delta", 10
         )
         self.timer = self.create_timer(1.0 / rate, self.publish_pose)
 
@@ -481,6 +500,28 @@ class LocalizerNode(Node):
         )
 
     # ------------------------------------------------------------------ wheel odom
+    def on_reset_pose(self, msg: PoseStamped) -> None:
+        """Atomically establish a trusted field pose after the scripted opening."""
+        x = float(msg.pose.position.x)
+        y = float(msg.pose.position.y)
+        q = msg.pose.orientation
+        siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
+        cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+        q_norm_sq = q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w
+        # An all-zero quaternion explicitly requests an x/y-only reset. This lets the opening
+        # establish its trusted endpoint without lying about the robot's measured heading.
+        theta = self.theta if q_norm_sq < 1e-12 else math.atan2(siny_cosp, cosy_cosp)
+        if not all(math.isfinite(value) for value in (x, y, theta)):
+            self.get_logger().warn("ignored non-finite localization reset pose")
+            return
+        self.x = x
+        self.y = y
+        self.theta = wrap_angle(theta)
+        self.last_wall_correction_time = None
+        self.get_logger().info(
+            f"localization pose reset to ({self.x:.3f},{self.y:.3f},{self.theta:.3f})"
+        )
+
     def on_wheel_cmd(self, msg: Float32MultiArray) -> None:
         if len(msg.data) >= 4:
             now = self.get_clock().now().nanoseconds * 1e-9
@@ -817,7 +858,11 @@ class LocalizerNode(Node):
         if self.last_imu_time is not None:
             dt = now - self.last_imu_time
             if 0.0 < dt < 0.2 and abs(wz) >= self.imu_gyro_deadband:   # deadband kills stationary walk
-                _, _, dtheta = self._constrain_robot_delta(0.0, 0.0, wz * dt, "imu")
+                physical_dtheta = wz * dt
+                self.pub_imu_yaw_delta.publish(Float32(data=float(physical_dtheta)))
+                _, _, dtheta = self._constrain_robot_delta(
+                    0.0, 0.0, physical_dtheta, "imu"
+                )
                 self.theta = wrap_angle(self.theta + dtheta)
         self.last_imu_time = now
 
@@ -927,18 +972,33 @@ class LocalizerNode(Node):
     def on_wall_fast_correction(self, msg: Bool) -> None:
         self.wall_fast_correction = bool(msg.data)
 
+    def on_wall_correction_mode(self, msg: String) -> None:
+        mode = str(msg.data).strip().upper()
+        if mode in {"OFF", "HEADING_ONLY", "TRANSLATION_ONLY", "FULL"}:
+            self.wall_correction_mode = mode
+
     def _wall_fast_active(self) -> bool:
         return bool(self.wall_fast_correction and self.is_stationary)
 
     def on_wall_field_correction(self, msg: Float32MultiArray) -> None:
-        """Apply the wall alignment as one rigid transform to the robot/map frame."""
+        """Apply a mission-gated wall correction and publish its heading diagnostics."""
         self.last_wall_correction_time = self.get_clock().now().nanoseconds * 1e-9
         if len(msg.data) < 3:
             return
         dx, dy, dth = (float(msg.data[i]) for i in range(3))
         conf = max(0.0, min(1.0, float(msg.data[3]) if len(msg.data) > 3 else 1.0))
-        if math.hypot(dx, dy) < self.wall_field_deadband_m and abs(dth) < math.radians(0.3):
-            return
+        raw_dth = float(msg.data[4]) if len(msg.data) > 4 else dth
+        segment_count = float(msg.data[5]) if len(msg.data) > 5 else 0.0
+        angle_variance = float(msg.data[6]) if len(msg.data) > 6 else math.nan
+        heading_conf = max(
+            0.0, min(1.0, float(msg.data[7]) if len(msg.data) > 7 else conf)
+        )
+        allow_heading = self.wall_correction_mode in {"HEADING_ONLY", "FULL"}
+        allow_translation = self.wall_correction_mode in {"TRANSLATION_ONLY", "FULL"}
+        # Translation was measured after rotating the observed lines by raw_dth. Never consume it
+        # until the wall and field axes are already parallel, otherwise x/y is geometrically wrong.
+        heading_converged = abs(raw_dth) <= self.wall_translation_heading_gate_rad
+        allow_translation = allow_translation and heading_converged
         fast_active = self._wall_fast_active()
         gain_value = self.wall_field_fast_gain if fast_active else self.wall_field_gain
         theta_gain_value = (
@@ -957,14 +1017,47 @@ class LocalizerNode(Node):
             else self.wall_field_max_step_rad
         )
         trans_gain = self._imu_translation_gain("wall_field")
-        gain = max(0.0, gain_value) * conf * trans_gain
-        theta_gain = max(0.0, theta_gain_value) * conf
-        tx = max(-max_step_m, min(max_step_m, gain * dx))
-        ty = max(-max_step_m, min(max_step_m, gain * dy))
+        gain = max(0.0, gain_value) * conf * trans_gain if allow_translation else 0.0
+        theta_gain = max(0.0, theta_gain_value) * heading_conf if allow_heading else 0.0
+        tx = max(-max_step_m, min(max_step_m, gain * dx)) if math.isfinite(dx) else 0.0
+        ty = max(-max_step_m, min(max_step_m, gain * dy)) if math.isfinite(dy) else 0.0
         applied_dth = max(
             -max_step_rad,
             min(max_step_rad, theta_gain * dth),
         )
+
+        debug = Float32MultiArray()
+        # [raw dtheta, filtered dtheta, applied dtheta, segment count, variance(rad^2),
+        #  heading confidence, heading enabled, translation enabled]
+        debug.data = [
+            float(raw_dth),
+            float(dth),
+            float(applied_dth),
+            float(segment_count),
+            float(angle_variance),
+            float(heading_conf),
+            1.0 if allow_heading else 0.0,
+            1.0 if allow_translation else 0.0,
+        ]
+        self.pub_wall_heading_debug.publish(debug)
+
+        if self.wall_correction_mode == "OFF":
+            return
+        if not allow_translation and not allow_heading:
+            return
+        correction_is_tiny = (
+            math.hypot(tx, ty) < self.wall_field_deadband_m
+            and abs(applied_dth) < math.radians(0.3)
+        )
+        if correction_is_tiny:
+            return
+
+        if self.wall_correction_mode == "HEADING_ONLY":
+            # This is an orientation estimate update, not physical robot motion. Keep x/y and the
+            # base_link-relative anchor grid untouched; mapping is disabled throughout this phase.
+            self.theta = wrap_angle(self.theta + applied_dth)
+            return
+
         ct, st = math.cos(applied_dth), math.sin(applied_dth)
         old_x, old_y = self.x, self.y
         raw_dx = ct * old_x - st * old_y + tx - old_x

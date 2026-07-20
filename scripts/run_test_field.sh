@@ -16,39 +16,78 @@
 #
 # 타겟: config/test_field.yaml (SET1=icosahedron×3, SET2=orange×2).
 
+# ROS 2 setup scripts probe optional variables before defining them, so nounset must be enabled
+# only after both environments have been sourced.
+set -e -o pipefail
+
 WS=/home/seventt/seventt/workspace
+RUN_ROOT="$WS/data/mock_field_test"
+PID_FILE="$RUN_ROOT/.main_run.pid"
+mkdir -p "$RUN_ROOT"
 source /opt/ros/humble/setup.bash
 source "$WS/ros2_ws/install/setup.bash"
-
-TS=$(date +%Y%m%d_%H%M%S)
-RUN_DIR="$WS/data/mock_field_test/run_$TS"
-mkdir -p "$RUN_DIR"
-echo "== run dir: $RUN_DIR =="
+set -u
 
 echo "== preflight =="
+# Stop the exact prior launcher first when its PID file is valid. Guard against PID reuse by
+# checking the command line before sending a signal.
+if [[ -f "$PID_FILE" ]]; then
+  read -r OLD_PID < "$PID_FILE" || OLD_PID=""
+  if [[ "$OLD_PID" =~ ^[0-9]+$ ]] && kill -0 "$OLD_PID" 2>/dev/null; then
+    OLD_CMD=$(tr '\0' ' ' < "/proc/$OLD_PID/cmdline" 2>/dev/null || true)
+    if [[ "$OLD_CMD" == *"run_test_field.sh"* ]]; then
+      kill -TERM "$OLD_PID" 2>/dev/null || true
+      for _ in {1..25}; do
+        kill -0 "$OLD_PID" 2>/dev/null || break
+        sleep 0.2
+      done
+      if kill -0 "$OLD_PID" 2>/dev/null; then
+        kill -KILL "$OLD_PID" 2>/dev/null || true
+      fi
+      echo "  stopped previous launcher pid=$OLD_PID"
+    fi
+  fi
+fi
+
 for p in "install/robot_perception/lib" "install/robot_planning/lib" \
          "install/robot_control/lib" "install/robot_hardware/lib" "camera_csi_node" "ros2 bag record"; do
-  pkill -f "$p" 2>/dev/null && echo "  killed stale: $p"
+  if pkill -f "$p" 2>/dev/null; then
+    echo "  killed stale: $p"
+  fi
 done
 sleep 1
-echo "  devices: $(ls /dev/video0 /dev/video1 /dev/ttyUSB0 2>/dev/null | tr '\n' ' ')"
+python3 "$WS/scripts/competition_preflight.py" \
+  --serial /dev/ttyUSB0 --wide-sensor-id 1 --camera-timeout-sec 8
+sleep 1
 free -m | awk '/Mem/{print "  mem available="$7"MB  (SigLIP은 ~1.5GB 여유 필요 — 빠듯하면 크롬/Colab 끄거나 with_siglip:=false)"}'
+
+TS=$(date +%Y%m%d_%H%M%S)
+RUN_DIR="$RUN_ROOT/run_$TS"
+mkdir -p "$RUN_DIR"
+echo $$ > "$PID_FILE"
+echo "== run dir: $RUN_DIR =="
 
 # ---- rosbag (백그라운드), Ctrl-C 시 함께 정리 ----
 BAG_PID=""
-if [ -z "$NOBAG" ]; then
-  TOPICS="/world_model /localization/pose /localization/landmark_correction \
+if [[ -z "${NOBAG:-}" ]]; then
+  TOPICS="/competition/state /world_model /localization/pose /localization/landmark_correction \
 /camera_top/detections /camera_body/detections /classification/siglip /classification/shape \
 /selected_target /mission_state /planning/phase /planning/decision \
 /base/goal_pose /base_command /base/wheel_speeds /base/wheel_odom"
-  [ -n "$WITHIMG" ] && TOPICS="$TOPICS /camera_top/image_raw /camera_body/image_raw"
+  [[ -n "${WITHIMG:-}" ]] && TOPICS="$TOPICS /camera_top/image_raw /camera_body/image_raw"
   ros2 bag record -o "$RUN_DIR/bag" $TOPICS > "$RUN_DIR/bag.log" 2>&1 &
   BAG_PID=$!
   echo "== rosbag recording (pid $BAG_PID) -> $RUN_DIR/bag =="
 fi
-cleanup() { [ -n "$BAG_PID" ] && kill -INT "$BAG_PID" 2>/dev/null; }
+cleanup() {
+  [[ -n "$BAG_PID" ]] && kill -INT "$BAG_PID" 2>/dev/null || true
+  if [[ -f "$PID_FILE" ]] && [[ "$(<"$PID_FILE")" == "$$" ]]; then
+    rm -f "$PID_FILE"
+  fi
+}
 trap cleanup INT TERM EXIT
 
 echo "== launch (all node logs -> $RUN_DIR/console.log) =="
+echo "   fresh process state: STANDBY; second accepted button press establishes competition t=0."
 echo "   라이브 창이 뜨거나(디스플레이 있으면), 헤드리스면 $RUN_DIR/<시각>/live.png 가 계속 갱신됨."
 ros2 launch robot_bringup test_field.launch.py output_dir:="$RUN_DIR" "$@" 2>&1 | tee "$RUN_DIR/console.log"

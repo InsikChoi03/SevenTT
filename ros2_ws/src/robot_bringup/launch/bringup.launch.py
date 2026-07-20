@@ -54,7 +54,7 @@ def generate_launch_description() -> LaunchDescription:
             Node(package="robot_control", executable="pick_sequencer_node",
                  name="pick_sequencer_node", parameters=[params, motion_tuning], output="screen"),
             Node(package="robot_hardware", executable="mcu_bridge_base_node",
-                 name="mcu_bridge_base_node", parameters=[params, motion_tuning, {"startup_lift_ms": 2000}], output="screen"),
+                 name="mcu_bridge_base_node", parameters=[params, motion_tuning], output="screen"),
         ],
     )
 

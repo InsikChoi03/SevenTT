@@ -25,9 +25,17 @@ import numpy as np
 import rclpy
 from geometry_msgs.msg import PoseStamped
 from rclpy.node import Node
-from rclpy.qos import qos_profile_sensor_data
+from rclpy.qos import (
+    DurabilityPolicy,
+    HistoryPolicy,
+    QoSProfile,
+    ReliabilityPolicy,
+    qos_profile_sensor_data,
+)
 from sensor_msgs.msg import Image
-from std_msgs.msg import Bool, Float32MultiArray
+from std_msgs.msg import Bool, Float32MultiArray, String
+
+from robot_perception.wall_heading import classify_wall_segments, heading_confidence
 
 try:
     import cv2
@@ -42,6 +50,14 @@ try:
 except Exception:  # noqa: BLE001
     YOLO = None  # type: ignore[assignment, misc]
     _YOLO = False
+
+
+COMPETITION_QOS = QoSProfile(
+    history=HistoryPolicy.KEEP_LAST,
+    depth=1,
+    reliability=ReliabilityPolicy.RELIABLE,
+    durability=DurabilityPolicy.TRANSIENT_LOCAL,
+)
 
 
 class WallLocalizerNode(Node):
@@ -209,6 +225,7 @@ class WallLocalizerNode(Node):
         self._wall_field_ema = np.zeros(3, dtype=np.float64)
         self._wall_field_history: deque[np.ndarray] = deque(maxlen=self.wall_field_filter_window)
         self._wall_fast_correction = False
+        self._competition_state = "STANDBY"
         self._load_segmentation_model()
 
         self.create_subscription(PoseStamped, "/localization/pose", self.on_pose, 10)
@@ -217,6 +234,9 @@ class WallLocalizerNode(Node):
             Bool, "/localization/wall_fast_correction", self.on_wall_fast_correction, 10
         )
         self.create_subscription(Image, "/camera_top/image_raw", self.on_img, qos_profile_sensor_data)
+        self.create_subscription(
+            String, "/competition/state", self.on_competition_state, COMPETITION_QOS
+        )
         self.pub_segments = self.create_publisher(Float32MultiArray, "/localization/wall_segments", 10)
         self.pub_raw_segments = self.create_publisher(
             Float32MultiArray, "/localization/wall_raw_segments", 10
@@ -267,6 +287,11 @@ class WallLocalizerNode(Node):
 
     def on_img(self, msg: Image) -> None:
         self._img = msg
+
+    def on_competition_state(self, msg: String) -> None:
+        state = str(msg.data).strip().upper()
+        if state in {"STANDBY", "READY", "RUNNING", "DONE", "ERROR"}:
+            self._competition_state = state
 
     def _to_base(self, pts: np.ndarray) -> np.ndarray | None:
         """(N,2) pixels -> (N,2) base_link ground metres via fisheye undistort + rot180 + homography."""
@@ -1104,31 +1129,11 @@ class WallLocalizerNode(Node):
         if not segments:
             return
         extent = self.field_half_extent
-        usable: list[tuple[tuple[float, float, float, float], bool]] = []
-        heading_errors: list[float] = []
-        for x0, y0, x1, y1 in segments:
-            dx, dy = x1 - x0, y1 - y0
-            length = math.hypot(dx, dy)
-            if length < 0.12:
-                continue
-            angle = math.atan2(dy, dx)
-            # A line has no direction, so compare its angle modulo pi.
-            line_angle = angle % math.pi
-            mx, my = (x0 + x1) * 0.5, (y0 + y1) * 0.5
-            horizontal = min(line_angle, math.pi - line_angle) <= math.radians(35.0)
-            if horizontal:
-                target_angle = 0.0
-            else:
-                target_angle = math.pi * 0.5
-            angle_error = (target_angle - line_angle + math.pi * 0.5) % math.pi - math.pi * 0.5
-            if abs(angle_error) <= math.radians(35.0):
-                heading_errors.append(angle_error)
-                usable.append(((x0, y0, x1, y1), horizontal))
-
-        if not usable or not heading_errors:
+        usable, heading = classify_wall_segments(segments)
+        if not usable or heading is None:
             return
 
-        dtheta = float(np.median(heading_errors))
+        dtheta = heading.correction_rad
         ct, st = math.cos(dtheta), math.sin(dtheta)
         x_residuals: list[float] = []
         y_residuals: list[float] = []
@@ -1155,8 +1160,6 @@ class WallLocalizerNode(Node):
                 if abs(residual) <= self.wall_field_max_residual and spread <= 0.15:
                     x_residuals.append(residual)
 
-        if not x_residuals and not y_residuals:
-            return
         correction = np.array([math.nan, math.nan, dtheta], dtype=np.float64)
         if x_residuals:
             correction[0] = float(np.median(x_residuals))
@@ -1203,8 +1206,18 @@ class WallLocalizerNode(Node):
         a = max(0.0, min(1.0, smoothing))
         self._wall_field_ema = (1.0 - a) * self._wall_field_ema + a * filtered
         confidence = min(1.0, (len(x_residuals) + len(y_residuals)) / 2.0)
+        heading_conf = heading_confidence(heading)
         msg = Float32MultiArray()
-        msg.data = [*map(float, self._wall_field_ema), float(confidence)]
+        # [filtered dx,dy,dtheta, translation confidence, raw dtheta, segment count,
+        #  angular variance(rad^2), heading confidence]. Extra fields preserve compatibility.
+        msg.data = [
+            *map(float, self._wall_field_ema),
+            float(confidence),
+            float(heading.correction_rad),
+            float(heading.segment_count),
+            float(heading.variance_rad2),
+            float(heading_conf),
+        ]
         self.pub_wall_field.publish(msg)
 
     def _snap_segments_to_field(
@@ -1229,6 +1242,8 @@ class WallLocalizerNode(Node):
         return snapped
 
     def tick(self) -> None:
+        if self._competition_state not in {"READY", "RUNNING"}:
+            return
         if self._img is None or self._pose is None:
             return
         try:

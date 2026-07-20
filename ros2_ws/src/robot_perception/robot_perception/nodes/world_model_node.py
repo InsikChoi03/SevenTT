@@ -29,7 +29,7 @@ import rclpy
 from rclpy.node import Node
 from rcl_interfaces.msg import SetParametersResult
 
-from geometry_msgs.msg import PoseStamped, Vector3
+from geometry_msgs.msg import PoseArray, PoseStamped, Vector3
 from std_msgs.msg import Bool, Float32MultiArray, UInt64
 from robot_interfaces.msg import Classification, DetectionArray, Object, WorldModel
 
@@ -123,6 +123,13 @@ class WorldModelNode(Node):
         # opening motion finish and wall correction settle before the first field-grid objects are
         # committed to the map.
         self.declare_parameter("mapping_enabled_initially", True)
+        # Independent NEW-track birth gate. Existing tracks continue to associate/update while
+        # this is false; only unmatched detections are prevented from becoming candidates/tracks.
+        # With no slots the enabled gate is unrestricted for backward compatibility. When fixed
+        # field-frame slots are supplied, births are accepted only near one of those slots.
+        self.declare_parameter("track_birth_enabled_initially", True)
+        self.declare_parameter("track_birth_slot_radius_m", 0.22)
+        self.declare_parameter("track_birth_require_slots", False)
 
         # Top-cam intrinsics (pixels). Any zero -> cannot project (warn, pose only).
         self.declare_parameter("top_fx", 0.0)
@@ -456,6 +463,17 @@ class WorldModelNode(Node):
         self.robot_theta: float = 0.0
         self.have_pose: bool = False
         self.mapping_enabled = bool(self.get_parameter("mapping_enabled_initially").value)
+        self.track_birth_enabled = bool(
+            self.get_parameter("track_birth_enabled_initially").value
+        )
+        self.track_birth_slot_radius = max(
+            0.0, float(self.get_parameter("track_birth_slot_radius_m").value)
+        )
+        self.track_birth_require_slots = bool(
+            self.get_parameter("track_birth_require_slots").value
+        )
+        # Replaced atomically by the PoseArray callback. Slots are fixed field-frame xy positions.
+        self._track_birth_slots: tuple[tuple[float, float], ...] = ()
         # Short robot-pose history (t, x, y, theta) so a detection can be projected at the ROBOT POSE
         # AT IMAGE-CAPTURE TIME (see _pose_at) rather than at message-arrival time — the inference
         # delay otherwise smears the map during rotation. ~3 s at the 20 Hz pose rate covers any
@@ -487,11 +505,23 @@ class WorldModelNode(Node):
         self.create_subscription(PoseStamped, "/localization/pose", self.on_pose, 10)
         self.create_subscription(Bool, "/world_model/mapping_enabled", self.on_mapping_enabled, 10)
         self.create_subscription(
+            Bool, "/world_model/track_birth_enabled", self.on_track_birth_enabled, 10
+        )
+        self.create_subscription(
+            PoseArray, "/world_model/track_birth_slots", self.on_track_birth_slots, 10
+        )
+        self.create_subscription(
             Float32MultiArray, "/localization/wall_map_transform", self.on_wall_map_transform, 10
         )
         self.create_subscription(UInt64, "/world_model/blacklist_add", self.on_blacklist_add, 10)
 
         self.pub = self.create_publisher(WorldModel, "/world_model", 10)
+        # Per-frame WIDE observations in base_link. Unlike /world_model, this stream is
+        # pose-independent and remains available while field mapping is gated off, so relative
+        # navigation never depends on a potentially drifting field-frame robot pose.
+        self.pub_relative_wide = self.create_publisher(
+            WorldModel, "/world_model/wide_relative_objects", 10
+        )
         # Pose correction for the localizer: Float32MultiArray [dx, dy, dtheta, confidence]. The
         # confidence lets the localizer trust a well-conditioned landmark heading fix as an ABSOLUTE
         # reference (YOLO nails object bearings) instead of a tiny clamped nudge.
@@ -521,6 +551,8 @@ class WorldModelNode(Node):
             f"landmark_corr={self.landmark_correction} "
             f"grid_prior={self.grid_prior_enabled} grid_points={len(self._grid_points)} "
             f"mapping_enabled={self.mapping_enabled} "
+            f"track_birth_enabled={self.track_birth_enabled} "
+            f"track_birth_slot_radius={self.track_birth_slot_radius}m "
             f"cam_h={self.cam_height}m pitch={self.cam_pitch_deg}deg yaw={self.cam_yaw_deg}deg "
             f"offset=({self.cam_offset_x},{self.cam_offset_y}) "
             f"arm_base_off=({self.arm_base_off_x},{self.arm_base_off_y}) body_ws={self.body_ws} "
@@ -614,6 +646,18 @@ class WorldModelNode(Node):
                 self.fruit_cube_sticky_conf_body = float(param.value)
             elif param.name == "fruit_cube_sticky_min_wide_hits":
                 self.fruit_cube_sticky_min_wide_hits = int(param.value)
+            elif param.name == "track_birth_slot_radius_m":
+                self.track_birth_slot_radius = max(0.0, float(param.value))
+                if self._track_birth_slots:
+                    self._candidates = [
+                        candidate
+                        for candidate in self._candidates
+                        if self._track_birth_allowed(candidate["x"], candidate["y"])
+                    ]
+            elif param.name == "track_birth_require_slots":
+                self.track_birth_require_slots = bool(param.value)
+                if self.track_birth_require_slots and not self._track_birth_slots:
+                    self._candidates.clear()
         return SetParametersResult(successful=True)
 
     @staticmethod
@@ -765,6 +809,40 @@ class WorldModelNode(Node):
             self._clear_mapping_state()
             self.get_logger().info("object mapping disabled")
 
+    def on_track_birth_enabled(self, msg: Bool) -> None:
+        """Gate only unmatched detections; existing track association remains active."""
+        enabled = bool(msg.data)
+        if not enabled:
+            # A candidate accumulated before the gate closed must never promote after it reopens.
+            self._candidates.clear()
+        if enabled == self.track_birth_enabled:
+            return
+        self.track_birth_enabled = enabled
+        self.get_logger().info(
+            f"new track birth {'enabled' if enabled else 'disabled'} "
+            f"(fixed_slots={len(self._track_birth_slots)})"
+        )
+
+    def on_track_birth_slots(self, msg: PoseArray) -> None:
+        """Replace the fixed field-frame slots that unmatched detections may be born near."""
+        slots = tuple(
+            (float(pose.position.x), float(pose.position.y)) for pose in msg.poses
+        )
+        if slots == self._track_birth_slots:
+            return
+        self._track_birth_slots = slots
+        if slots:
+            # Keep only candidates that are valid under the newly supplied fixed-slot window.
+            self._candidates = [
+                candidate
+                for candidate in self._candidates
+                if self._track_birth_allowed(candidate["x"], candidate["y"])
+            ]
+        self.get_logger().info(
+            f"new track birth slots updated: count={len(slots)} "
+            f"radius={self.track_birth_slot_radius:.3f}m"
+        )
+
     def on_wall_map_transform(self, msg: Float32MultiArray) -> None:
         """Move robot history, tracks and anchors by the same wall-alignment transform."""
         if len(msg.data) < 3:
@@ -806,7 +884,61 @@ class WorldModelNode(Node):
         track.blacklisted = True  # keep so it isn't recreated/re-selected; never un-blacklist
         self.get_logger().info(f"blacklisted track id={track.id}")
 
+    def _publish_wide_relative(self, msg: DetectionArray) -> None:
+        """Publish this WIDE frame as raw, height-corrected base_link observations.
+
+        This intentionally performs no tracking and uses no robot field pose. An empty message is
+        still published when there are no detections or the wide homography is unavailable; the
+        consumer can therefore distinguish a fresh empty frame from a stale camera pipeline.
+        """
+        relative = WorldModel()
+        relative.header.stamp = msg.header.stamp
+        relative.header.frame_id = "base_link"
+        relative.robot_x = 0.0
+        relative.robot_y = 0.0
+        relative.robot_theta = 0.0
+
+        objects: list[Object] = []
+        for det in msg.detections:
+            u = float(det.x_center)
+            v = float(det.y_center)
+            confidence = float(det.confidence)
+            if not (math.isfinite(u) and math.isfinite(v) and math.isfinite(confidence)):
+                continue
+            base = self._wide_pixel_to_base(u, v)
+            if base is None:
+                continue
+            bx, by = self._height_correct(
+                base[0], base[1], self.cam_offset_x, self.cam_offset_y, self.cam_height
+            )
+            if not (math.isfinite(bx) and math.isfinite(by)):
+                continue
+
+            label = str(det.label)
+            obj = Object()
+            # IDs are frame-local only: this topic deliberately carries observations, not tracks.
+            obj.id = len(objects) + 1
+            obj.class_label = label
+            obj.set_type = int(
+                _LABEL_TO_SET_TYPE.get(label, 2 if label in _FRUIT_LABELS else 0)
+            )
+            obj.x = float(bx)
+            obj.y = float(by)
+            obj.confidence = confidence
+            obj.last_seen = msg.header.stamp
+            obj.blacklisted = False
+            obj.n_obs = 1
+            obj.source = "wide_relative"
+            obj.fruit_label = label if label in _FRUIT_LABELS else ""
+            obj.locked = False
+            objects.append(obj)
+
+        relative.objects = objects
+        self.pub_relative_wide.publish(relative)
+
     def on_detections(self, msg: DetectionArray) -> None:
+        # Relative navigation consumes every camera frame independently of field-map gating.
+        self._publish_wide_relative(msg)
         if not self.mapping_enabled:
             self._prev_wide_base = []
             self._proj_wide = []
@@ -1104,11 +1236,23 @@ class WorldModelNode(Node):
             tr.anchor_y = tr.y
         return True
 
+    def _track_birth_allowed(self, x: float, y: float) -> bool:
+        """Return whether an unmatched field point may enter the new-track candidate pool."""
+        if not self.track_birth_enabled:
+            return False
+        slots = self._track_birth_slots
+        if not slots:
+            return not self.track_birth_require_slots
+        radius = self.track_birth_slot_radius
+        return any(math.hypot(sx - x, sy - y) <= radius for sx, sy in slots)
+
     def _candidate_hit(self, x: float, y: float, conf: float, label: str, set_type: int,
                        now: float, is_body: bool, vote_thresh: float) -> int:
         """A detection with no matching track: hold it as a CANDIDATE and only spawn a real track once
         it has been re-observed new_track_min_hits times at ~the same spot. Returns the new track id on
         promotion, else 0 (no track yet). Kills phantom over-creation from motion jitter."""
+        if not self._track_birth_allowed(x, y):
+            return 0
         self._candidates = [c for c in self._candidates if now - c["t"] <= self.candidate_ttl]
         best = None
         bd = self.assoc_radius
@@ -1152,6 +1296,9 @@ class WorldModelNode(Node):
                 best["fruit_cube_seen"] = True
                 best["set"] = 2
         if best["n"] < self.new_track_min_hits:
+            return 0
+        if not self._track_birth_allowed(float(best["x"]), float(best["y"])):
+            self._candidates.remove(best)
             return 0
         # Confirmed -> promote to a real track.
         tid = self._next_id
@@ -1218,6 +1365,8 @@ class WorldModelNode(Node):
         if best_id is None:
             # No existing track within reassoc_radius -> genuinely new spot. DON'T spawn from a single
             # detection (jitter/blur -> phantoms). Require new_track_min_hits consistent re-obs.
+            if not self._track_birth_allowed(x, y):
+                return 0
             return self._candidate_hit(x, y, conf, label, set_type, now, is_body, vote_thresh)
 
         # Fuse into the matched track.

@@ -5,6 +5,12 @@
 // 프로토콜:
 //   수신 <BASE,fl,fr,rl,rr>\n   휠 선속도 m/s (부호=방향). base_mecanum_pca와 동일
 //   수신 <ARM,t1,t2,t3,...>\n   서보각 0~180: t1=ch0 어깨, t2=ch1 손목, t3=ch2 그리퍼 (나머지 무시)
+//   수신 <STATUS,STANDBY|READY|RUNNING|DONE|ERROR>
+//     경기 상태/안전 LED 동기화
+//   송신 <SW,1>/<START,n>
+//     A1 시작 버튼의 50ms debounce된 누름 edge
+//   송신 <SW,0>
+//     시작 버튼 놓음 edge
 //   송신 <HB,fl,fr,rl,rr>\n     5Hz 베이스 하트비트(명령 echo, 엔코더 없음)
 //   송신 <ODOM,fl,fr,rl,rr,t_ms>\n   10Hz 엔코더 실측 휠 속도(m/s)
 //   송신 <ENC,e1,e2,e3,e4,t_ms>\n       2Hz 엔코더 raw tick(매핑 검증용)
@@ -74,6 +80,89 @@ const int LIFT_PIN = 13;
 const unsigned long MAX_LIFT_MS = 10000;   // 스톨 번아웃 방지: 최대 on 시간 후 자동 off
 bool liftOn = false;
 unsigned long liftOffAt = 0;
+
+// ---- 3단계 경기 시작 버튼 / 상태 LED ----
+const uint8_t RED_LED_PIN = 10;
+const uint8_t GREEN_LED_PIN = 11;
+const uint8_t YELLOW_LED_PIN = 12;
+const uint8_t START_BUTTON_PIN = A1;
+const unsigned long BUTTON_DEBOUNCE_MS = 50;
+
+enum CompetitionState : uint8_t {
+  COMP_STANDBY,
+  COMP_READY,
+  COMP_RUNNING,
+  COMP_DONE,
+  COMP_ERROR
+};
+
+CompetitionState competitionState = COMP_STANDBY;
+uint32_t startPressCount = 0;
+int buttonRaw = HIGH;
+int buttonStable = HIGH;
+unsigned long buttonChangedAt = 0;
+bool reportAcceptedRelease = false;
+
+void stopAll();
+void setLift(bool on);
+
+void showCompetitionState() {
+  digitalWrite(RED_LED_PIN, LOW);
+  digitalWrite(GREEN_LED_PIN, LOW);
+  digitalWrite(YELLOW_LED_PIN, LOW);
+  if (competitionState == COMP_READY) {
+    digitalWrite(YELLOW_LED_PIN, HIGH);
+  } else if (competitionState == COMP_RUNNING) {
+    digitalWrite(GREEN_LED_PIN, HIGH);
+  } else {
+    // STANDBY, DONE, ERROR are all fail-safe red.
+    digitalWrite(RED_LED_PIN, HIGH);
+  }
+}
+
+void applyCompetitionStatus(const char* state) {
+  if (strcmp(state, "STANDBY") == 0) competitionState = COMP_STANDBY;
+  else if (strcmp(state, "READY") == 0) competitionState = COMP_READY;
+  else if (strcmp(state, "RUNNING") == 0) competitionState = COMP_RUNNING;
+  else if (strcmp(state, "DONE") == 0) competitionState = COMP_DONE;
+  else if (strcmp(state, "ERROR") == 0) competitionState = COMP_ERROR;
+  else return;
+  if (competitionState != COMP_RUNNING) {
+    stopAll();
+    setLift(false);
+    liftOn = false;
+  }
+  showCompetitionState();
+}
+
+void updateStartButton(unsigned long now) {
+  int raw = digitalRead(START_BUTTON_PIN);
+  if (raw != buttonRaw) {
+    buttonRaw = raw;
+    buttonChangedAt = now;
+  }
+  if (raw == buttonStable || now - buttonChangedAt < BUTTON_DEBOUNCE_MS) return;
+
+  buttonStable = raw;
+  if (buttonStable == LOW) {
+    // Only STANDBY -> READY -> RUNNING is locally permitted. Once RUNNING (or terminal),
+    // all later presses are ignored and can never act as a stop button.
+    if (competitionState != COMP_STANDBY && competitionState != COMP_READY) return;
+    startPressCount++;
+    competitionState = (
+      competitionState == COMP_STANDBY ? COMP_READY : COMP_RUNNING
+    );
+    showCompetitionState();
+    reportAcceptedRelease = true;
+    Serial.println("<SW,1>");
+    Serial.print("<START,"); Serial.print(startPressCount); Serial.println(">");
+  } else if (reportAcceptedRelease) {
+    // The release belonging to the accepted second press is still reported even though that
+    // press changed the local state to RUNNING. Later press/release cycles are ignored entirely.
+    reportAcceptedRelease = false;
+    Serial.println("<SW,0>");
+  }
+}
 
 void updateEncoder(uint8_t e) {
   uint8_t state = encState[e] & 3;
@@ -241,10 +330,13 @@ void parseFrame() {
       v[i] = atof(p); char* c = strchr(p, ',');
       if (i < 3) { if (!c) return; p = c + 1; }
     }
-    for (uint8_t i = 0; i < 4; i++) wheelCmd[i] = v[i];
+    for (uint8_t i = 0; i < 4; i++) {
+      wheelCmd[i] = competitionState == COMP_RUNNING ? v[i] : 0.0;
+    }
     lastCmdMs = millis();
     for (uint8_t w = 0; w < 4; w++) setWheelPWM(w, wheelCmd[w]);
   } else if (strncmp(buf, "ARM,", 4) == 0) {
+    if (competitionState != COMP_RUNNING) return;
     float v[3]; char* p = buf + 4;
     for (uint8_t i = 0; i < 3; i++) {
       v[i] = atof(p); char* c = strchr(p, ',');
@@ -257,11 +349,13 @@ void parseFrame() {
       Serial.print("<ARMACK,"); Serial.print((int)tgtA[0]); Serial.print(',');
       Serial.print((int)tgtA[1]); Serial.print(','); Serial.print((int)tgtA[2]); Serial.println(">");
     }
+  } else if (strncmp(buf, "STATUS,", 7) == 0) {
+    applyCompetitionStatus(buf + 7);
   } else if (strncmp(buf, "LIFT,", 5) == 0) {   // 광각 리프트 모터 MOSFET (D13)
     long ms = atol(buf + 5);
     if (ms <= 0) {                               // <LIFT,0> = 즉시 off
       setLift(false); liftOn = false;
-    } else {                                     // <LIFT,ms> = ms 동안 on 후 자동 off
+    } else if (competitionState == COMP_RUNNING) { // <LIFT,ms> = RUNNING에서만 on
       if (ms > (long)MAX_LIFT_MS) ms = MAX_LIFT_MS;
       if (LIFT_PIN >= 0) {
         setLift(true); liftOn = true; liftOffAt = millis() + ms;
@@ -278,6 +372,14 @@ void parseFrame() {
 
 void setup() {
   if (LED >= 0) pinMode(LED, OUTPUT);
+  pinMode(RED_LED_PIN, OUTPUT);
+  pinMode(GREEN_LED_PIN, OUTPUT);
+  pinMode(YELLOW_LED_PIN, OUTPUT);
+  pinMode(START_BUTTON_PIN, INPUT_PULLUP);
+  buttonRaw = buttonStable = digitalRead(START_BUTTON_PIN);
+  buttonChangedAt = millis();
+  competitionState = COMP_STANDBY;
+  showCompetitionState();
   if (LIFT_PIN >= 0) { pinMode(LIFT_PIN, OUTPUT); setLift(false); }   // 부팅 시 리프트 모터 off
   Serial.begin(115200);
   Wire.begin();
@@ -292,7 +394,7 @@ void setup() {
   for (int i = 0; i < 3; i++) { curA[i] = 90; tgtA[i] = 90; }   // 팔은 boot-limp (아래 loop서 armActive 전엔 미구동)
   delay(200);
   resetEncoders();
-  Serial.println("<BANNER,base_arm_combined_v2,base0x60/arm0x40,enc4320,115200>");
+  Serial.println("<BANNER,base_arm_combined_v3,start3,base0x60/arm0x40,enc4320,115200>");
   lastCmdMs = millis();
 }
 
@@ -304,6 +406,7 @@ void loop() {
     else if (inFrame && idx < sizeof(buf) - 1) { buf[idx++] = c; }
   }
   unsigned long now = millis();
+  updateStartButton(now);
 
   // 광각 리프트 모터 자동 off (MAX_LIFT_MS 스톨 방지)
   if (liftOn && (long)(now - liftOffAt) >= 0) {

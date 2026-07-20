@@ -119,6 +119,7 @@ class BaseControllerNode(Node):
         self._brake_until = 0.0
         self._brake_cmd = [0.0, 0.0, 0.0, 0.0]
         self._last_move_wheels = [0.0, 0.0, 0.0, 0.0]
+        self._last_align_profile_move = False
 
         self.last_cmd_time = self.get_clock().now()
         self.last_cmd = (0.0, 0.0, 0.0)
@@ -266,12 +267,25 @@ class BaseControllerNode(Node):
         m = max(abs(w) for w in wheels)
         now = self.get_clock().now().nanoseconds * 1e-9
         aligning = self._mstate == "ALIGN"
+        is_rot = abs(vx) < 0.02 and abs(vy) < 0.02 and abs(omega) > 1e-3
+        is_strafe = abs(vy) >= 0.02 and abs(vy) >= abs(vx)
+        opening = self._mstate == "OPENING"
+        # The opening's one left-strafe pulse is deliberately calibrated from ALIGN.  Give that
+        # exact pure-strafe command the same boost-free, slew-bypassed output profile as ALIGN;
+        # every other OPENING command keeps the established opening profile.
+        opening_align_strafe = (
+            opening
+            and vy > 0.02
+            and abs(vx) < 0.02
+            and abs(omega) <= 1e-3
+        )
+        align_profile = aligning or opening_align_strafe
         kick = False                                  # boost/brake pulse this tick -> bypass slew
         if m <= self.wheel_deadband:
             if self._moving:                          # transition move -> rest: start the brake pulse
                 self._moving = False
                 brake = self.wheel_brake_ms > 0.0 and self.wheel_brake_scale > 0.0
-                if aligning and self.align_brake_off:
+                if (aligning or self._last_align_profile_move) and self.align_brake_off:
                     brake = False                     # no coast-brake during fine ALIGN (it jerks)
                 if brake:
                     self._brake_until = now + self.wheel_brake_ms / 1000.0
@@ -286,14 +300,11 @@ class BaseControllerNode(Node):
             was_moving = self._moving
             self._moving = True
             self._brake_until = 0.0                   # a fresh move cancels any pending brake
-            if aligning:
+            if align_profile:
                 kick = True                           # ALIGN unit steps bypass slew -> hit full duty
                                                       # immediately, matching the boost-free calibration
             # The steady floor is the min duty that keeps the base moving. Pure in-place rotation gets
             # its own floor, while strafe/rotation starts also get a short breakaway boost.
-            is_rot = abs(vx) < 0.02 and abs(vy) < 0.02 and abs(omega) > 1e-3
-            is_strafe = abs(vy) >= 0.02 and abs(vy) >= abs(vx)
-            opening = self._mstate == "OPENING"
             boost = 0.0
             boost_ms = self.wheel_boost_ms
             if opening and is_rot:
@@ -306,10 +317,12 @@ class BaseControllerNode(Node):
                 boost = self.wheel_boost_rot
             elif is_strafe:
                 boost = self.wheel_boost_strafe
-            if (not aligning and not was_moving and (is_rot or is_strafe)
+            if (not align_profile and not was_moving and (is_rot or is_strafe)
                     and boost > 0.0 and boost_ms > 0.0):
                 self._boost_until = now + boost_ms / 1000.0
-            if opening and is_rot and self.opening_wheel_min_rot > 0.0:
+            if opening_align_strafe:
+                steady_floor = self.wheel_min_strafe
+            elif opening and is_rot and self.opening_wheel_min_rot > 0.0:
                 steady_floor = self.opening_wheel_min_rot
             elif opening and is_strafe and self.opening_wheel_min_strafe > 0.0:
                 steady_floor = self.opening_wheel_min_strafe
@@ -332,6 +345,7 @@ class BaseControllerNode(Node):
                     wheels = [max(-1.0, min(1.0, w * s)) for w in wheels]
                 kick = True                           # boost pulse must hit immediately
             self._last_move_wheels = list(wheels)     # remember travel direction for the stop brake
+            self._last_align_profile_move = align_profile
 
         # Slew-limit toward the target so accel/decel is smooth (no jack-rabbit start / no slip).
         # Brake pulses bypass slew (kick) so they hit hard enough to actually cut the coast.

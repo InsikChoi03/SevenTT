@@ -12,12 +12,13 @@ Launch args (for a safe / memory-bounded staged startup):
                                    script owns base motion.
     with_siglip (default true)  -- siglip_gate (fruit TYPE). Set false to save ~1.5 GB VRAM;
                                    YOLO still separates Set1 vs Set2 (fruit_photo_cube class).
+    with_arm    (default true)  -- real 2R pick sequencer through the shared base MCU bridge.
 
     ros2 launch robot_bringup test_field.launch.py                              # full run
     ros2 launch robot_bringup test_field.launch.py with_base:=false with_siglip:=false  # core smoke
 
-The ARM IS NEVER USED: pick_sequencer_node, arm_controller_node, mcu_bridge_arm_node are not
-launched, and mission_fsm runs dry_pick:true. Fill set1_label/set2_label/quotas in the yaml.
+The legacy 6-DOF arm nodes are not launched. The verified 2R pick sequencer is enabled by default;
+the MCU bridge still discards every arm target until competition state RUNNING.
 """
 import os
 
@@ -99,7 +100,7 @@ def generate_launch_description() -> LaunchDescription:
                               description="start target selector + mission FSM (/base_command owner)"),
         DeclareLaunchArgument("with_siglip", default_value="true",
                               description="start siglip_gate (fruit type); false saves VRAM"),
-        DeclareLaunchArgument("with_arm", default_value="false",
+        DeclareLaunchArgument("with_arm", default_value="true",
                               description="start 2R pick_sequencer (real grasp); needs with_base (shares ttyUSB0)"),
         DeclareLaunchArgument("with_wall_localizer", default_value="true",
                               description="use arena wall/floor lines as absolute pose correction"),
@@ -149,7 +150,7 @@ def generate_launch_description() -> LaunchDescription:
         # SigLIP fruit-type gate (optional, VRAM-heavy)
         node("robot_perception", "siglip_gate_node", "siglip_gate_node",
              condition=IfCondition(with_siglip)),
-        # base drive layer (optional; robot moves only with this) -- NO arm nodes ever
+        # base drive layer (optional; robot moves only with this)
         # The mission FSM is the sole /base_command publisher in the field-test pipeline.
         # node("robot_planning", "explorer_node", "explorer_node",
         #      condition=IfCondition(with_base)),
