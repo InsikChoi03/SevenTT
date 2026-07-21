@@ -26,10 +26,10 @@
 
 ## 2. 현재 상태 (Snapshot — 이 섹션만 최신값으로 덮어쓰기)
 
-- **현재 버전:** `v5.0.0` (`new` 브랜치, Git 태그 없음)
-- **최종 업데이트:** 2026-07-21 23:17 (KST)
+- **현재 버전:** `v5.1.0` (`new` 브랜치, Git 태그 없음)
+- **최종 업데이트:** 2026-07-22 05:44 (KST)
 - **최종 작업자:** `@AI`
-- **한 줄 요약:** IMU 기반 제자리 회전·직선 주행, 150초 직선 주차, 단일 벽 경계 모델, 팔 대기 자세와 8080 라이브 화면을 통합한 v5.0.0을 확정했다.
+- **한 줄 요약:** 위치·분류·팔 집기 안정화와 waypoint 통과 판정을 보강하고, 실제 경기에서 150초 주차장 도달까지 확인한 v5.1.0을 확정했다.
 
 ---
 
@@ -150,13 +150,41 @@
 - [x] IMU yaw 무감쇠 적분, 펄스 제자리 회전, 150초 직선 주차, 단일 벽 경계 모델, 팔 주행 대기 자세와 8080 프레임 폴링 화면을 v5.0.0으로 통합 — `@AI` (2026-07-21 완료)
 - [ ] 실제 경기 실행 중 `http://127.0.0.1:8080/health`가 `ok`이고 합성 화면이 연속 갱신되는지 확인 — `@insik`
 - [ ] PICK 후 첫 레인 진입점 도착 시 브레이크·정지·다음 구간 heading 정렬을 추가해 연속 과주행을 방지 — `@AI`
-- [ ] 150초에 `(1.5,1.5)` 직선 이동→원점 heading 정렬→`(1.8,1.8)` 후진 주차가 실제 경기장에서 완료되는지 검증 — `@insik`
+- [x] 150초에 `(1.5,1.5)` 직선 이동→원점 heading 정렬→`(1.8,1.8)` 후진 주차가 실제 경기장에서 완료되는지 검증 — `@insik` (2026-07-22 완료)
+- [ ] 일반 레인과 마지막 stand-off에서 `LANE WAYPOINT/FINAL PASSED` 및 15cm 초과 `MISSED -> REPLAN`이 과주행 없이 동작하는지 실주행 검증 — `@insik`
 
 ---
 
 ## 5. 변경 이력 (Changelog) — ⛔ 삭제 금지 / 최신 항목이 맨 위
 
 <!-- 새 엔트리는 바로 이 줄 아래에 추가하세요. 기존 엔트리는 건드리지 마세요. -->
+
+### `v5.1.0` — 2026-07-22 05:44 (KST) · 작업자: `@AI` · ID: `2026-07-22-01`
+- **변경 요약:** 위치·분류·팔 집기와 레인 waypoint 도착 판정을 안정화하고, 150초 주차장 도달을 실제 경기에서 확인했다.
+- **상세:**
+  - landmark 위치 보정에 초당 0.20m slew limit와 0.10초 dt 상한을 적용해 정지 물체 기반 pose가 한 프레임에 크게 점프하지 않도록 했고, IMU gyro deadband를 0.005rad/s로 낮춰 느린 실제 회전을 heading에 반영했다.
+  - object-flow의 3프레임 velocity medoid와 속도/dt 제한을 설정으로 추가하되, 현재 경기 설정은 필터와 상한을 모두 꺼 v5.0.0 병진 반영 방식으로 운용하도록 했다.
+  - `fruit_photo_cube` sticky 분류를 해제해 후속 shape 관측으로 라벨을 복구할 수 있게 하고, ALIGN에서 동일 비목표 body 라벨이 새 프레임 5개 연속일 때만 제외하도록 변경했다.
+  - world track이 순간 소실돼도 CLASSIFY 진입 후 0.60초 이내의 정렬된 body 목표를 PICK 후보로 사용할 수 있게 해 근거리 목표 누락을 줄였다.
+  - 팔 이동 시간을 실제 각도 변화와 60deg/s 기준으로 자동 연장하고 PICK 자세에서 열린 그리퍼를 0.25초 정착시킨 뒤 닫도록 했으며, 베이스 잠금 시간을 11초로 늘렸다.
+  - 오프닝 이동·정지 시간을 현재 실측값으로 갱신하고, Z1 앵커 진입 전 x축을 ALIGN 검증값의 무부스트 횡이동 펄스로 맞춘 뒤 y축 직진을 수행하도록 했다.
+  - 일반 레인 waypoint는 12cm 반경 도착 또는 목표선 통과와 횡오차 15cm 이하를 완료로 처리하고 즉시 정지하며, 15cm 밖에서 통과하면 정지 후 현재 pose에서 경로를 재계획하도록 했다.
+  - 마지막 stand-off waypoint의 통과 판정을 APPROACH 브레이크·정지·heading 정렬·ALIGN 흐름에 연결해 지난 waypoint를 계속 추적하며 물체나 벽을 미는 동작을 방지했다.
+  - 사용자가 메인 경기 실주행에서 150초 이후 중간점 이동, 원점 heading 정렬과 후진 주차를 거쳐 주차장까지 도달하는 것을 확인했다.
+  - 변경 핵심 테스트 24개와 `robot_planning`·`robot_bringup` 빌드를 통과했으며, 패키지 전체 기능 테스트에서는 143개가 통과하고 기존 누적 flake8/pep257 경고 2개만 남았다.
+- **변경 파일:**
+  - `PROJECT_LOG.md` / 수정
+  - `ros2_ws/src/robot_bringup/config/{local_anchor_test,motion_tuning,perception,test_field}.yaml` / 수정
+  - `ros2_ws/src/robot_control/robot_control/nodes/{base_controller_node,pick_sequencer_node}.py` / 수정
+  - `ros2_ws/src/robot_control/test/test_base_controller_deadband.py` / 수정
+  - `ros2_ws/src/robot_perception/robot_perception/nodes/{localizer_node,world_model_node}.py` / 수정
+  - `ros2_ws/src/robot_perception/test/test_localizer_imu_yaw.py` / 수정
+  - `ros2_ws/src/robot_perception/test/test_world_model_object_flow_filter.py` / 신규
+  - `ros2_ws/src/robot_planning/robot_planning/nodes/mission_fsm_node.py` / 수정
+  - `ros2_ws/src/robot_planning/test/{test_align_heading_control,test_lane_heading_lock,test_zone_anchor_candidates}.py` / 수정
+  - `ros2_ws/src/robot_planning/test/{test_align_distractor_confirmation,test_classify_body_fallback}.py` / 신규
+- **다음 할 일 반영:** 150초 직선 주차 실경기 검증을 완료 처리하고, waypoint 통과·횡오차 초과 재계획의 실주행 확인을 신규 TODO로 추가했다.
+- **버전 근거:** v5.0.0 구조를 유지하면서 위치·분류·팔·오프닝·레인 도착 처리에 새 동작과 테스트를 추가한 하위 호환 기능 릴리스이므로 `MINOR`를 올려 `v5.1.0`으로 정했다.
 
 ### `v5.0.0` — 2026-07-21 23:17 (KST) · 작업자: `@AI` · ID: `2026-07-21-02`
 - **변경 요약:** v4.1.0 이후 누적된 위치 추정·주행·주차·벽 인식·팔 자세·웹 라이브 개선을 메인 경기 v5.0.0으로 통합했다.

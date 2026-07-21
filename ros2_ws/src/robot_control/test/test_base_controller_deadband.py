@@ -1,4 +1,8 @@
-from robot_control.nodes.base_controller_node import below_motion_deadband, select_wheel_scales
+from robot_control.nodes.base_controller_node import (
+    below_motion_deadband,
+    is_precision_strafe_command,
+    select_wheel_scales,
+)
 
 
 def test_low_speed_pure_rotation_reaches_rotation_floor():
@@ -60,3 +64,12 @@ def test_forward_motion_keeps_forward_wheel_scales():
     )
 
     assert scales == [1.0, 0.95, 1.0, 0.95]
+
+
+def test_calibrated_lateral_pulse_uses_precision_profile_in_both_directions():
+    assert is_precision_strafe_command(0.0, 0.315, 0.0, 0.315, 0.005)
+    assert is_precision_strafe_command(0.0, -0.315, 0.0, 0.315, 0.005)
+
+
+def test_other_strafe_speed_does_not_use_precision_profile():
+    assert not is_precision_strafe_command(0.0, 0.20, 0.0, 0.315, 0.005)

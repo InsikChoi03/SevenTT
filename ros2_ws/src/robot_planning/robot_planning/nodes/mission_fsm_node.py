@@ -82,6 +82,85 @@ def _nearest_zone_anchor(
     )
 
 
+def _opening_zone_entry_waypoints(
+    robot_xy: tuple[float, float],
+    anchor_xy: tuple[float, float],
+    axis_tolerance_m: float,
+) -> list[tuple[float, float]]:
+    """Build the post-opening route: correct field x first, then drive along field y."""
+    rx, ry = float(robot_xy[0]), float(robot_xy[1])
+    ax, ay = float(anchor_xy[0]), float(anchor_xy[1])
+    waypoints: list[tuple[float, float]] = []
+    if abs(ax - rx) > max(0.0, float(axis_tolerance_m)):
+        waypoints.append((ax, ry))
+    if not waypoints or math.hypot(ax - waypoints[-1][0], ay - waypoints[-1][1]) > 1e-9:
+        waypoints.append((ax, ay))
+    return waypoints
+
+
+def _opening_anchor_strafe_velocity(
+    field_x_error: float,
+    robot_heading: float,
+    duty: float,
+) -> float:
+    """Return a pure body-left command that reduces field-x error."""
+    body_left_field_x = -math.sin(float(robot_heading))
+    projected_error = float(field_x_error) * body_left_field_x
+    if abs(projected_error) <= 1e-9 or duty <= 0.0:
+        return 0.0
+    return math.copysign(abs(float(duty)), projected_error)
+
+
+def _cardinal_goal_reached_or_passed(
+    start_xy: tuple[float, float],
+    robot_xy: tuple[float, float],
+    goal_xy: tuple[float, float],
+    tolerance_m: float,
+) -> tuple[bool, bool]:
+    """Return (reached, passed) so a cardinal segment cannot drive beyond its goal line."""
+    sx, sy = float(start_xy[0]), float(start_xy[1])
+    rx, ry = float(robot_xy[0]), float(robot_xy[1])
+    gx, gy = float(goal_xy[0]), float(goal_xy[1])
+    if math.hypot(gx - rx, gy - ry) <= max(0.0, float(tolerance_m)):
+        return True, False
+    dx, dy = gx - sx, gy - sy
+    length_sq = dx * dx + dy * dy
+    if length_sq <= 1e-12:
+        return True, False
+    passed = (rx - sx) * dx + (ry - sy) * dy >= length_sq
+    return passed, passed
+
+
+def _cardinal_waypoint_status(
+    start_xy: tuple[float, float],
+    robot_xy: tuple[float, float],
+    goal_xy: tuple[float, float],
+    reach_tolerance_m: float,
+    pass_lateral_tolerance_m: float,
+) -> tuple[bool, bool, float]:
+    """Return (reached, passed, lateral_error) for a cardinal lane waypoint."""
+    sx, sy = float(start_xy[0]), float(start_xy[1])
+    rx, ry = float(robot_xy[0]), float(robot_xy[1])
+    gx, gy = float(goal_xy[0]), float(goal_xy[1])
+    distance = math.hypot(gx - rx, gy - ry)
+    if distance <= max(0.0, float(reach_tolerance_m)):
+        return True, False, 0.0
+
+    dx, dy = gx - sx, gy - sy
+    length = math.hypot(dx, dy)
+    if length <= 1e-9:
+        return True, False, 0.0
+
+    ux, uy = dx / length, dy / length
+    along = (rx - sx) * ux + (ry - sy) * uy
+    lateral_error = abs((rx - sx) * uy - (ry - sy) * ux)
+    passed = along >= length
+    reached = passed and lateral_error <= max(
+        0.0, float(pass_lateral_tolerance_m)
+    )
+    return reached, passed, lateral_error
+
+
 def heading_control_command(
     current_heading: float,
     target_heading: float,
@@ -101,13 +180,26 @@ def heading_control_command(
     return False, omega
 
 
-def yaw_scan_target_heading(origin_heading: float, step: int, scan_angle_rad: float) -> float | None:
-    """Return +scan, -scan, then origin heading targets for a three-step body search."""
-    offsets = (abs(float(scan_angle_rad)), -abs(float(scan_angle_rad)), 0.0)
-    if step < 0 or step >= len(offsets):
-        return None
-    target = float(origin_heading) + offsets[step]
-    return math.atan2(math.sin(target), math.cos(target))
+def align_heading_error(
+    target_x: float,
+    target_y: float,
+    grab_y: float,
+) -> float:
+    """Heading change that puts a target on the straight line through ``grab_y``.
+
+    A subsequent forward-only move preserves lateral ``y``.  Therefore the facing target is not
+    the final grab-point bearing; it is the bearing whose lateral component at the current range
+    equals ``grab_y``.
+    """
+    radius = math.hypot(float(target_x), float(target_y))
+    if radius <= 1e-9:
+        return 0.0
+    desired_bearing = math.asin(max(-1.0, min(1.0, float(grab_y) / radius)))
+    observed_bearing = math.atan2(float(target_y), float(target_x))
+    return math.atan2(
+        math.sin(observed_bearing - desired_bearing),
+        math.cos(observed_bearing - desired_bearing),
+    )
 
 
 def circular_heading_filter(previous: float | None, raw_heading: float, alpha: float) -> float:
@@ -359,10 +451,10 @@ class MissionFsmNode(Node):
         self.declare_parameter("approach_dist_m", 0.525)
         self.declare_parameter("align_settle_sec", 1.0)
         self.declare_parameter("classify_timeout_sec", 2.0)
-        # ALIGN visual servo: drive the mecanum base so the target lands on the arm's fixed grab
-        # point (base_link m, measured 2026-07-04: 26.4cm fwd / 0.7cm left). SAFETY: never advance
-        # the target past grab_min_x — the body cam blind-limit (~25cm) is only ~1cm nearer, so an
-        # overshoot loses sight of the object right before the grab.
+        self.declare_parameter("classify_body_max_age_sec", 0.60)
+        # ALIGN visual servo: face the Wide/latched target first, then use forward/back pulses only
+        # so the target lands on the arm's fixed grab point.  Body refines the same target when it
+        # becomes visible; no lateral translation or blind +/-10deg body search is used.
         self.declare_parameter("grab_x", 0.264)
         self.declare_parameter("grab_y", 0.007)
         self.declare_parameter("grab_min_x", 0.255)     # never push the target closer than this
@@ -375,6 +467,7 @@ class MissionFsmNode(Node):
         self.declare_parameter("align_vmin", 0.13)
         self.declare_parameter("align_timeout_sec", 12.0)
         self.declare_parameter("max_align_fails", 3)   # consecutive ALIGN timeouts on an object -> blacklist it
+        self.declare_parameter("align_distractor_confirm_frames", 5)
         # Pulse+settle: the heavy base coasts after a command, so instead of a continuous servo we
         # nudge briefly, let it FULLY STOP (inertia dissipates), then measure the settled position
         # and grab if within tolerance (gripper opening absorbs the residual). Repeat otherwise.
@@ -386,12 +479,10 @@ class MissionFsmNode(Node):
         # duty/sec per direction (strafe needs ~1.7x duty & 1.5x time = higher lateral stiction):
         self.declare_parameter("align_step_fwd_duty", 0.18)     # fwd/back: 0.18/0.20s -> ~1.5-2 cm
         self.declare_parameter("align_step_fwd_sec", 0.15)
-        self.declare_parameter("align_step_strafe_duty", 0.30)  # strafe: 0.30/0.30s -> ~2.5 cm (yaw ~0)
-        self.declare_parameter("align_step_strafe_sec", 0.1575)
+        self.declare_parameter("align_heading_tolerance_rad", math.radians(3.0))
         self.declare_parameter("align_adaptive_steps_enabled", False)
         self.declare_parameter("align_mid_error_m", 0.06)
         self.declare_parameter("align_step_fwd_mid_sec", 0.24)
-        self.declare_parameter("align_step_strafe_mid_sec", 0.28)
         # If the target remains in the wide/world map but drops out of the body cam at ALIGN,
         # back up once so the body cam can reacquire it instead of waiting stationary for timeout.
         self.declare_parameter("align_body_lost_backoff_enabled", True)
@@ -402,12 +493,6 @@ class MissionFsmNode(Node):
         self.declare_parameter("align_body_lost_same_slot_retries", 1)
         self.declare_parameter("align_retry_heading_tol_rad", 0.10)
         self.declare_parameter("align_retry_heading_timeout_sec", 2.0)
-        self.declare_parameter("align_body_lost_yaw_scan_enabled", False)
-        self.declare_parameter("align_body_lost_yaw_scan_deg", 10.0)
-        self.declare_parameter("align_body_lost_yaw_scan_omega", 0.10)
-        self.declare_parameter("align_body_lost_yaw_scan_tolerance_rad", 0.0524)
-        self.declare_parameter("align_body_lost_yaw_scan_settle_sec", 0.35)
-        self.declare_parameter("align_body_lost_yaw_scan_max_attempts", 1)
         self.declare_parameter("pick_duration_sec", 3.0)
         self.declare_parameter("storage_x", 0.2)
         self.declare_parameter("storage_y", 0.2)
@@ -462,6 +547,10 @@ class MissionFsmNode(Node):
         self.declare_parameter("opening_wall_position_tolerance_m", 0.04)
         self.declare_parameter("opening_wall_position_min_confidence", 0.90)
         self.declare_parameter("opening_position_stable_frames", 3)
+        self.declare_parameter("opening_anchor_strafe_duty", 0.315)
+        self.declare_parameter("opening_anchor_strafe_pulse_sec", 0.30)
+        self.declare_parameter("opening_anchor_strafe_settle_sec", 0.60)
+        self.declare_parameter("opening_anchor_strafe_max_pulses", 8)
         # SCAN search: the start pose likely sees nothing, so after the opening the robot turns slowly
         # CLOCKWISE in place to sweep for objects. Negative omega = CW (REP-103 +z is up). The actual
         # turn speed is set by base_controller wheel_min_rot (this just needs to be non-zero CW).
@@ -641,6 +730,9 @@ class MissionFsmNode(Node):
         self.approach_dist_m = float(self.get_parameter("approach_dist_m").value)
         self.align_settle_sec = float(self.get_parameter("align_settle_sec").value)
         self.classify_timeout_sec = float(self.get_parameter("classify_timeout_sec").value)
+        self.classify_body_max_age_sec = max(
+            0.0, float(self.get_parameter("classify_body_max_age_sec").value)
+        )
         self.grab_x = float(self.get_parameter("grab_x").value)
         self.grab_y = float(self.get_parameter("grab_y").value)
         self.grab_min_x = float(self.get_parameter("grab_min_x").value)
@@ -651,17 +743,23 @@ class MissionFsmNode(Node):
         self.align_vmin = float(self.get_parameter("align_vmin").value)
         self.align_timeout_sec = float(self.get_parameter("align_timeout_sec").value)
         self.max_align_fails = int(self.get_parameter("max_align_fails").value)
+        self.align_distractor_confirm_frames = max(
+            1, int(self.get_parameter("align_distractor_confirm_frames").value)
+        )
         self._align_fail_count = 0
+        self._align_distractor_label = ""
+        self._align_distractor_count = 0
+        self._align_distractor_last_seq = -1
         self.align_pulse_sec = float(self.get_parameter("align_pulse_sec").value)
         self.align_settle_pulse_sec = float(self.get_parameter("align_settle_pulse_sec").value)
         self.align_step_fwd_duty = float(self.get_parameter("align_step_fwd_duty").value)
         self.align_step_fwd_sec = float(self.get_parameter("align_step_fwd_sec").value)
-        self.align_step_strafe_duty = float(self.get_parameter("align_step_strafe_duty").value)
-        self.align_step_strafe_sec = float(self.get_parameter("align_step_strafe_sec").value)
+        self.align_heading_tolerance_rad = max(
+            0.0, float(self.get_parameter("align_heading_tolerance_rad").value)
+        )
         self.align_adaptive_steps_enabled = bool(self.get_parameter("align_adaptive_steps_enabled").value)
         self.align_mid_error_m = float(self.get_parameter("align_mid_error_m").value)
         self.align_step_fwd_mid_sec = float(self.get_parameter("align_step_fwd_mid_sec").value)
-        self.align_step_strafe_mid_sec = float(self.get_parameter("align_step_strafe_mid_sec").value)
         self.align_body_lost_backoff_enabled = bool(self.get_parameter("align_body_lost_backoff_enabled").value)
         self.align_body_lost_backoff_speed = float(self.get_parameter("align_body_lost_backoff_speed").value)
         self.align_body_lost_backoff_sec = float(self.get_parameter("align_body_lost_backoff_sec").value)
@@ -680,37 +778,13 @@ class MissionFsmNode(Node):
         self.align_retry_heading_timeout_sec = float(
             self.get_parameter("align_retry_heading_timeout_sec").value
         )
-        self.align_body_lost_yaw_scan_enabled = bool(
-            self.get_parameter("align_body_lost_yaw_scan_enabled").value
-        )
-        self.align_body_lost_yaw_scan_deg = float(
-            self.get_parameter("align_body_lost_yaw_scan_deg").value
-        )
-        self.align_body_lost_yaw_scan_omega = float(
-            self.get_parameter("align_body_lost_yaw_scan_omega").value
-        )
-        self.align_body_lost_yaw_scan_tolerance_rad = max(
-            0.0,
-            float(self.get_parameter("align_body_lost_yaw_scan_tolerance_rad").value),
-        )
-        self.align_body_lost_yaw_scan_settle_sec = float(
-            self.get_parameter("align_body_lost_yaw_scan_settle_sec").value
-        )
-        self.align_body_lost_yaw_scan_max_attempts = int(
-            self.get_parameter("align_body_lost_yaw_scan_max_attempts").value
-        )
-        self._align_phase = "measure"      # measure -> pulse/body_lost_backoff -> settle/SELECT -> measure ...
+        self._align_phase = "measure"      # measure -> face/pulse/backoff -> settle -> measure
         self._align_phase_start = 0.0
         self._pulse_vx = 0.0
-        self._pulse_vy = 0.0
         self._pulse_sec = self.align_step_fwd_sec   # duration of the current unit step (per direction)
         self._slot_body_lost_retry_counts: dict[int, int] = {}
-        self._slot_yaw_scan_counts: dict[int, int] = {}
-        self._target_yaw_scan_counts: dict[int, int] = {}
         self._slot_missing_track_counts: dict[int, int] = {}
-        self._yaw_scan_step = 0
-        self._yaw_scan_origin_heading: float | None = None
-        self._yaw_scan_target_heading: float | None = None
+        self._align_heading_target: float | None = None
         self._require_precise_heading_before_align = False
         self._precise_heading_retry_start_s: float | None = None
         # Body-cam ground homography for POSE-INDEPENDENT servo: project the object's body pixel
@@ -836,6 +910,18 @@ class MissionFsmNode(Node):
         )
         self.opening_position_stable_frames = max(
             1, int(self.get_parameter("opening_position_stable_frames").value)
+        )
+        self.opening_anchor_strafe_duty = max(
+            0.0, float(self.get_parameter("opening_anchor_strafe_duty").value)
+        )
+        self.opening_anchor_strafe_pulse_sec = max(
+            0.03, float(self.get_parameter("opening_anchor_strafe_pulse_sec").value)
+        )
+        self.opening_anchor_strafe_settle_sec = max(
+            0.0, float(self.get_parameter("opening_anchor_strafe_settle_sec").value)
+        )
+        self.opening_anchor_strafe_max_pulses = max(
+            1, int(self.get_parameter("opening_anchor_strafe_max_pulses").value)
         )
         self.scan_search_omega = float(self.get_parameter("scan_search_omega").value)
         self.direct_nav_speed = float(self.get_parameter("direct_nav_speed").value)
@@ -1075,6 +1161,15 @@ class MissionFsmNode(Node):
         self._zone_anchor_reached_idx: int | None = None
         self._zone_entry_anchor_idx: int | None = None
         self._zone_entry_anchor: tuple[float, float] | None = None
+        self._opening_zone_entry_pending = self.opening_enabled
+        self._opening_zone_entry_path: list[tuple[float, float]] | None = None
+        self._opening_zone_entry_start: tuple[float, float] | None = None
+        self._opening_zone_entry_idx = 0
+        self._opening_zone_entry_generation = 0
+        self._opening_anchor_strafe_phase = "align"
+        self._opening_anchor_strafe_phase_start_s = 0.0
+        self._opening_anchor_strafe_pulses = 0
+        self._opening_anchor_strafe_vy = 0.0
         self._zone_stabilize_start_s = 0.0
         self._zone_stabilized_after_s = 0.0
 
@@ -1095,6 +1190,7 @@ class MissionFsmNode(Node):
         self.declare_parameter("direct_fallback_enabled", False)  # false holds if no lane route exists
         self.declare_parameter("start_connect_k", 4)
         self.declare_parameter("wp_reach_tol_m", 0.12)          # advance to next via within this
+        self.declare_parameter("lane_pass_lateral_tol_m", 0.15)
         self.declare_parameter("replan_period_sec", 1.5)
         self.declare_parameter("periodic_replan_enabled", False)
         self.declare_parameter("replan_goal_move_m", 0.15)      # replan if the destination drifts
@@ -1111,6 +1207,9 @@ class MissionFsmNode(Node):
         self.planner_enabled = bool(self.get_parameter("planner_enabled").value)
         fb = [float(v) for v in self.get_parameter("field_bounds_m").value]
         self.wp_reach_tol_m = float(self.get_parameter("wp_reach_tol_m").value)
+        self.lane_pass_lateral_tol_m = max(
+            0.0, float(self.get_parameter("lane_pass_lateral_tol_m").value)
+        )
         self.replan_period_sec = float(self.get_parameter("replan_period_sec").value)
         self.periodic_replan_enabled = bool(
             self.get_parameter("periodic_replan_enabled").value
@@ -1430,6 +1529,14 @@ class MissionFsmNode(Node):
         self._opening_wall_heading_valid = False
         self._wall_translation_unlocked = False
         self._world_mapping_enabled = not self.opening_enabled
+        self._opening_zone_entry_pending = self.opening_enabled
+        self._opening_zone_entry_path = None
+        self._opening_zone_entry_start = None
+        self._opening_zone_entry_idx = 0
+        self._opening_anchor_strafe_phase = "align"
+        self._opening_anchor_strafe_phase_start_s = 0.0
+        self._opening_anchor_strafe_pulses = 0
+        self._opening_anchor_strafe_vy = 0.0
         self._plan = None
         self._plan_start_xy = None
         self._post_pick_lane_entry_pending = False
@@ -1541,9 +1648,9 @@ class MissionFsmNode(Node):
             self._reset_pulsed_heading()
         if new_state == "ALIGN":
             self._align_phase = "measure"       # start each ALIGN by measuring the settled position
-            self._yaw_scan_step = 0
-            self._yaw_scan_origin_heading = None
-            self._yaw_scan_target_heading = None
+            self._align_heading_target = None
+            self._reset_pulsed_heading()
+            self._reset_align_distractor_confirmation()
             if self._current_anchor_slot() is not None:
                 self._reset_anchor_body_confirmation(clear_latched=True)
         if new_state == "APPROACH":
@@ -2653,93 +2760,6 @@ class MissionFsmNode(Node):
         self._precise_heading_retry_start_s = self._now_s()
         return True
 
-    def _body_lost_yaw_scan_allowed(self) -> bool:
-        slot = self._current_slot()
-        if (not self.align_body_lost_yaw_scan_enabled
-                or self.align_body_lost_yaw_scan_max_attempts <= 0):
-            return False
-        anchor_slot = self._current_anchor_slot()
-        if self._relative_mode() and anchor_slot is not None:
-            target_id = int(self.current_target.id) if self.current_target is not None else 0
-            if self._target_yaw_scan_counts.get(target_id, 0) >= self.align_body_lost_yaw_scan_max_attempts:
-                return False
-            point = self._relative_slot_point(anchor_slot)
-            return bool(
-                point is not None
-                and math.hypot(point[0], point[1]) <= self.approach_dist_m + 0.25
-                and self._align_target_still_in_world()
-            )
-        robot_xy = self._robot_xy()
-        if robot_xy is None:
-            return False
-        if self._set2_slot_mode() and slot is not None:
-            if self._slot_yaw_scan_counts.get(slot.slot_id, 0) >= self.align_body_lost_yaw_scan_max_attempts:
-                return False
-            if (self.set2_slot_retry_enabled
-                    and self._slot_body_lost_retry_counts.get(slot.slot_id, 0)
-                    >= self.align_body_lost_same_slot_retries):
-                return False
-            if slot.distance_to(robot_xy[0], robot_xy[1]) > self.approach_dist_m + 0.25:
-                return False
-            return self._align_target_still_in_world()
-
-        if self.current_target is None:
-            return False
-        if self._target_yaw_scan_counts.get(int(self.current_target.id), 0) >= self.align_body_lost_yaw_scan_max_attempts:
-            return False
-        if not self._align_target_still_in_world() or self.current_target is None:
-            return False
-        dx = float(self.current_target.x) - robot_xy[0]
-        dy = float(self.current_target.y) - robot_xy[1]
-        return math.hypot(dx, dy) <= self.approach_dist_m + 0.25
-
-    def _start_body_lost_yaw_scan(self) -> bool:
-        if not self._body_lost_yaw_scan_allowed():
-            return False
-        if self.world is None:
-            return False
-        omega = abs(self.align_body_lost_yaw_scan_omega)
-        if omega <= 1e-6:
-            return False
-        slot = self._current_slot()
-        if self._set2_slot_mode() and slot is not None:
-            self._slot_yaw_scan_counts[slot.slot_id] = self._slot_yaw_scan_counts.get(slot.slot_id, 0) + 1
-            self._decide(f"SLOT YAW SCAN F{slot.slot_id}")
-            self.get_logger().info(
-                f"Set2 slot F{slot.slot_id}: body lost -> yaw scan "
-                f"+/-{self.align_body_lost_yaw_scan_deg:.1f}deg"
-            )
-        else:
-            if self.current_target is None:
-                return False
-            target_id = int(self.current_target.id)
-            self._target_yaw_scan_counts[target_id] = self._target_yaw_scan_counts.get(target_id, 0) + 1
-            self._decide(f"TARGET YAW SCAN #{target_id}")
-            self.get_logger().info(
-                f"Target id={target_id} '{self.current_target.class_label}': body lost -> yaw scan "
-                f"+/-{self.align_body_lost_yaw_scan_deg:.1f}deg"
-            )
-        self._yaw_scan_origin_heading = float(self.world.robot_theta)
-        self._yaw_scan_target_heading = None
-        self._yaw_scan_step = 0
-        return self._start_next_yaw_scan_turn()
-
-    def _start_next_yaw_scan_turn(self) -> bool:
-        if self._yaw_scan_origin_heading is None:
-            return False
-        target = yaw_scan_target_heading(
-            self._yaw_scan_origin_heading,
-            self._yaw_scan_step,
-            math.radians(abs(self.align_body_lost_yaw_scan_deg)),
-        )
-        if target is None:
-            return False
-        self._yaw_scan_target_heading = target
-        self._yaw_scan_step += 1
-        self._align_phase = "body_lost_yaw_scan_turn"
-        self._align_phase_start = self._now_s()
-        return True
-
     def _ready_for_precise_align_retry(self, bearing: float) -> bool:
         if not self._require_precise_heading_before_align or self.world is None:
             return True
@@ -3103,6 +3123,32 @@ class MissionFsmNode(Node):
                 best = (str(label), bx, by, float(confidence))
         return best
 
+    def _fresh_body_set1_pick_candidate(self) -> tuple[str, float, float, float] | None:
+        """Return a fresh, spatially aligned Body confirmation for the latched Set1 target."""
+        if (
+            self._opportunistic_set2_active
+            or self.phase != 1
+            or self.current_target is None
+            or int(self.current_target.set_type) != 1
+            or str(self.current_target.class_label) != self.set1_label
+            or self._body_dets_stamp_s < self.state_enter_s
+            or self._now_s() - self._body_dets_stamp_s > self.classify_body_max_age_sec
+        ):
+            return None
+        body_target = self._body_target_base(self.set1_label)
+        if body_target is None:
+            return None
+        label, bx, by, confidence = body_target
+        ex, ey = bx - self.grab_x, by - self.grab_y
+        if (
+            label != self.set1_label
+            or confidence < max(self.pick_track_conf, self.conf_threshold)
+            or abs(ex) >= self.align_fwd_tol
+            or abs(ey) >= self.align_tol
+        ):
+            return None
+        return label, confidence, ex, ey
+
     def _body_nearest_any(self) -> tuple[str, float, float] | None:
         """Nearest body detection of ANY label to the grab point -> (label, bx, by). Lets ALIGN spot
         a DISTRACTOR (e.g. a cube) sitting where the target was expected and skip that spot fast."""
@@ -3123,6 +3169,29 @@ class MissionFsmNode(Node):
                 bestd = d
                 best = (label, bx, by)
         return best
+
+    def _reset_align_distractor_confirmation(self) -> None:
+        self._align_distractor_label = ""
+        self._align_distractor_count = 0
+        self._align_distractor_last_seq = int(self._body_dets_seq)
+
+    def _update_align_distractor_confirmation(self, label: str | None) -> tuple[int, bool]:
+        """Count one matching distractor per fresh Body frame."""
+        seq = int(self._body_dets_seq)
+        if seq == self._align_distractor_last_seq:
+            return self._align_distractor_count, False
+        self._align_distractor_last_seq = seq
+
+        label = str(label or "")
+        if not label:
+            self._align_distractor_label = ""
+            self._align_distractor_count = 0
+        elif label == self._align_distractor_label:
+            self._align_distractor_count += 1
+        else:
+            self._align_distractor_label = label
+            self._align_distractor_count = 1
+        return self._align_distractor_count, True
 
     def _body_set1_distractor_in_front(self) -> tuple[str, float, float] | None:
         """Set2 slot guard: any Set1 body detection in the near front view means the slot is wrong."""
@@ -3170,6 +3239,39 @@ class MissionFsmNode(Node):
             return True
         ref = (float(self.current_target.x), float(self.current_target.y))
         return self._current_object_for_approach(ref_xy=ref) is not None
+
+    def _wide_align_target_base(self) -> tuple[float, float] | None:
+        """Return the latched Wide/slot target in current ``base_link`` coordinates."""
+        anchor_slot = self._current_anchor_slot()
+        if self._relative_mode() and anchor_slot is not None:
+            point = self._relative_slot_point(anchor_slot)
+            if point is not None:
+                return float(point[0]), float(point[1])
+
+        if self.current_target is not None and self.world is not None:
+            fresh = self._lookup_object(int(self.current_target.id))
+            if fresh is not None and not fresh.blacklisted:
+                self.current_target = fresh
+            point = self._to_base(float(self.current_target.x), float(self.current_target.y))
+            if point is not None:
+                return float(point[0]), float(point[1])
+
+        slot = self._current_slot()
+        if slot is not None:
+            point = self._to_base(float(slot.x), float(slot.y))
+            if point is not None:
+                return float(point[0]), float(point[1])
+
+        if anchor_slot is not None:
+            point = self._to_base(float(anchor_slot.x), float(anchor_slot.y))
+            if point is not None:
+                return float(point[0]), float(point[1])
+
+        if self._appr_tgt_xy is not None:
+            point = self._to_base(float(self._appr_tgt_xy[0]), float(self._appr_tgt_xy[1]))
+            if point is not None:
+                return float(point[0]), float(point[1])
+        return None
 
     def _drive(self, vx: float, vy: float, omega: float = 0.0) -> None:
         now = self._now_s()
@@ -3460,6 +3562,7 @@ class MissionFsmNode(Node):
         *,
         force_initial_align: bool = False,
         forward_only: bool = False,
+        stop_radius_m: float | None = None,
     ) -> bool:
         """Face a cardinal lane leg in place, then follow it without lateral translation."""
         if not self.lane_heading_lock_enabled or self.world is None:
@@ -3491,7 +3594,12 @@ class MissionFsmNode(Node):
                     f"LANE ENTRY PULSE ALIGN error={math.degrees(error):+.1f}deg"
                 )
 
-        if self._distance_to(dest[0], dest[1]) <= self.direct_nav_stop_radius_m:
+        stop_radius = (
+            self.direct_nav_stop_radius_m
+            if stop_radius_m is None
+            else max(0.0, float(stop_radius_m))
+        )
+        if self._distance_to(dest[0], dest[1]) <= stop_radius:
             self._drive(0.0, 0.0, 0.0)
             return True
 
@@ -3639,6 +3747,172 @@ class MissionFsmNode(Node):
     def _clear_zone_entry_anchor(self) -> None:
         self._zone_entry_anchor_idx = None
         self._zone_entry_anchor = None
+
+    def _reset_opening_anchor_strafe(self) -> None:
+        self._opening_anchor_strafe_phase = "align"
+        self._opening_anchor_strafe_phase_start_s = 0.0
+        self._opening_anchor_strafe_pulses = 0
+        self._opening_anchor_strafe_vy = 0.0
+        self._reset_pulsed_heading()
+
+    def _step_opening_anchor_x_strafe(
+        self,
+        goal_x: float,
+        anchor: tuple[float, float],
+    ) -> bool:
+        """Align with the anchor's y leg, then pulse sideways until field x matches."""
+        if self.world is None:
+            self._drive(0.0, 0.0, 0.0)
+            return False
+        x_error = float(goal_x) - float(self.world.robot_x)
+        if abs(x_error) <= self.lane_heading_axis_tolerance_m:
+            self._drive(0.0, 0.0, 0.0)
+            self._reset_opening_anchor_strafe()
+            return True
+
+        dy = float(anchor[1]) - float(self.world.robot_y)
+        target_heading = math.pi / 2.0 if dy >= 0.0 else -math.pi / 2.0
+        heading_error = self._wrap_pi(target_heading - float(self.world.robot_theta))
+        phase = self._opening_anchor_strafe_phase
+        now = self._now_s()
+
+        if phase not in {"align", "heading_settle"} and abs(heading_error) > self.lane_heading_align_tolerance_rad:
+            self._opening_anchor_strafe_phase = "align"
+            self._opening_anchor_strafe_phase_start_s = 0.0
+            self._reset_pulsed_heading()
+            phase = "align"
+
+        if phase == "align":
+            if self._opening_anchor_strafe_phase_start_s <= 0.0:
+                self._opening_anchor_strafe_phase_start_s = now
+                self._decide(
+                    f"OPENING Z1 STRAFE-X HEADING {math.degrees(target_heading):+.0f}deg"
+                )
+            aligned = self._turn_in_place_pulsed(
+                target_heading,
+                self.lane_heading_align_tolerance_rad,
+                ("opening_anchor_strafe", self._opening_zone_entry_generation),
+                self.lane_heading_omega_max,
+            )
+            if aligned:
+                self._opening_anchor_strafe_phase = "heading_settle"
+                self._opening_anchor_strafe_phase_start_s = now
+            return False
+
+        if phase == "heading_settle":
+            self._drive(0.0, 0.0, 0.0)
+            if now - self._opening_anchor_strafe_phase_start_s >= self.lane_heading_settle_sec:
+                self._opening_anchor_strafe_phase = "ready"
+                self._opening_anchor_strafe_phase_start_s = now
+            return False
+
+        if phase == "pulse":
+            if now - self._opening_anchor_strafe_phase_start_s < self.opening_anchor_strafe_pulse_sec:
+                self._drive(0.0, self._opening_anchor_strafe_vy, 0.0)
+                return False
+            self._drive(0.0, 0.0, 0.0)
+            self._opening_anchor_strafe_phase = "pulse_settle"
+            self._opening_anchor_strafe_phase_start_s = now
+            return False
+
+        if phase == "pulse_settle":
+            self._drive(0.0, 0.0, 0.0)
+            if now - self._opening_anchor_strafe_phase_start_s >= self.opening_anchor_strafe_settle_sec:
+                self._opening_anchor_strafe_phase = "align"
+                self._opening_anchor_strafe_phase_start_s = 0.0
+                self._reset_pulsed_heading()
+            return False
+
+        if self._opening_anchor_strafe_pulses >= self.opening_anchor_strafe_max_pulses:
+            self._drive(0.0, 0.0, 0.0)
+            self.get_logger().error(
+                "opening Z1 x-strafe reached its pulse limit; holding stopped",
+                throttle_duration_sec=2.0,
+            )
+            return False
+
+        vy = _opening_anchor_strafe_velocity(
+            x_error, target_heading, self.opening_anchor_strafe_duty
+        )
+        self._opening_anchor_strafe_pulses += 1
+        self._opening_anchor_strafe_vy = vy
+        self._opening_anchor_strafe_phase = "pulse"
+        self._opening_anchor_strafe_phase_start_s = now
+        self._decide(
+            f"OPENING Z1 STRAFE-X PULSE {self._opening_anchor_strafe_pulses}/"
+            f"{self.opening_anchor_strafe_max_pulses} error={x_error:+.2f}m vy={vy:+.3f}"
+        )
+        self._drive(0.0, vy, 0.0)
+        return False
+
+    def _step_opening_zone_entry(self, anchor: tuple[float, float]) -> bool:
+        """Strafe onto the anchor x coordinate, then drive forward along field y."""
+        robot_xy = self._robot_xy()
+        if robot_xy is None:
+            self._drive(0.0, 0.0, 0.0)
+            return False
+        if self._opening_zone_entry_path is None:
+            self._opening_zone_entry_start = robot_xy
+            self._opening_zone_entry_path = _opening_zone_entry_waypoints(
+                robot_xy, anchor, self.lane_heading_axis_tolerance_m
+            )
+            self._opening_zone_entry_idx = 0
+            self._opening_zone_entry_generation += 1
+            route = " -> ".join(
+                f"({x:.2f},{y:.2f})" for x, y in self._opening_zone_entry_path
+            )
+            self._reset_opening_anchor_strafe()
+            self._decide(f"OPENING Z1 STRAFE-X-THEN-FORWARD-Y ROUTE {route}")
+
+        path = self._opening_zone_entry_path
+        if not path or self._opening_zone_entry_start is None:
+            self._drive(0.0, 0.0, 0.0)
+            return True
+        idx = self._opening_zone_entry_idx
+        if idx >= len(path):
+            self._drive(0.0, 0.0, 0.0)
+            return True
+        start = self._opening_zone_entry_start if idx == 0 else path[idx - 1]
+        goal = path[idx]
+        x_strafe_leg = (
+            idx == 0
+            and len(path) > 1
+            and abs(goal[0] - start[0]) > self.lane_heading_axis_tolerance_m
+            and abs(goal[1] - start[1]) <= self.lane_heading_axis_tolerance_m
+        )
+        if x_strafe_leg:
+            if self._step_opening_anchor_x_strafe(goal[0], anchor):
+                self._decide(f"OPENING Z1 STRAFE-X REACHED x={goal[0]:+.2f}")
+                self._opening_zone_entry_idx += 1
+                self._lane_heading_segment_key = None
+                self._lane_heading_phase = "align"
+            return False
+        tolerance = (
+            self.zone_center_reach_tol_m
+            if idx == len(path) - 1
+            else self.lane_heading_axis_tolerance_m
+        )
+        reached, passed = _cardinal_goal_reached_or_passed(start, robot_xy, goal, tolerance)
+        if reached:
+            self._drive(0.0, 0.0, 0.0)
+            label = "PASSED" if passed else "REACHED"
+            self._decide(f"OPENING Z1 LEG {idx + 1}/{len(path)} {label}")
+            self._opening_zone_entry_idx += 1
+            self._lane_heading_segment_key = None
+            self._lane_heading_phase = "align"
+            return self._opening_zone_entry_idx >= len(path)
+
+        segment_key = (-self._opening_zone_entry_generation, idx)
+        handled = self._drive_cardinal_lane_segment(
+            start, goal, segment_key, stop_radius_m=0.0
+        )
+        if not handled:
+            self._drive(0.0, 0.0, 0.0)
+            self.get_logger().error(
+                "post-opening Z1 entry produced a non-cardinal segment",
+                throttle_duration_sec=2.0,
+            )
+        return False
 
     def _zone_entry_anchor_point(self) -> tuple[float, float] | None:
         """Latch the closest candidate once when the active zone is entered."""
@@ -3833,18 +4107,19 @@ class MissionFsmNode(Node):
         yaw: float = 0.0,
         exclude_id: int = 0,
         route_mode: str = "grid_only",
-    ) -> None:
-        """Route to (dest_x,dest_y) and directly command the active lane waypoint each tick."""
+    ) -> bool:
+        """Drive the active lane route and report when its final waypoint is reached."""
         dest = (float(dest_x), float(dest_y))
         obstacles = self._obstacles_snapshot(exclude_id, dest)
         self._publish_planning_obstacles(obstacles)
         if not self.planner_enabled:
             self._drive_toward_direct(dest_x, dest_y, yaw)
-            return
+            distance = self._distance_to(dest_x, dest_y)
+            return distance is not None and distance <= self.wp_reach_tol_m
         rxy = self._robot_xy()
         if rxy is None:
             self._drive(0.0, 0.0, 0.0)
-            return
+            return False
         now = self._now_s()
         drifted = (self._plan_dest is None
                    or math.hypot(dest[0] - self._plan_dest[0], dest[1] - self._plan_dest[1]) > self.replan_goal_move_m)
@@ -3904,20 +4179,60 @@ class MissionFsmNode(Node):
                 )
         if not self._plan:                            # safety: never index a None/empty plan
             self._drive(0.0, 0.0, 0.0)
-            return
+            return False
         # advance monotonically past intermediate vias already reached
         while self._plan_idx < len(self._plan) - 1:
             wx, wy = self._plan[self._plan_idx]
             d = self._distance_to(wx, wy)
+            segment_start = (
+                self._plan_start_xy
+                if self._plan_idx == 0
+                else self._plan[self._plan_idx - 1]
+            )
+            reached = d is not None and d <= self.wp_reach_tol_m
+            passed = False
+            lateral_error = 0.0
+            if (
+                rxy is not None
+                and segment_start is not None
+                and cardinal_segment_heading(
+                    segment_start, (wx, wy), self.lane_heading_axis_tolerance_m
+                )
+                is not None
+            ):
+                reached, passed, lateral_error = _cardinal_waypoint_status(
+                    segment_start,
+                    rxy,
+                    (wx, wy),
+                    self.wp_reach_tol_m,
+                    self.lane_pass_lateral_tol_m,
+                )
+            if passed and not reached:
+                self._drive(0.0, 0.0, 0.0)
+                self._decide(
+                    f"LANE WAYPOINT MISSED lateral={lateral_error:.2f}m -> REPLAN"
+                )
+                self._plan = None
+                self._plan_start_xy = None
+                self._lane_heading_segment_key = None
+                self._reset_object_connector_brake()
+                return False
             brake_key = (self._plan_generation, self._plan_idx)
             connector_braking = self._object_connector_brake_key == brake_key
-            if d is not None and (d < self.wp_reach_tol_m or connector_braking):
+            if reached or connector_braking:
                 if (
                     self._object_connector_brake_required(self._plan_idx)
                     and self._step_object_connector_brake(self._plan_idx)
                 ):
-                    return
+                    return False
+                if passed:
+                    self._decide(
+                        f"LANE WAYPOINT PASSED lateral={lateral_error:.2f}m"
+                    )
                 self._plan_idx += 1
+                if passed:
+                    self._drive(0.0, 0.0, 0.0)
+                    return False
             else:
                 break
         wx, wy = self._plan[self._plan_idx]
@@ -3927,7 +4242,7 @@ class MissionFsmNode(Node):
                 self._plan = None
                 self._plan_escape = False
                 self._drive(0.0, 0.0, 0.0)
-                return
+                return False
         last = self._plan_idx == len(self._plan) - 1
         # Intermediate vias keep the current heading target; the final via carries the requested yaw.
         via_yaw = yaw if last else (self.world.robot_theta if self.world is not None else yaw)
@@ -3938,6 +4253,45 @@ class MissionFsmNode(Node):
         )
         segment_key = (self._plan_generation, self._plan_idx)
         post_pick_plan = self._plan_route_mode == "post_pick_entry"
+        final_distance = self._distance_to(wx, wy)
+        final_reached = (
+            final_distance is not None and final_distance <= self.wp_reach_tol_m
+        )
+        final_passed = False
+        final_lateral_error = 0.0
+        if (
+            segment_start is not None
+            and cardinal_segment_heading(
+                segment_start, (wx, wy), self.lane_heading_axis_tolerance_m
+            )
+            is not None
+        ):
+            final_reached, final_passed, final_lateral_error = (
+                _cardinal_waypoint_status(
+                    segment_start,
+                    rxy,
+                    (wx, wy),
+                    self.wp_reach_tol_m,
+                    self.lane_pass_lateral_tol_m,
+                )
+            )
+        if final_passed and not final_reached:
+            self._drive(0.0, 0.0, 0.0)
+            self._decide(
+                f"LANE FINAL MISSED lateral={final_lateral_error:.2f}m -> REPLAN"
+            )
+            self._plan = None
+            self._plan_start_xy = None
+            self._lane_heading_segment_key = None
+            self._reset_object_connector_brake()
+            return False
+        if final_reached:
+            self._drive(0.0, 0.0, 0.0)
+            if final_passed:
+                self._decide(
+                    f"LANE FINAL PASSED lateral={final_lateral_error:.2f}m"
+                )
+            return True
         cardinal_handled = segment_start is not None and self._drive_cardinal_lane_segment(
             segment_start,
             (wx, wy),
@@ -3965,6 +4319,7 @@ class MissionFsmNode(Node):
                     "non-cardinal lane segment blocked in grid-only route",
                     throttle_duration_sec=2.0,
                 )
+        return False
 
     def _publish_pick(self, trigger: bool) -> None:
         self.pub_pick.publish(Bool(data=trigger))
@@ -4933,17 +5288,23 @@ class MissionFsmNode(Node):
                         return
                     zx, zy = entry_anchor
                     d_zone = self._distance_to(zx, zy)
-                    if d_zone is None or d_zone > self.zone_center_reach_tol_m:
+                    anchor_reached = d_zone is not None and d_zone <= self.zone_center_reach_tol_m
+                    if not anchor_reached:
                         self._reset_zone_scan_timer()
-                        th = self.world.robot_theta if self.world is not None else 0.0
-                        self._drive_toward(
-                            zx,
-                            zy,
-                            th,
-                            exclude_id=0,
-                            route_mode=self._next_travel_route_mode(),
-                        )
-                        return
+                        if self._opening_zone_entry_pending and self._zone_idx == 0:
+                            anchor_reached = self._step_opening_zone_entry(entry_anchor)
+                        else:
+                            th = self.world.robot_theta if self.world is not None else 0.0
+                            self._drive_toward(
+                                zx,
+                                zy,
+                                th,
+                                exclude_id=0,
+                                route_mode=self._next_travel_route_mode(),
+                            )
+                        if not anchor_reached:
+                            return
+                    self._opening_zone_entry_pending = False
                     self._zone_anchor_reached_idx = self._zone_idx
                     self._decide(f"ZONE {self._active_zone_id()} ANCHOR REACHED")
                 if not self._zone_is_stabilized():
@@ -5127,13 +5488,19 @@ class MissionFsmNode(Node):
                         return
                 self._enter("ALIGN")
                 return
-            self._drive_toward(
+            route_arrived = self._drive_toward(
                 sx,
                 sy,
                 bearing,
                 exclude_id=exclude,
                 route_mode=self._next_travel_route_mode(),
             )
+            if route_arrived:
+                self._step_approach_arrival(
+                    0.0,
+                    self.align_retry_heading_tol_rad,
+                    self.direct_nav_omega_max,
+                )
 
         elif self.state == "ALIGN":
             self._step_align()
@@ -5434,10 +5801,13 @@ class MissionFsmNode(Node):
                 self._search_t0 = now
 
     def _step_align(self) -> None:
-        """Pulse+settle visual align: nudge the base briefly, let it FULLY STOP (inertia dissipates),
-        then measure the object's body-cam base_link position (pose-independent) and grab if within
-        tolerance (the gripper opening absorbs the residual). Otherwise nudge again. The base is
-        stationary at grab time, so the object won't drift while the arm descends."""
+        """Wide-first stop/turn/forward ALIGN with no mecanum lateral translation.
+
+        Wide or the immutable anchor slot supplies the initial bearing even when the close Body
+        camera cannot see the object.  The local-anchor pulsed heading controller faces that exact
+        bearing, then calibrated forward/back pulses change range.  Once Body sees the target it
+        refines the same geometry; a blind fixed-angle yaw scan is never used.
+        """
         now = self._now_s()
         if self._time_in_state() > self.align_timeout_sec:
             self._drive(0.0, 0.0)
@@ -5465,7 +5835,7 @@ class MissionFsmNode(Node):
 
         if self._align_phase == "pulse":
             if now - self._align_phase_start < self._pulse_sec:  # calibrated per-direction duration
-                self._drive(self._pulse_vx, self._pulse_vy)     # one fixed unit step
+                self._drive(self._pulse_vx, 0.0)                 # forward/back only
             else:
                 self._drive(0.0, 0.0)
                 if self.anchor_mission_enabled and self._current_anchor_slot() is not None:
@@ -5480,22 +5850,20 @@ class MissionFsmNode(Node):
             if now - self._align_phase_start >= self.align_settle_pulse_sec:
                 self._align_phase = "measure"
             return
-        if self._align_phase == "body_lost_yaw_scan_turn":
-            if self._yaw_scan_target_heading is None:
+        if self._align_phase == "face_target":
+            if self._align_heading_target is None or self.world is None:
                 self._drive(0.0, 0.0, 0.0)
                 self._align_phase = "measure"
-            elif self._rotate_to_heading(
-                self._yaw_scan_target_heading,
-                self.align_body_lost_yaw_scan_tolerance_rad,
-                abs(self.align_body_lost_yaw_scan_omega),
+                return
+            if self._turn_in_place_pulsed(
+                self._align_heading_target,
+                self.align_heading_tolerance_rad,
+                ("align_face", round(float(self._align_heading_target), 3)),
+                self.direct_nav_omega_max,
             ):
-                self._align_phase = "body_lost_yaw_scan_settle"
+                self._align_heading_target = None
+                self._align_phase = "settle"
                 self._align_phase_start = now
-            return
-        if self._align_phase == "body_lost_yaw_scan_settle":
-            self._drive(0.0, 0.0)
-            if now - self._align_phase_start >= self.align_body_lost_yaw_scan_settle_sec:
-                self._align_phase = "measure"
             return
         if self._align_phase == "body_lost_backoff":
             if now - self._align_phase_start < self.align_body_lost_backoff_sec:
@@ -5523,21 +5891,15 @@ class MissionFsmNode(Node):
                 self._enter("SELECT_TARGET")
             return
 
-        # measure (base is settled/stationary) — align ONLY to the target label (body-cam truth)
+        # Measure only while stopped. Wide/slot geometry is the acquisition authority; Body becomes
+        # the precision authority after the latched target is visible in its close-range image.
+        wide_point = self._wide_align_target_base()
         candidate = self._body_target_base(self._body_label())
+        body_confirmed = candidate is not None
         if self.anchor_mission_enabled and self._current_anchor_slot() is not None:
-            confirmed = self._anchor_note_body_candidate(candidate)
-            if candidate is None:
-                self._drive(0.0, 0.0, 0.0)
-                if self._anchor_body_missing_count >= self.body_slot_confirm_frames:
-                    self._anchor_start_body_backoff_or_defer(
-                        now,
-                        "current slot absent in Body",
-                    )
-                return
-            if not confirmed:
-                self._drive(0.0, 0.0, 0.0)
-                return
+            body_confirmed = self._anchor_note_body_candidate(candidate)
+            if not body_confirmed:
+                candidate = None
         if candidate is None:
             if self._set2_slot_mode() and self._current_slot() is not None:
                 set1_front = self._body_set1_distractor_in_front()
@@ -5552,9 +5914,19 @@ class MissionFsmNode(Node):
             # is sitting at the grab point, this spot is wrong -> blacklist it and go elsewhere.
             other = self._body_nearest_any()
             if other is not None and other[0] not in self._body_align_labels():
+                distractor_count, fresh_frame = self._update_align_distractor_confirmation(other[0])
                 want = "/".join(sorted(self._body_align_labels()))
+                if fresh_frame:
+                    self.get_logger().info(
+                        f"ALIGN: body sees '{other[0]}' (not '{want}') at grab "
+                        f"{distractor_count}/{self.align_distractor_confirm_frames} frames"
+                    )
+                if distractor_count < self.align_distractor_confirm_frames:
+                    self._drive(0.0, 0.0, 0.0)
+                    return
                 self.get_logger().info(
-                    f"ALIGN: body sees '{other[0]}' (not '{want}') at grab -> skip this spot")
+                    f"ALIGN: body sees '{other[0]}' (not '{want}') at grab for "
+                    f"{distractor_count} consecutive frames -> skip this spot")
                 if self._set2_slot_mode() and self._current_slot() is not None:
                     self._retry_current_slot(f"body distractor {other[0]}")
                     self._align_fail_count = 0
@@ -5566,30 +5938,38 @@ class MissionFsmNode(Node):
                 self._align_fail_count = 0
                 self._enter("SELECT_TARGET")
                 return
-            if self._yaw_scan_step > 0 and self._start_next_yaw_scan_turn():
-                return
-            if self._start_body_lost_yaw_scan():
-                return
-            if self.align_body_lost_backoff_enabled and self._align_target_still_in_world():
-                self.get_logger().info(
-                    "ALIGN: target in world/wide but not body -> back off to reacquire")
-                self._drive(-abs(self.align_body_lost_backoff_speed), 0.0)
-                self._align_phase = "body_lost_backoff"
-                self._align_phase_start = now
-                return
-            # nothing there (or the target just blinked) -> re-settle & re-measure, don't bail.
-            self._drive(0.0, 0.0)
+            self._update_align_distractor_confirmation(None)
+        else:
+            self._update_align_distractor_confirmation(None)
+
+        if candidate is not None:
+            _, obj_x, obj_y, _ = candidate
+        elif wide_point is not None:
+            obj_x, obj_y = wide_point
+        else:
+            self._drive(0.0, 0.0, 0.0)
             self._align_phase = "settle"
             self._align_phase_start = now
             return
-        _, obj_x, obj_y, _ = candidate
-        self._yaw_scan_step = 0
-        self._yaw_scan_origin_heading = None
-        self._yaw_scan_target_heading = None
+
+        heading_error = align_heading_error(obj_x, obj_y, self.grab_y)
+        if abs(heading_error) > self.align_heading_tolerance_rad and self.world is not None:
+            self._align_heading_target = self._wrap_pi(
+                float(self.world.robot_theta) + heading_error
+            )
+            self._reset_pulsed_heading()
+            self._align_phase = "face_target"
+            source = "Body" if candidate is not None else "Wide"
+            self._decide(
+                f"ALIGN {source.upper()} FACE error={math.degrees(heading_error):+.1f}deg"
+            )
+            self._drive(0.0, 0.0, 0.0)
+            return
+
         ex = obj_x - self.grab_x
         ey = obj_y - self.grab_y
         ex_tol = self.align_fwd_tol
-        if abs(ex) < ex_tol and abs(ey) < self.align_tol:       # both axes settled -> grab
+        if candidate is not None and abs(ex) < ex_tol and abs(ey) < self.align_tol:
             self._drive(0.0, 0.0)
             self.get_logger().info(
                 f"ALIGN ok (cam): fwd_err={ex * 100:+.1f}cm lat_err={ey * 100:+.1f}cm -> grab")
@@ -5598,33 +5978,36 @@ class MissionFsmNode(Node):
             self.shape_stamp_s = None
             self._enter("CLASSIFY")
             return
-        # ---- Latch ONE calibrated unit step toward the WORST-out-of-tolerance axis ----
-        # Each pulse is a fixed duty*time that moves a near-constant distance (fwd ~1.5-2 cm, strafe
-        # ~2.5 cm). We attack the axis that is furthest out of its tolerance (normalized), fix the
-        # other next cycle. copysign gives direction: +ex=object too far->forward(+vx); ex<0 (object
-        # too near)->back(-vx). +ey=object to the left->strafe left(+vy). Re-measure after settle.
-        lat_out = abs(ey) - self.align_tol
-        fwd_out = abs(ex) - ex_tol
-        step_lateral = lat_out > 0.0 and (fwd_out <= 0.0 or lat_out >= fwd_out)
-        if step_lateral:
-            vx, vy = 0.0, math.copysign(self.align_step_strafe_duty, ey)
-            if self.align_adaptive_steps_enabled and abs(ey) >= self.align_mid_error_m:
-                self._pulse_sec = self.align_step_strafe_mid_sec
-            else:
-                self._pulse_sec = self.align_step_strafe_sec
+
+        if candidate is None and abs(ex) <= ex_tol:
+            self._drive(0.0, 0.0, 0.0)
+            if (self.anchor_mission_enabled
+                    and self._current_anchor_slot() is not None
+                    and self._anchor_body_missing_count >= self.body_slot_confirm_frames):
+                self._anchor_start_body_backoff_or_defer(now, "current slot absent in Body")
+                return
+            if self.align_body_lost_backoff_enabled and self._align_target_still_in_world():
+                self.get_logger().info(
+                    "ALIGN: Wide is at grab range but Body is absent -> straight backoff")
+                self._align_phase = "body_lost_backoff"
+                self._align_phase_start = now
+                return
+            self._align_phase = "settle"
+            self._align_phase_start = now
+            return
+
+        # Heading is settled. Change only range, preserving the lateral line established above.
+        vx = math.copysign(self.align_step_fwd_duty, ex)
+        if self.align_adaptive_steps_enabled and abs(ex) >= self.align_mid_error_m:
+            self._pulse_sec = self.align_step_fwd_mid_sec
         else:
-            vx, vy = math.copysign(self.align_step_fwd_duty, ex), 0.0
-            if self.align_adaptive_steps_enabled and abs(ex) >= self.align_mid_error_m:
-                self._pulse_sec = self.align_step_fwd_mid_sec
-            else:
-                self._pulse_sec = self.align_step_fwd_sec
-            # Forward safety: never step past the body-cam blind limit. ex<0 still steps back freely.
-            if obj_x <= self.grab_min_x and vx > 0.0:
-                vx = 0.0
-        self._pulse_vx, self._pulse_vy = vx, vy
+            self._pulse_sec = self.align_step_fwd_sec
+        if obj_x <= self.grab_min_x and vx > 0.0:
+            vx = 0.0
+        self._pulse_vx = vx
         self._align_phase = "pulse"
         self._align_phase_start = now
-        self._drive(vx, vy)
+        self._drive(vx, 0.0)
 
     def _step_classify_set2_slot(self) -> None:
         """Classify and pick only the latched Set2 slot; uncertain results are retried."""
@@ -5686,6 +6069,21 @@ class MissionFsmNode(Node):
         """
         if self._set2_slot_mode() and self._current_slot() is not None:
             self._step_classify_set2_slot()
+            return
+        # ALIGN already established that this exact Set1 target was centred at the grab point. Near
+        # grab_x the world-model track can temporarily disappear because its calibrated Body map
+        # workspace starts farther away than the arm's grab point. In that narrow blind band, accept
+        # only a NEW post-ALIGN Body frame that still sees the latched label at the same grab point.
+        # This preserves the spatial safety gate without depending on the decaying world-map track.
+        body_pick = self._fresh_body_set1_pick_candidate()
+        if body_pick is not None:
+            label, confidence, ex, ey = body_pick
+            self._commit_pick(
+                1,
+                label,
+                f"fresh body conf={confidence:.2f} "
+                f"grab_err=({ex*100:+.1f},{ey*100:+.1f})cm",
+            )
             return
         # SPATIAL gate: confirm from the CURRENT TARGET's own world-model track (its fused wide+body
         # identity at THIS track's position), not a frame-global /classification/shape or /siglip

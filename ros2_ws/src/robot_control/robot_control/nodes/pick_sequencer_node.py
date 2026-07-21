@@ -4,11 +4,12 @@ bridge (mcu_bridge_base) forwards it as <ARM,shoulder,wrist,gripper> on ttyUSB0.
 
 Transplanted from the VERIFIED scripts/arm_pick2r.py (fixed-blind 2R grasp; pick confirmed by
 pick_verify). Replaces the old arm_ik / 6-DOF path (arm_controller_node + mcu_bridge_arm), which
-does not match the physical 2R arm. Each step is host-ramped so the main field launch shows the
-same stage order and does not drop the gripper too quickly.
+does not match the physical 2R arm. Arm moves are host-ramped no faster than the firmware can
+follow. The pick pose is then held with the gripper open before the close command is allowed.
 
-    trigger True  -> GRASP: open gripper at stow -> reach to PICK pose (open) -> close -> lift while holding
-                     -> move to PLACE while holding -> open at PLACE -> stow closed.
+    trigger True  -> GRASP: open gripper at stow -> reach to PICK pose (open) -> settle (open)
+                     -> close -> lift while holding -> move to PLACE while holding
+                     -> open at PLACE -> stow closed.
     trigger False -> RELEASE: move to PLACE while holding -> open at PLACE -> stow closed.
 
 The arm boots LIMP and snaps to the first <ARM> it receives, so INIT is published on startup to
@@ -34,6 +35,8 @@ class PickSequencerNode(Node):
         self.declare_parameter("move_sec", 2.5)     # dwell for an arm move (>= firmware smooth time)
         self.declare_parameter("grasp_sec", 0.7)    # dwell for a gripper open/close
         self.declare_parameter("preopen_sec", 0.25)  # open gripper before lowering so it won't snag
+        self.declare_parameter("pick_settle_sec", 0.25)  # hold PICK fully open before closing
+        self.declare_parameter("servo_speed_dps", 60.0)  # conservative firmware speed estimate
         self.declare_parameter("rate_hz", 20.0)
 
         self.init_pose = [float(v) for v in self.get_parameter("init_pose").value]
@@ -47,6 +50,8 @@ class PickSequencerNode(Node):
         self.move_sec = float(self.get_parameter("move_sec").value)
         self.grasp_sec = float(self.get_parameter("grasp_sec").value)
         self.preopen_sec = float(self.get_parameter("preopen_sec").value)
+        self.pick_settle_sec = float(self.get_parameter("pick_settle_sec").value)
+        self.servo_speed_dps = float(self.get_parameter("servo_speed_dps").value)
         rate = float(self.get_parameter("rate_hz").value)
 
         self.pub = self.create_publisher(Float32MultiArray, "/arm2r/target", 10)
@@ -71,7 +76,9 @@ class PickSequencerNode(Node):
         self.get_logger().info(
             f"pick_sequencer(2R) ready: init={self.init_pose} pick={self.pick_sw} "
             f"place={self.place_sw} grip(open={self.grip_open}/closed={self.grip_closed}) "
-            f"move={self.move_sec}s grasp={self.grasp_sec}s preopen={self.preopen_sec}s -> /arm2r/target"
+            f"move>={self.move_sec}s grasp={self.grasp_sec}s preopen={self.preopen_sec}s "
+            f"pick_settle={self.pick_settle_sec}s servo_speed={self.servo_speed_dps}deg/s "
+            "-> /arm2r/target"
         )
 
     def _now_s(self) -> float:
@@ -116,7 +123,8 @@ class PickSequencerNode(Node):
         plsh, plwr = self.place_sw
         self.seq = [
             ("PREOPEN",  self.preopen_sec, (ish, iwr, self.grip_open)),      # open before lowering
-            ("REACH",    self.move_sec,  (psh, pwr, self.grip_open)),      # down to pick pose, open
+            ("REACH",    self.move_sec,  (psh, pwr, self.grip_open)),      # move only shoulder/wrist
+            ("PICK_SETTLE", self.pick_settle_sec, (psh, pwr, self.grip_open)),  # finish, still open
             ("GRASP",    self.grasp_sec, (psh, pwr, self.grip_closed)),    # close (grab)
             ("LIFT",     self.move_sec,  (ish, iwr, self.grip_closed)),    # lift to init, holding
             ("TO_PLACE", self.move_sec,  (plsh, plwr, self.grip_closed)),  # move to place, holding
@@ -143,11 +151,23 @@ class PickSequencerNode(Node):
         self.cum = []
         self.seq_start_poses = []
         step_start_pose = self.current_pose
-        for (_n, d, p) in self.seq:
+        timed_seq: list[tuple[str, float, tuple[float, float, float]]] = []
+        arm_move_steps = {"REACH", "LIFT", "TO_PLACE", "STOW"}
+        for (name, configured_duration, pose) in self.seq:
             self.seq_start_poses.append(step_start_pose)
-            t += d
+            duration = configured_duration
+            if name in arm_move_steps:
+                # The MCU moves each servo by at most MAX_STEP every update. If a YAML override
+                # requests a ramp shorter than that physical travel time, the MCU remains behind
+                # the host target and GRASP can start while the wrist is still descending.
+                travel_deg = max(abs(pose[i] - step_start_pose[i]) for i in range(3))
+                required_duration = travel_deg / max(self.servo_speed_dps, 1e-6)
+                duration = max(configured_duration, required_duration)
+            timed_seq.append((name, duration, pose))
+            t += duration
             self.cum.append(t)
-            step_start_pose = p
+            step_start_pose = pose
+        self.seq = timed_seq
         self.total = t
         self.get_logger().info(f"{kind} sequence start: {len(self.seq)} steps, {self.total:.1f}s")
 

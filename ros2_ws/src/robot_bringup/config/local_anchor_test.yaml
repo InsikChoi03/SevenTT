@@ -74,7 +74,7 @@ local_anchor_test_node:
     # pick_enabled is injected only by `run_local_anchor_test.sh live`.
     enable_align: true
     pick_enabled: false
-    pick_duration_sec: 9.0       # motion_tuning.yaml의 실제 팔 시퀀스보다 길게 base를 잠근다.
+    pick_duration_sec: 11.0      # 그립 닫힘과 팔 복귀가 모두 끝날 때까지 base를 잠근다.
     body_align_labels: [fruit_photo_cube, cube] # 접근 중 YOLO가 같은 큐브를 plain cube로 본 프레임도 유지.
     body_ground_homography_path: /home/seventt/seventt/workspace/data/calib/body_ground.npz
     body_px_scale_x: 2.5625

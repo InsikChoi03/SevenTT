@@ -60,6 +60,18 @@ def wrap_angle(theta: float) -> float:
     return math.atan2(math.sin(theta), math.cos(theta))
 
 
+def limit_planar_delta(
+    dx: float, dy: float, max_distance_m: float
+) -> Tuple[float, float, bool]:
+    """Slew-limit a planar correction without changing its direction."""
+    limit = max(0.0, float(max_distance_m))
+    distance = math.hypot(float(dx), float(dy))
+    if distance <= limit or distance <= 1e-12:
+        return float(dx), float(dy), False
+    scale = limit / distance
+    return float(dx) * scale, float(dy) * scale, True
+
+
 class LocalizerNode(Node):
     def __init__(self) -> None:
         super().__init__("localizer_node")
@@ -87,6 +99,8 @@ class LocalizerNode(Node):
         self.declare_parameter("landmark_gain", 0.2)
         self.declare_parameter("landmark_max_step_m", 0.1)
         self.declare_parameter("landmark_max_step_rad", 0.1)
+        self.declare_parameter("landmark_correction_max_speed_mps", 0.20)
+        self.declare_parameter("landmark_correction_max_dt_sec", 0.10)
         # HEADING authority for a CONFIDENT landmark fix (scaled by the fix's confidence). Higher
         # than landmark_gain because a well-conditioned object-bearing heading is an absolute ref.
         self.declare_parameter("landmark_theta_gain", 0.7)
@@ -290,6 +304,15 @@ class LocalizerNode(Node):
         self.landmark_theta_gain = float(self.get_parameter("landmark_theta_gain").value)
         self.landmark_max_step_m = float(self.get_parameter("landmark_max_step_m").value)
         self.landmark_max_step_rad = float(self.get_parameter("landmark_max_step_rad").value)
+        self.landmark_correction_max_speed_mps = max(
+            0.0, float(self.get_parameter("landmark_correction_max_speed_mps").value)
+        )
+        self.landmark_correction_max_dt_sec = max(
+            0.0, float(self.get_parameter("landmark_correction_max_dt_sec").value)
+        )
+        publish_rate_hz = max(1.0, float(self.get_parameter("publish_rate_hz").value))
+        self.landmark_correction_nominal_dt = 1.0 / publish_rate_hz
+        self.last_landmark_correction_time: Optional[float] = None
         # VO now OWNS rotation (applies the FULL measured yaw delta). Wheel-odom rotation is only a
         # FALLBACK used when VO has been stale this long, so the two never double-count theta.
         self.declare_parameter("vo_stale_sec", 0.25)
@@ -518,6 +541,7 @@ class LocalizerNode(Node):
         self.y = y
         self.theta = wrap_angle(theta)
         self.last_wall_correction_time = None
+        self.last_landmark_correction_time = None
         self.get_logger().info(
             f"localization pose reset to ({self.x:.3f},{self.y:.3f},{self.theta:.3f})"
         )
@@ -941,6 +965,32 @@ class LocalizerNode(Node):
         applied_dx, applied_dy, applied_dth = self._constrain_world_delta(
             applied_dx, applied_dy, applied_dth, "object_landmark"
         )
+        now = self.get_clock().now().nanoseconds * 1e-9
+        if self.last_landmark_correction_time is None:
+            dt = min(
+                self.landmark_correction_max_dt_sec,
+                self.landmark_correction_nominal_dt,
+            )
+        else:
+            dt = max(
+                0.0,
+                min(
+                    self.landmark_correction_max_dt_sec,
+                    now - self.last_landmark_correction_time,
+                ),
+            )
+        self.last_landmark_correction_time = now
+        max_translation = self.landmark_correction_max_speed_mps * dt
+        requested_translation = math.hypot(applied_dx, applied_dy)
+        applied_dx, applied_dy, limited = limit_planar_delta(
+            applied_dx, applied_dy, max_translation
+        )
+        if limited:
+            self.get_logger().warn(
+                f"landmark correction slew-limited: requested={requested_translation*100:.1f}cm "
+                f"allowed={max_translation*100:.1f}cm dt={dt:.3f}s",
+                throttle_duration_sec=1.0,
+            )
         self.x += applied_dx
         self.y += applied_dy
         self.theta = wrap_angle(self.theta + applied_dth)

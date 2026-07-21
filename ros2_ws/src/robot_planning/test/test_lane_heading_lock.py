@@ -5,6 +5,7 @@ from robot_planning.lane_planner import cardinal_segment_heading
 from robot_planning.nodes.mission_fsm_node import (
     MissionFsmNode,
     PulsedHeadingController,
+    _cardinal_waypoint_status,
     circular_heading_filter,
     lane_heading_violation_time_step,
 )
@@ -24,6 +25,37 @@ def test_cardinal_segment_heading_tolerates_small_pose_offset():
 
 def test_cardinal_segment_heading_rejects_diagonal_connector():
     assert cardinal_segment_heading((0.10, 0.10), (0.25, 0.25), 0.06) is None
+
+
+def test_cardinal_waypoint_accepts_goal_radius_or_nearby_goal_line_pass():
+    assert _cardinal_waypoint_status(
+        (0.0, 0.0), (0.91, 0.07), (1.0, 0.0), 0.12, 0.15
+    ) == (True, False, 0.0)
+
+    reached, passed, lateral_error = _cardinal_waypoint_status(
+        (0.0, 0.0), (1.07, 0.14), (1.0, 0.0), 0.12, 0.15
+    )
+    assert reached
+    assert passed
+    assert math.isclose(lateral_error, 0.14)
+
+
+def test_cardinal_waypoint_rejects_goal_line_pass_far_outside_lane():
+    reached, passed, lateral_error = _cardinal_waypoint_status(
+        (0.0, 0.0), (1.07, 0.20), (1.0, 0.0), 0.12, 0.15
+    )
+    assert not reached
+    assert passed
+    assert math.isclose(lateral_error, 0.20)
+
+
+def test_cardinal_waypoint_pass_works_for_vertical_lane():
+    reached, passed, lateral_error = _cardinal_waypoint_status(
+        (0.5, 0.0), (0.37, 1.08), (0.5, 1.0), 0.12, 0.15
+    )
+    assert reached
+    assert passed
+    assert math.isclose(lateral_error, 0.13)
 
 
 def test_circular_heading_filter_handles_wraparound():

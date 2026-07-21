@@ -56,6 +56,22 @@ def select_wheel_scales(
     return [(awx * wheel_scales[i] + awy * strafe[i]) / tot for i in range(4)]
 
 
+def is_precision_strafe_command(
+    vx: float,
+    vy: float,
+    omega: float,
+    duty: float,
+    tolerance: float,
+) -> bool:
+    """Identify the calibrated no-boost lateral unit-step command."""
+    return bool(
+        duty > 0.0
+        and abs(vx) < 0.02
+        and abs(omega) <= 1e-3
+        and abs(abs(vy) - duty) <= max(0.0, tolerance)
+    )
+
+
 class BaseControllerNode(Node):
     def __init__(self) -> None:
         super().__init__("base_controller_node")
@@ -153,8 +169,16 @@ class BaseControllerNode(Node):
         # nudge jerk ("휙휙"). During ALIGN use a softer kick and NO brake so the base creeps.
         self.declare_parameter("align_wheel_boost", 0.45)
         self.declare_parameter("align_brake_off", True)
+        self.declare_parameter("precision_strafe_duty", 0.315)
+        self.declare_parameter("precision_strafe_tolerance", 0.005)
         self.align_wheel_boost = float(self.get_parameter("align_wheel_boost").value)
         self.align_brake_off = bool(self.get_parameter("align_brake_off").value)
+        self.precision_strafe_duty = max(
+            0.0, float(self.get_parameter("precision_strafe_duty").value)
+        )
+        self.precision_strafe_tolerance = max(
+            0.0, float(self.get_parameter("precision_strafe_tolerance").value)
+        )
         # SLEW-RATE limit: cap how much each wheel output can change per 20 ms tick, so the base ramps
         # up/down smoothly instead of jack-rabbiting (급발진) and slipping — slip is what accumulates
         # odometry error and makes it wander later. 0 disables. 0.04/tick @50Hz = 2.0/s.
@@ -348,9 +372,16 @@ class BaseControllerNode(Node):
             and abs(vx) < 0.02
             and abs(omega) <= 1e-3
         )
+        precision_strafe = is_precision_strafe_command(
+            vx,
+            vy,
+            omega,
+            self.precision_strafe_duty,
+            self.precision_strafe_tolerance,
+        )
         # ALIGN translation keeps its calibrated no-boost unit-step profile. Pure heading-search
         # pulses use the normal rotation profile so every stop/start can re-arm rotation torque.
-        align_profile = (aligning and not is_rot) or opening_align_strafe
+        align_profile = (aligning and not is_rot) or opening_align_strafe or precision_strafe
         kick = False                                  # boost/brake pulse this tick -> bypass slew
         # For pure rotation, mecanum IK scales omega by (lx + ly).  With k=0.2, an intentional
         # omega=0.07 becomes a 0.014 wheel command, below the generic 0.02 wheel deadband.  Do not

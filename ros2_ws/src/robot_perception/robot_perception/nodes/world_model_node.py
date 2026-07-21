@@ -31,7 +31,7 @@ from rcl_interfaces.msg import SetParametersResult
 
 from geometry_msgs.msg import PoseArray, PoseStamped, Vector3
 from std_msgs.msg import Bool, Float32MultiArray, UInt64
-from robot_interfaces.msg import Classification, DetectionArray, Object, WorldModel
+from robot_interfaces.msg import BaseCommand, Classification, DetectionArray, Object, WorldModel
 
 # cv2/numpy only needed for the fisheye ray (top cam is a ~150 deg fisheye). Guarded so the
 # node still runs (pinhole path) if they are missing.
@@ -64,6 +64,44 @@ _FRUIT_LABELS = frozenset({"apple", "orange", "banana", "pineapple"})
 # reliable camera, so when it has classified an object its confidence-summed vote wins outright;
 # the wide cam only names objects the body never saw. This beats a single blended weight, which
 # let the high-frame-rate wide cam out-accumulate the body's higher per-vote weight over time.
+
+
+@dataclass(frozen=True)
+class ObjectFlowSample:
+    """One raw object-flow interval, retained as velocity for variable camera frame times."""
+
+    dtheta: float
+    dfwd: float
+    dleft: float
+    dt: float
+    confidence: float
+
+    @property
+    def vfwd(self) -> float:
+        return self.dfwd / self.dt
+
+    @property
+    def vleft(self) -> float:
+        return self.dleft / self.dt
+
+
+def select_translation_velocity_medoid(
+    samples: list[ObjectFlowSample],
+) -> ObjectFlowSample:
+    """Select the observed velocity vector closest to all other vectors."""
+    if not samples:
+        raise ValueError("at least one object-flow sample is required")
+
+    def score(index: int) -> tuple[float, float, int]:
+        sample = samples[index]
+        distance_sum = sum(
+            math.hypot(sample.vfwd - other.vfwd, sample.vleft - other.vleft)
+            for other in samples
+        )
+        # Prefer confidence, then the newest sample, when vectors are equally central.
+        return distance_sum, -sample.confidence, -index
+
+    return samples[min(range(len(samples)), key=score)]
 
 
 @dataclass
@@ -221,6 +259,10 @@ class WorldModelNode(Node):
         self.declare_parameter("object_flow_assoc_m", 0.30)      # frame-to-frame NN gate (points barely move)
         self.declare_parameter("object_flow_max_dtheta", 0.5)    # reject a per-frame yaw jump beyond this (rad)
         self.declare_parameter("object_flow_trans_deadband_m", 0.008)  # sub-cm per-frame shift = noise -> 0 (no drift)
+        self.declare_parameter("object_flow_max_speed_mps", 0.20)
+        self.declare_parameter("object_flow_position_margin_m", 0.025)
+        self.declare_parameter("object_flow_max_dt_sec", 0.40)
+        self.declare_parameter("object_flow_median_filter_enabled", False)
 
         # Tracker tuning.
         self.declare_parameter("assoc_radius_m", 0.18)     # tight gate: new-track spacing + duplicate merge
@@ -279,7 +321,7 @@ class WorldModelNode(Node):
         # LOWER bar than the wide cam — otherwise a real 0.6–0.8 body octa/icosa never establishes an
         # identity, gets no protection, and is swallowed by a neighbouring high-conf cube track.
         self.declare_parameter("class_conf_threshold_body", 0.50)
-        self.declare_parameter("fruit_cube_sticky_enabled", True)
+        self.declare_parameter("fruit_cube_sticky_enabled", False)
         self.declare_parameter("fruit_cube_sticky_conf_wide", 0.75)
         self.declare_parameter("fruit_cube_sticky_conf_body", 0.50)
         self.declare_parameter("fruit_cube_sticky_min_wide_hits", 3)
@@ -390,6 +432,14 @@ class WorldModelNode(Node):
         self.object_flow_assoc = float(self.get_parameter("object_flow_assoc_m").value)
         self.object_flow_max_dtheta = float(self.get_parameter("object_flow_max_dtheta").value)
         self.object_flow_trans_deadband = float(self.get_parameter("object_flow_trans_deadband_m").value)
+        self.object_flow_max_speed = max(0.0, float(self.get_parameter("object_flow_max_speed_mps").value))
+        self.object_flow_position_margin = max(
+            0.0, float(self.get_parameter("object_flow_position_margin_m").value)
+        )
+        self.object_flow_max_dt = max(0.0, float(self.get_parameter("object_flow_max_dt_sec").value))
+        self.object_flow_median_filter_enabled = bool(
+            self.get_parameter("object_flow_median_filter_enabled").value
+        )
         self._corr_pairs: list[tuple[int, float, float, float, float]] = []  # (tid,obs_x,obs_y,anchor_x,anchor_y)
 
         self.can_project = self.fx != 0.0 and self.fy != 0.0 and self.cx != 0.0 and self.cy != 0.0
@@ -510,6 +560,7 @@ class WorldModelNode(Node):
         self.create_subscription(DetectionArray, "/camera_body/detections", self.on_body_detections, 10)
         self.create_subscription(Classification, "/classification/siglip", self.on_siglip, 10)
         self.create_subscription(PoseStamped, "/localization/pose", self.on_pose, 10)
+        self.create_subscription(BaseCommand, "/base_command", self.on_base_command, 10)
         self.create_subscription(Bool, "/world_model/mapping_enabled", self.on_mapping_enabled, 10)
         self.create_subscription(
             Bool, "/world_model/track_birth_enabled", self.on_track_birth_enabled, 10
@@ -545,6 +596,9 @@ class WorldModelNode(Node):
         # (robot-frame per-frame delta) for the localizer to use as the PRIMARY yaw source.
         self.pub_odom = self.create_publisher(Float32MultiArray, "/localization/object_odom", 10)
         self._prev_wide_base: list[tuple[float, float, str]] = []   # (bx, by, label) previous wide frame
+        self._prev_wide_base_sec: float | None = None
+        self._object_flow_samples: deque[ObjectFlowSample] = deque(maxlen=3)
+        self._object_flow_drive_mode = "STOP"
         self.timer = self.create_timer(1.0 / rate, self.tick)
 
         if not self.can_project:
@@ -556,6 +610,7 @@ class WorldModelNode(Node):
             f"rate={rate}Hz project={self.can_project} fisheye={self.use_fisheye} "
             f"rot180={self.rotated_180} body_fusion={self.can_project_body} "
             f"landmark_corr={self.landmark_correction} "
+            f"flow_median3={self.object_flow_median_filter_enabled} "
             f"grid_prior={self.grid_prior_enabled} grid_points={len(self._grid_points)} "
             f"mapping_enabled={self.mapping_enabled} "
             f"track_birth_enabled={self.track_birth_enabled} "
@@ -628,6 +683,8 @@ class WorldModelNode(Node):
         self._last_body_fruit_id = None
         self._last_body_fruit_sec = 0.0
         self._prev_wide_base = []
+        self._prev_wide_base_sec = None
+        self._object_flow_samples.clear()
         self._proj_wide = []
         self._proj_body = []
         self._corr_pairs.clear()
@@ -643,6 +700,9 @@ class WorldModelNode(Node):
                 self.grid_track_lock_enabled = bool(param.value)
             elif param.name == "grid_track_lock_radius_m":
                 self.grid_track_lock_radius = max(0.0, float(param.value))
+            elif param.name == "object_flow_median_filter_enabled":
+                self.object_flow_median_filter_enabled = bool(param.value)
+                self._object_flow_samples.clear()
             elif param.name == "grid_track_lock_alpha":
                 self.grid_track_lock_alpha = min(1.0, max(0.0, float(param.value)))
             elif param.name == "fruit_cube_sticky_enabled":
@@ -801,6 +861,22 @@ class WorldModelNode(Node):
         self._pose_hist.append((t if t > 0.0 else self._now_sec(),
                                 self.robot_x, self.robot_y, self.robot_theta))
 
+    def on_base_command(self, msg: BaseCommand) -> None:
+        """Reset flow history across stop/translate/rotate transitions.
+
+        Short ALIGN translation pulses therefore use the legacy raw flow path instead of being
+        erased by a window that still contains stationary samples.
+        """
+        if math.hypot(float(msg.vx), float(msg.vy)) > 0.02:
+            mode = "TRANSLATE"
+        elif abs(float(msg.omega)) > 0.05:
+            mode = "ROTATE"
+        else:
+            mode = "STOP"
+        if mode != self._object_flow_drive_mode:
+            self._object_flow_drive_mode = mode
+            self._object_flow_samples.clear()
+
     def on_mapping_enabled(self, msg: Bool) -> None:
         enabled = bool(msg.data)
         if enabled == self.mapping_enabled:
@@ -948,6 +1024,7 @@ class WorldModelNode(Node):
         self._publish_wide_relative(msg)
         if not self.mapping_enabled:
             self._prev_wide_base = []
+            self._prev_wide_base_sec = None
             self._proj_wide = []
             return
         if not self.can_project:
@@ -1616,9 +1693,24 @@ class WorldModelNode(Node):
         ~0 when the robot is still even while the motors buzz (unlike dense LK flow, which sees the
         vibration as rotation). Published [dtheta, dfwd, dleft, conf] in the robot frame.
         """
+        now = self._now_sec()
         prev = self._prev_wide_base
+        prev_sec = self._prev_wide_base_sec
         self._prev_wide_base = curr_base
+        self._prev_wide_base_sec = now
+        if prev_sec is None:
+            return
+        dt = now - prev_sec
+        if dt <= 0.0 or (self.object_flow_max_dt > 0.0 and dt > self.object_flow_max_dt):
+            self._object_flow_samples.clear()
+            self.get_logger().info(
+                f"object-flow reset: frame gap dt={dt:.3f}s exceeds "
+                f"{self.object_flow_max_dt:.3f}s",
+                throttle_duration_sec=1.0,
+            )
+            return
         if not self.object_flow or len(prev) < self.object_flow_min_pairs or len(curr_base) < self.object_flow_min_pairs:
+            self._object_flow_samples.clear()
             return
         gate = self.object_flow_assoc
         pairs = []   # (px, py, qx, qy)
@@ -1640,6 +1732,7 @@ class WorldModelNode(Node):
                 px, py, _ = prev[best]
                 pairs.append((px, py, qx, qy))
         if len(pairs) < self.object_flow_min_pairs:
+            self._object_flow_samples.clear()
             return
         # Solve prev->curr, trim mismatches once by residual, re-solve.
         phi, tx, ty = self._umeyama_2d(pairs)
@@ -1663,19 +1756,49 @@ class WorldModelNode(Node):
         dtheta = -phi
         dfwd, dleft = -tx, -ty
         if abs(dtheta) > self.object_flow_max_dtheta:
+            self._object_flow_samples.clear()
             return   # implausible per-frame jump -> bad association, drop this frame
+
+        n_factor = min(1.0, (len(pairs) - 2) / 5.0)                 # 4 pts -> .4, 7 -> 1
+        resid_factor = max(0.0, 1.0 - mean_resid / max(1e-6, gate * 0.5))
+        conf = max(0.0, n_factor * resid_factor)
+        raw_dfwd, raw_dleft = dfwd, dleft
+        filter_active = (
+            self.object_flow_median_filter_enabled
+            and self._object_flow_drive_mode == "TRANSLATE"
+        )
+        if filter_active:
+            current = ObjectFlowSample(dtheta, dfwd, dleft, dt, conf)
+            self._object_flow_samples.append(current)
+            if len(self._object_flow_samples) == self._object_flow_samples.maxlen:
+                selected = select_translation_velocity_medoid(list(self._object_flow_samples))
+                dfwd = selected.vfwd * dt
+                dleft = selected.vleft * dt
+                conf = min(conf, selected.confidence)
+        else:
+            self._object_flow_samples.clear()
+
+        translation = math.hypot(dfwd, dleft)
+        max_translation = self.object_flow_max_speed * dt + self.object_flow_position_margin
+        if self.object_flow_max_speed > 0.0 and translation > max_translation:
+            apparent_speed = translation / dt
+            self.get_logger().warn(
+                f"object-flow rejected: move={translation*100:.1f}cm dt={dt:.3f}s "
+                f"speed={apparent_speed:.2f}m/s allowed={max_translation*100:.1f}cm",
+                throttle_duration_sec=1.0,
+            )
+            return
         # Sub-cm per-frame translation is match noise, not motion — zero it so a stationary robot
         # does NOT random-walk away (drift). Real driving exceeds this each frame.
         if math.hypot(dfwd, dleft) < self.object_flow_trans_deadband:
             dfwd = dleft = 0.0
-        n_factor = min(1.0, (len(pairs) - 2) / 5.0)                 # 4 pts -> .4, 7 -> 1
-        resid_factor = max(0.0, 1.0 - mean_resid / max(1e-6, gate * 0.5))
-        conf = max(0.0, n_factor * resid_factor)
         m = Float32MultiArray()
         m.data = [float(dtheta), float(dfwd), float(dleft), float(conf)]
         self.pub_odom.publish(m)
         self.get_logger().info(
             f"object-flow dθ={math.degrees(dtheta):+5.1f}° dfwd={dfwd*100:+.0f} dleft={dleft*100:+.0f}cm "
+            f"raw=({raw_dfwd*100:+.0f},{raw_dleft*100:+.0f})cm "
+            f"median3={'on' if filter_active and len(self._object_flow_samples) == 3 else 'warmup' if filter_active else 'off'} "
             f"conf={conf:.2f} ({len(pairs)} pts, resid={mean_resid*100:.1f}cm)",
             throttle_duration_sec=1.0,
         )

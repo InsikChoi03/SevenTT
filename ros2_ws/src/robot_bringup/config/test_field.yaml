@@ -217,7 +217,7 @@ world_model_node:
     # 위치 vs 분류 분리 + 음의 증거(FOV 안인데 미검출 시 지속 감점 → 팬텀/집어간 물체 정리)
     class_conf_threshold: 0.85            # 광각 IDENTITY 커트라인(높게): 이 이상만 클래스 투표(광각=위치 위주)
     class_conf_threshold_body: 0.50       # 본체=신원 권위자라 낮은 바에서도 투표(0.6~0.8 octa/icosa도 자기 정체성 확립→과병합 방지)
-    fruit_cube_sticky_enabled: true       # fruit_photo_cube가 한 번 확실히 보이면 shape vote에 눌리지 않게 Set2로 고정
+    fruit_cube_sticky_enabled: false      # 오분류 고착을 막고 이후 shape vote로 재분류를 허용한다
     fruit_cube_sticky_conf_wide: 0.75
     fruit_cube_sticky_conf_body: 0.50
     # 카메라 커버 도형(base_link): 본체=부채꼴, 광각=전방 타원 (음의증거 판정 + 맵 표시 공용)
@@ -282,7 +282,7 @@ mission_fsm_node:
     approach_dist_m: 0.375                 # 집기 전 ALIGN 전환 거리: 37.5cm
     align_settle_sec: 1.0
     classify_timeout_sec: 3.5             # 트랙기반 게이트(set1 즉시), set2 SigLIP 여유
-    pick_duration_sec: 9.0                # 물체를 쥐고 어깨가 올라간 뒤 바로 다음 주행 시작
+    pick_duration_sec: 11.0               # 그립 닫힘과 팔 복귀 완료 후 다음 주행 시작
     shape_target_total: 4                 # 정십이면체 4개
     fruit_target_total: 0                 # 오렌지 큐브 무시: 정십이면체만 집기
     set2_require_fruit_label: true
@@ -352,11 +352,11 @@ mission_fsm_node:
     zone_stabilize_sec: 3.0
     zone_stabilize_require_fresh_seen: true
     align_pulse_sec: 0.10                 # (legacy, 미사용)
+    align_distractor_confirm_frames: 5    # 동일 비목표 라벨 5프레임 연속 확인 후에만 blacklist
     # ★단위-스텝 보정값★ (2026-07-08 실측, 무부스트+브레이크). 각 방향 거의 일정 이동:
     align_step_fwd_duty: 0.27             # 전진/후진 duty. 직전 저속값 대비 1.5배
     align_step_fwd_sec: 0.15              # 한 번 전/후진 보정 거리: 직전값 대비 1.5배
-    align_step_strafe_duty: 0.315         # ALIGN 미세조정 횡이동 duty: 0.45의 0.7배
-    align_step_strafe_sec: 0.1575         # 한 번 좌/우 보정 거리: 직전 0.225의 0.7배
+    align_heading_tolerance_rad: 0.0524   # Wide/Body 방향 펄스 회전 완료 허용오차(3도)
     align_body_lost_backoff_enabled: true # ALIGN에서 wide/world에는 있는데 body에 없으면 후진 후 재탐지
     align_body_lost_backoff_speed: 0.189  # body lost 후진 duty: 0.27의 0.7배
     align_body_lost_backoff_sec: 0.54     # 속도 0.7배 기준 약 10cm 후진
@@ -375,6 +375,8 @@ pick_sequencer_node:
     grip_closed: 50.0                     # 닫힘/잡기
     move_sec: 4.0                         # 팔 이동 단계 램프 시간(REACH/LIFT/TO_PLACE). 내림 속도 완화
     grasp_sec: 1.0                        # 그리퍼 열림/닫힘 단계 램프 시간
+    pick_settle_sec: 0.25                 # 집기 자세 도달 후 열린 상태 정착 시간
+    servo_speed_dps: 60.0                 # 펌웨어 이동시간 계산에 쓰는 보수적 속도
 
 go_to_goal_node:
   ros__parameters:
