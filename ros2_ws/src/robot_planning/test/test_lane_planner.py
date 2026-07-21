@@ -20,6 +20,10 @@ def _verify_clear(lp, start, path, obstacles):
         assert d >= lp.block_r - 1e-9, f"segment {a}->{b} clearance {d:.3f} < {lp.block_r}"
 
 
+def _is_cardinal(a, b):
+    return abs(a[0] - b[0]) < 1e-9 or abs(a[1] - b[1]) < 1e-9
+
+
 def test_phase_inference():
     lp = _planner()
     ox, oy = lp.infer_origin(GRID)
@@ -112,3 +116,128 @@ def test_simplify_disabled_keeps_four_connected_lane_vias():
             (abs(dx - S) < 1e-6 and dy < 1e-6)
             or (dx < 1e-6 and abs(dy - S) < 1e-6)
         )
+
+
+def test_grid_only_makes_start_and_goal_connectors_cardinal():
+    lp = LanePlanner(
+        spacing=0.5,
+        bounds=(-2, 2, -2, 2),
+        margin=0.22,
+        origin_mode="fixed",
+        simplify=False,
+    )
+    start = (-1.40, -1.10)
+    dest = (1.10, 1.40)
+    path = lp.plan(start, dest, [], route_mode="grid_only")
+    assert path is not None and path[-1] == dest
+    assert all(_is_cardinal(a, b) for a, b in zip([start] + path, path))
+
+
+def test_grid_only_ignores_legacy_direct_simplification():
+    lp = LanePlanner(
+        spacing=0.5,
+        bounds=(-2, 2, -2, 2),
+        margin=0.22,
+        origin_mode="fixed",
+        simplify=True,
+    )
+    start = (-1.40, -1.10)
+    dest = (1.10, 1.40)
+    path = lp.plan(start, dest, [], route_mode="grid_only")
+    assert path is not None and len(path) > 1
+    assert all(_is_cardinal(a, b) for a, b in zip([start] + path, path))
+
+
+def test_object_approach_places_last_waypoint_on_lane_line():
+    lp = LanePlanner(
+        spacing=0.5,
+        bounds=(-2, 2, -2, 2),
+        margin=0.22,
+        origin_mode="fixed",
+        simplify=False,
+    )
+    start = (-1.40, -1.10)
+    stand_off = (1.10, 1.40)
+    path = lp.plan(start, stand_off, [], route_mode="object_approach")
+    assert path is not None and path[-1] == stand_off
+    segments = list(zip([start] + path, path))
+    assert all(_is_cardinal(a, b) for a, b in segments)
+    assert path[-2] in ((stand_off[0], 1.25), (1.25, stand_off[1]))
+    assert path[-2] != (1.25, 1.25)
+    assert math.dist(*segments[-1]) <= 0.25
+
+
+def test_object_approach_projects_recent_standoff_onto_nearest_lane():
+    lp = LanePlanner(
+        spacing=0.5,
+        bounds=(-2, 2, -2, 2),
+        margin=0.22,
+        origin_mode="fixed",
+        simplify=False,
+    )
+    start = (-1.25, 0.75)
+    stand_off = (-0.86, 0.62)
+
+    path = lp.plan(start, stand_off, [], route_mode="object_approach")
+
+    assert path is not None and path[-1] == stand_off
+    assert path[-2] == (-0.86, 0.75)
+    assert math.isclose(math.dist(path[-2], stand_off), 0.13, abs_tol=1e-9)
+
+
+def test_object_standoff_is_one_of_four_lane_centres_around_target():
+    lp = LanePlanner(
+        spacing=0.5,
+        bounds=(-2, 2, -2, 2),
+        margin=0.22,
+        origin_mode="fixed",
+        simplify=False,
+    )
+    start = (-1.25, -1.25)
+
+    result = lp.plan_object_standoff(start, (0.0, 0.0), [])
+
+    assert result is not None
+    stand_off, path = result
+    assert stand_off in {
+        (-0.25, -0.25),
+        (-0.25, 0.25),
+        (0.25, -0.25),
+        (0.25, 0.25),
+    }
+    assert path[-1] == stand_off
+    assert all(_is_cardinal(a, b) for a, b in zip([start] + path, path))
+
+
+def test_object_standoff_skips_a_blocked_lane_centre():
+    lp = LanePlanner(
+        spacing=0.5,
+        bounds=(-2, 2, -2, 2),
+        margin=0.22,
+        block_radius=0.15,
+        origin_mode="fixed",
+        simplify=False,
+    )
+    blocked = (-0.25, -0.25)
+
+    result = lp.plan_object_standoff((-1.25, -1.25), (0.0, 0.0), [blocked])
+
+    assert result is not None
+    stand_off, path = result
+    assert stand_off != blocked
+    assert path[-1] == stand_off
+
+
+def test_orthogonal_connector_uses_unblocked_l_shape():
+    lp = LanePlanner(block_radius=0.15)
+    connector = lp._orthogonal_connector((0.0, 0.0), (1.0, 1.0), [(0.5, 0.0)])
+    assert connector is not None
+    assert connector[0] == [(0.0, 1.0), (1.0, 1.0)]
+
+
+def test_orthogonal_connector_rejects_when_both_l_shapes_are_blocked():
+    lp = LanePlanner(block_radius=0.15)
+    connector = lp._orthogonal_connector(
+        (0.0, 0.0), (1.0, 1.0), [(0.5, 0.0), (0.0, 0.5)]
+    )
+    assert connector is None

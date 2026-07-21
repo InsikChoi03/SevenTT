@@ -300,8 +300,94 @@ def test_body_center_lock_rejects_low_confidence_and_large_imu_disagreement():
 
     assert not fsm.note_visual_fruit_center(320.0, 0.59, 0.2, 0.0)
     assert not fsm.note_visual_fruit_center(320.0, 0.90, 0.3, 0.0)
-    assert fsm.state in {"TURN_MEASURE", "TURN_PULSE"}
+    assert fsm.state in {"TURN_MEASURE", "TURN_CONTINUOUS", "TURN_PULSE"}
     assert fsm.summary()["visual_lock_count"] == 0
+
+
+def test_turn_runs_continuously_until_slowdown_zone():
+    cfg = LocalAnchorConfig(turn_omega=0.10, turn_slow_omega=0.07)
+    fsm = LocalAnchorFruitFsm(cfg)
+    fsm.candidates = [candidate(1, -90)]
+    fsm.route = [1]
+    fsm._face_current_candidate(0.0)
+
+    assert fsm.tick(0.0, 0.0).omega == 0.0
+    first = fsm.tick(0.05, math.radians(-5.0))
+    second = fsm.tick(0.10, math.radians(-10.0))
+    assert first.omega == -0.10
+    assert second.omega == -0.10
+    assert fsm.state == "TURN_CONTINUOUS"
+
+
+def test_turn_stops_inside_fifteen_degrees_then_pulses_if_still_short():
+    cfg = LocalAnchorConfig(
+        turn_omega=0.10,
+        turn_slow_omega=0.07,
+        turn_slowdown_rad=math.radians(15.0),
+        turn_verify_sec=0.60,
+        turn_correction_pulse_sec=0.10,
+    )
+    fsm = LocalAnchorFruitFsm(cfg)
+    fsm.candidates = [candidate(1, -30)]
+    fsm.route = [1]
+    fsm._face_current_candidate(0.0)
+    fsm.tick(0.0, 0.0)
+
+    command = fsm.tick(0.1, math.radians(-20.0))
+    assert command.omega == 0.0
+    assert fsm.state == "TURN_VERIFY"
+
+    assert fsm.tick(0.69, math.radians(-20.0)).omega == 0.0
+    assert fsm.tick(0.71, math.radians(-20.0)).omega == 0.0
+    assert fsm.state == "TURN_PULSE"
+    assert fsm.tick(0.72, math.radians(-20.0)).omega == -0.10
+
+
+def test_first_center_observation_stops_then_three_frames_lock_heading():
+    cfg = LocalAnchorConfig(visual_heading_confirm_frames=3)
+    fsm = LocalAnchorFruitFsm(cfg)
+    fsm.candidates = [candidate(1, -45)]
+    fsm.route = [1]
+    fsm._face_current_candidate(0.0)
+    fsm.tick(0.0, 0.0)
+    assert fsm.tick(0.1, math.radians(-35.0)).omega == 0.0
+    assert fsm.state == "TURN_VERIFY"
+
+    assert not fsm.note_visual_fruit_center(
+        320.0, 0.9, 0.11, math.radians(-35.0), math.radians(-2.0)
+    )
+    assert fsm.state == "TURN_VERIFY"
+    assert fsm.tick(0.12, math.radians(-35.0)).omega == 0.0
+    assert not fsm.note_visual_fruit_center(
+        321.0, 0.9, 0.13, math.radians(-35.0), math.radians(-1.0)
+    )
+    assert fsm.note_visual_fruit_center(
+        319.0, 0.9, 0.14, math.radians(-35.0), math.radians(1.0)
+    )
+    assert fsm.state == "FACE_SETTLE"
+
+
+def test_failed_visual_verify_uses_short_correction_pulse_only_after_timeout():
+    cfg = LocalAnchorConfig(
+        turn_verify_sec=0.60,
+        turn_correction_pulse_sec=0.10,
+        turn_correction_settle_sec=0.35,
+    )
+    fsm = LocalAnchorFruitFsm(cfg)
+    fsm.candidates = [candidate(1, -45)]
+    fsm.route = [1]
+    fsm._face_current_candidate(0.0)
+    fsm.tick(0.0, 0.0)
+    fsm.tick(0.1, math.radians(-43.0))
+    assert fsm.state == "TURN_VERIFY"
+    fsm.note_visual_fruit_center(
+        390.0, 0.9, 0.2, math.radians(-43.0), math.radians(-5.0)
+    )
+
+    assert fsm.tick(0.69, math.radians(-43.0)).omega == 0.0
+    assert fsm.tick(0.71, math.radians(-43.0)).omega == 0.0
+    assert fsm.state == "TURN_PULSE"
+    assert fsm.tick(0.72, math.radians(-43.0)).omega < 0.0
 
 
 def test_first_target_classification_cancels_remaining_route_and_starts_align():

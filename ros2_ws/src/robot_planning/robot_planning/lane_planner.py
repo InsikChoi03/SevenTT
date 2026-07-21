@@ -11,7 +11,8 @@ lanes at the razor's edge). Instead:
   3. run 4-connected A* whose edges are gated by exact point-to-SEGMENT distance to the
      float object coordinates (>= block_radius), with a clearance cost so equal-length
      routes prefer the roomiest lanes and thread a tight gate only as a last resort,
-  4. string-pull the result to a few corner vias ending at the EXACT destination.
+  4. connect the robot and destination according to the requested route policy: legacy direct
+     connectors or cardinal L connectors whose elbow may lie anywhere on a lane line.
 
 Pure Python (math only), ROS-free, unit-testable off-robot. All coordinates are field-frame
 metres (REP-103), identical to the world model — no transforms.
@@ -24,6 +25,24 @@ from __future__ import annotations
 
 import heapq
 import math
+
+
+def cardinal_segment_heading(
+    start: tuple[float, float],
+    end: tuple[float, float],
+    axis_tolerance_m: float,
+) -> float | None:
+    """Return the field heading for an axis-aligned lane segment, else None."""
+    dx = float(end[0]) - float(start[0])
+    dy = float(end[1]) - float(start[1])
+    if math.hypot(dx, dy) < 1e-6:
+        return None
+    tol = max(0.0, float(axis_tolerance_m))
+    if abs(dy) <= tol and abs(dx) > abs(dy):
+        return 0.0 if dx > 0.0 else math.pi
+    if abs(dx) <= tol and abs(dy) > abs(dx):
+        return math.pi / 2.0 if dy > 0.0 else -math.pi / 2.0
+    return None
 
 
 def _pt_seg_dist(px: float, py: float, ax: float, ay: float, bx: float, by: float) -> float:
@@ -153,6 +172,46 @@ class LanePlanner:
         got = self._nearest_clear_nodes(nodes, pt, obstacles, 1)
         return got[0] if got else None
 
+    def _orthogonal_connector(self, start, dest, obstacles):
+        """Best collision-free cardinal connector, excluding start and ending at dest."""
+        sx, sy = start
+        dx, dy = dest
+        if math.hypot(dx - sx, dy - sy) < 1e-9:
+            return ([], 0.0)
+        if abs(dx - sx) < 1e-9 or abs(dy - sy) < 1e-9:
+            if not self._seg_free(start, dest, obstacles):
+                return None
+            return ([dest], self._edge_cost(start, dest, obstacles))
+
+        candidates = []
+        for elbow in ((dx, sy), (sx, dy)):
+            if not self._seg_free(start, elbow, obstacles):
+                continue
+            if not self._seg_free(elbow, dest, obstacles):
+                continue
+            cost = (
+                self._edge_cost(start, elbow, obstacles)
+                + self._edge_cost(elbow, dest, obstacles)
+            )
+            candidates.append(([elbow, dest], cost))
+        return min(candidates, key=lambda item: item[1]) if candidates else None
+
+    def _endpoint_connectors(self, nodes, point, obstacles, *, from_point, allow_direct):
+        """Map lane-node ids to (connector points, cost) for one route endpoint."""
+        connectors = {}
+        for ij, node in nodes.items():
+            start, dest = (point, node) if from_point else (node, point)
+            if allow_direct:
+                if not self._seg_free(start, dest, obstacles):
+                    continue
+                connector = ([dest], self._edge_cost(start, dest, obstacles))
+            else:
+                connector = self._orthogonal_connector(start, dest, obstacles)
+                if connector is None:
+                    continue
+            connectors[ij] = connector
+        return connectors
+
     # ------------------------------------------------------------ A*
     def _astar(self, nodes, starts, goal_ij, obstacles, start_xy):
         gx, gy = nodes[goal_ij]
@@ -194,6 +253,48 @@ class LanePlanner:
                     heapq.heappush(pq, (nc + h(nij), nc, nij))
         return None
 
+    def _astar_with_endpoint_connectors(
+        self, nodes, start_connectors, goal_connectors, obstacles
+    ):
+        """Find the cheapest 4-connected lane path including both endpoint connectors."""
+        g_cost = {}
+        came = {}
+        pq = []
+        starts = sorted(start_connectors.items(), key=lambda item: item[1][1])[:self.k]
+        for ij, (_, connector_cost) in starts:
+            g_cost[ij] = connector_cost
+            came[ij] = None
+            heapq.heappush(pq, (connector_cost, ij))
+
+        best_total = float("inf")
+        best_goal = None
+        while pq:
+            cost, ij = heapq.heappop(pq)
+            if cost > g_cost.get(ij, float("inf")) or cost >= best_total:
+                continue
+            if ij in goal_connectors:
+                total = cost + goal_connectors[ij][1]
+                if total < best_total:
+                    best_total = total
+                    best_goal = ij
+            i, j = ij
+            for nij in ((i + 1, j), (i - 1, j), (i, j + 1), (i, j - 1)):
+                if nij not in nodes or not self._seg_free(nodes[ij], nodes[nij], obstacles):
+                    continue
+                next_cost = cost + self._edge_cost(nodes[ij], nodes[nij], obstacles)
+                if next_cost < g_cost.get(nij, float("inf")):
+                    g_cost[nij] = next_cost
+                    came[nij] = ij
+                    heapq.heappush(pq, (next_cost, nij))
+
+        if best_goal is None:
+            return None
+        path = [best_goal]
+        while came[path[-1]] is not None:
+            path.append(came[path[-1]])
+        path.reverse()
+        return path
+
     # ------------------------------------------------------------ simplify
     def _simplify(self, pts, obstacles):
         """Greedy string-pull: from each kept point jump to the FURTHEST later point still
@@ -218,25 +319,105 @@ class LanePlanner:
                 out.append(p)
         return out
 
+    def plan_object_standoff(self, start, target, obstacles):
+        """Choose the cheapest reachable lane-hole centre surrounding an object."""
+        sx, sy = float(start[0]), float(start[1])
+        tx, ty = float(target[0]), float(target[1])
+        obstacles = [(float(ox), float(oy)) for ox, oy in obstacles]
+        ox0, oy0 = self.infer_origin(obstacles + [(tx, ty)])
+        nodes = self._lane_nodes(ox0, oy0)
+        if not nodes:
+            return None
+
+        lattice_i = int(round((tx - ox0) / self.s))
+        lattice_j = int(round((ty - oy0) / self.s))
+        candidate_ids = (
+            (lattice_i - 1, lattice_j - 1),
+            (lattice_i - 1, lattice_j),
+            (lattice_i, lattice_j - 1),
+            (lattice_i, lattice_j),
+        )
+        candidates = []
+        for ij in candidate_ids:
+            stand_off = nodes.get(ij)
+            if stand_off is None:
+                continue
+            path = self.plan(
+                (sx, sy), stand_off, obstacles, route_mode="grid_only"
+            )
+            if not path:
+                continue
+            points = [(sx, sy)] + path
+            route_cost = sum(
+                self._edge_cost(a, b, obstacles)
+                for a, b in zip(points, points[1:])
+            )
+            candidates.append((route_cost, stand_off[0], stand_off[1], path))
+
+        if not candidates:
+            return None
+        _, stand_x, stand_y, path = min(candidates, key=lambda item: item[:3])
+        return (stand_x, stand_y), path
+
     # ------------------------------------------------------------ public: plan
-    def plan(self, start, dest, obstacles):
+    def plan(self, start, dest, obstacles, route_mode="legacy"):
         """Collision-free via list from `start` to `dest` (field xy, metres). Returns a list of
         (x,y) ENDING at the exact dest (robot's own position is NOT included), or None if no lane
-        route exists (caller should then fall back to a direct goal). `obstacles` must already
-        EXCLUDE the target being approached."""
+        route exists. `grid_only` makes both endpoint connectors cardinal; `object_approach` also
+        keeps the final pre-stand-off waypoint on a lane line instead of forcing it to a 0.5 m
+        grid intersection. `legacy` preserves the original direct endpoint behavior. `obstacles`
+        must already EXCLUDE the target being approached."""
         sx, sy = float(start[0]), float(start[1])
         dx, dy = float(dest[0]), float(dest[1])
         obstacles = [(float(ox), float(oy)) for ox, oy in obstacles]
+        if route_mode not in {"legacy", "grid_only", "object_approach"}:
+            raise ValueError(f"unsupported lane route mode: {route_mode}")
         if math.hypot(dx - sx, dy - sy) < 1e-6:
             return [(dx, dy)]
         # Direct shot already clear? then no vias needed. Disabled with simplify=false so tests can
         # observe the raw 4-connected lane route instead of a straight shortcut across the field.
-        if self.simplify and self._seg_free((sx, sy), (dx, dy), obstacles):
+        if (
+            route_mode == "legacy"
+            and self.simplify
+            and self._seg_free((sx, sy), (dx, dy), obstacles)
+        ):
             return [(dx, dy)]
         ox0, oy0 = self.infer_origin(obstacles)
         nodes = self._lane_nodes(ox0, oy0)
         if not nodes:
             return None
+        if route_mode != "legacy":
+            start_connectors = self._endpoint_connectors(
+                nodes, (sx, sy), obstacles, from_point=True, allow_direct=False
+            )
+            goal_connectors = self._endpoint_connectors(
+                nodes,
+                (dx, dy),
+                obstacles,
+                from_point=False,
+                allow_direct=False,
+            )
+            if not start_connectors or not goal_connectors:
+                return None
+            path_ij = None
+            selected_goal_ij = None
+            for goal_ij, goal_connector in sorted(
+                goal_connectors.items(), key=lambda item: item[1][1]
+            ):
+                path_ij = self._astar_with_endpoint_connectors(
+                    nodes, start_connectors, {goal_ij: goal_connector}, obstacles
+                )
+                if path_ij is not None:
+                    selected_goal_ij = goal_ij
+                    break
+            if path_ij is None or selected_goal_ij is None:
+                return None
+            pts = [(sx, sy)]
+            pts.extend(start_connectors[path_ij[0]][0])
+            pts.extend(nodes[ij] for ij in path_ij[1:])
+            pts.extend(goal_connectors[selected_goal_ij][0])
+            return self._drop_duplicate_points(pts)[1:]
+
         goal_ij = self._nearest_clear_node(nodes, (dx, dy), obstacles)
         starts = self._nearest_clear_nodes(nodes, (sx, sy), obstacles, self.k)
         if goal_ij is None or not starts:

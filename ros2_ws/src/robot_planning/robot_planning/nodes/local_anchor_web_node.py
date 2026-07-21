@@ -188,6 +188,7 @@ async function update() {
       Number(d.turn_target_deg||0).toFixed(1)+'° · 보정 '+
       Number(d.heading_correction_deg||0).toFixed(1)+'° · visual hit/lock '+
       (d.visual_center_hits||0)+'/'+(d.visual_lock_count||0)+
+      ' · corrections '+(d.visual_correction_attempts||0)+
       ' · pulses '+(d.turn_pulses||0);
     const m=d.base_command||{};
     $('cmd').textContent='vx '+Number(m.vx||0).toFixed(3)+' · vy '+

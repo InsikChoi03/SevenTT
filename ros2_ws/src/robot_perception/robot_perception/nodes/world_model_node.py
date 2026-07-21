@@ -263,6 +263,10 @@ class WorldModelNode(Node):
             "zone_anchor_xy",
             [-1.0, 0.5, -1.0, -1.0, 0.75, -1.0, 0.75, 0.5],
         )
+        self.declare_parameter(
+            "zone_anchor_candidates",
+            [1.0, -1.0, 0.5, 2.0, -1.0, -1.0, 3.0, 0.75, -1.0, 4.0, 0.75, 0.5],
+        )
         self.declare_parameter("grid_moved_threshold_m", 0.22)
 
         # --- Position vs identity: DIFFERENT confidence cut-offs ---
@@ -340,7 +344,10 @@ class WorldModelNode(Node):
             1.0, max(0.0, float(self.get_parameter("grid_track_lock_alpha").value))
         )
         za = [float(v) for v in self.get_parameter("zone_anchor_xy").value]
-        self.zone_anchors = [(za[i], za[i + 1]) for i in range(0, min(len(za), 8), 2)]
+        zc = [float(v) for v in self.get_parameter("zone_anchor_candidates").value]
+        self.zone_anchors = [(zc[i + 1], zc[i + 2]) for i in range(0, len(zc) - 2, 3)]
+        if not self.zone_anchors:
+            self.zone_anchors = [(za[i], za[i + 1]) for i in range(0, min(len(za), 8), 2)]
         self.grid_moved_threshold = max(0.0, float(self.get_parameter("grid_moved_threshold_m").value))
         self.class_conf_threshold = float(self.get_parameter("class_conf_threshold").value)
         self.class_conf_threshold_body = float(self.get_parameter("class_conf_threshold_body").value)

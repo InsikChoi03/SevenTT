@@ -35,12 +35,18 @@ local_anchor_test_node:
     expected_candidates_min: 3
     expected_candidates_max: 4
 
-    # Rotation pulse tuning.  Change ONE value at a time and repeat the same placement seed.
+    # Rotation: continuous when far, stop inside 15deg, then short stable-power correction pulses.
     scan_step_deg: 45.0
     scan_positions: 8
-    turn_omega: 0.07             # 기존 0.14의 절반. 테스트 전용 base floor도 함께 낮춘다.
-    turn_pulse_sec: 0.12         # 최초 로컬 앵커 테스트의 회전 펄스 시간으로 원복.
-    turn_settle_sec: 0.70        # 감속 후 완전 정지와 IMU 안정화를 기다린다.
+    turn_omega: 0.10             # 연속 회전 및 목표 근처 보정 펄스의 안정 구동 세기.
+    turn_slow_omega: 0.07        # 구버전 호환용; 현재 목표 근처에서는 연속 저속 회전하지 않는다.
+    turn_slowdown_deg: 7.5
+    turn_pulse_sec: 0.12         # 구버전 호환용; 정상 회전에서는 사용하지 않는다.
+    turn_settle_sec: 0.70        # 구버전 호환용; 정상 회전에서는 사용하지 않는다.
+    turn_verify_sec: 0.60        # 정지 후 body 중앙 3프레임을 받을 시간.
+    turn_verify_max_corrections: 4
+    turn_correction_pulse_sec: 0.10 # 목표 근처/중앙 검증 실패 때 turn_omega로 치는 짧은 보정.
+    turn_correction_settle_sec: 0.35
     turn_tolerance_deg: 3.0
     max_turn_pulses: 60          # 느린 회전에서도 각 45도 목표에 충분히 도달할 여유.
     scan_observe_sec: 1.00       # single_lap=false인 기존 45도 스캔 모드 전용.
@@ -94,6 +100,8 @@ local_anchor_test_node:
 # Test-only base profile.  These override motion_tuning.yaml only in local_anchor_test.launch.py.
 base_controller_node:
   ros__parameters:
+    rotation_cw_scales: [1.1, 1.1, 1.1, 1.0]   # 순수 시계방향 회전 전용 [FL,FR,RL,RR]; FL 약함 보정.
+    rotation_ccw_scales: [1.1, 1.1, 1.1, 1.0]  # 순수 반시계방향 회전 전용 [FL,FR,RL,RR].
     wheel_min_rot: 0.07          # 테스트 초기값으로 원복(0.04 적용 전 값).
     wheel_boost_rot: 0.35        # 오프닝에서 검증된 정지마찰 탈출 출력.
     wheel_boost_ms: 100          # 출발만 보조하고 이후 0.14 floor로 낮춘다.

@@ -153,9 +153,15 @@ class LocalAnchorTestNode(Node):
         )
         self.declare_parameter("scan_step_deg", 45.0)
         self.declare_parameter("scan_positions", 8)
-        self.declare_parameter("turn_omega", 0.07)
+        self.declare_parameter("turn_omega", 0.10)
+        self.declare_parameter("turn_slow_omega", 0.07)
+        self.declare_parameter("turn_slowdown_deg", 15.0)
         self.declare_parameter("turn_pulse_sec", 0.12)
         self.declare_parameter("turn_settle_sec", 0.70)
+        self.declare_parameter("turn_verify_sec", 0.60)
+        self.declare_parameter("turn_verify_max_corrections", 4)
+        self.declare_parameter("turn_correction_pulse_sec", 0.10)
+        self.declare_parameter("turn_correction_settle_sec", 0.35)
         self.declare_parameter("turn_tolerance_deg", 3.0)
         self.declare_parameter("max_turn_pulses", 60)
         self.declare_parameter("scan_observe_sec", 1.00)
@@ -221,8 +227,14 @@ class LocalAnchorTestNode(Node):
             scan_step_rad=math.radians(float(value("scan_step_deg"))),
             scan_positions=int(value("scan_positions")),
             turn_omega=float(value("turn_omega")),
+            turn_slow_omega=float(value("turn_slow_omega")),
+            turn_slowdown_rad=math.radians(float(value("turn_slowdown_deg"))),
             turn_pulse_sec=float(value("turn_pulse_sec")),
             turn_settle_sec=float(value("turn_settle_sec")),
+            turn_verify_sec=float(value("turn_verify_sec")),
+            turn_verify_max_corrections=int(value("turn_verify_max_corrections")),
+            turn_correction_pulse_sec=float(value("turn_correction_pulse_sec")),
+            turn_correction_settle_sec=float(value("turn_correction_settle_sec")),
             turn_tolerance_rad=math.radians(float(value("turn_tolerance_deg"))),
             max_turn_pulses=int(value("max_turn_pulses")),
             scan_observe_sec=float(value("scan_observe_sec")),
@@ -384,6 +396,7 @@ class LocalAnchorTestNode(Node):
         now = self._now()
         visual_best = None
         visual_confidence = 0.0
+        visual_turn_hint = 0.0
         if self.config.visual_heading_enabled:
             for detection in msg.detections:
                 if str(detection.label).strip().lower() != "fruit_photo_cube":
@@ -398,12 +411,25 @@ class LocalAnchorTestNode(Node):
                 if visual_best is None or score < visual_best[0]:
                     visual_best = (score, float(detection.x_center))
                     visual_confidence = confidence
+                    base = self._body_pixel_base(
+                        detection.x_center,
+                        detection.y_center,
+                    )
+                    if base is not None:
+                        visual_turn_hint = math.atan2(base[1], max(0.01, base[0]))
+            previous_state = self.fsm.state
             self.fsm.note_visual_fruit_center(
                 None if visual_best is None else visual_best[1],
                 visual_confidence,
                 now,
                 self._relative_yaw(),
+                visual_turn_hint,
             )
+            if (
+                previous_state in {"TURN_CONTINUOUS", "TURN_PULSE"}
+                and self.fsm.state == "TURN_VERIFY"
+            ):
+                self._publish_command(MotionCommand())
 
         if not self.fsm.state.startswith("ALIGN"):
             return
@@ -466,8 +492,32 @@ class LocalAnchorTestNode(Node):
         cfg = self.config
         checks = [
             (0.03 <= abs(cfg.turn_omega) <= 0.50, "turn_omega must be in [0.03, 0.50]"),
+            (
+                0.03 <= abs(cfg.turn_slow_omega) <= abs(cfg.turn_omega),
+                "turn_slow_omega must be in [0.03, turn_omega]",
+            ),
             (0.03 <= cfg.turn_pulse_sec <= 0.50, "turn_pulse_sec must be in [0.03, 0.50]"),
             (0.20 <= cfg.turn_settle_sec <= 2.0, "turn_settle_sec must be in [0.20, 2.0]"),
+            (
+                0.20 <= cfg.turn_verify_sec <= 2.0,
+                "turn_verify_sec must be in [0.20, 2.0]",
+            ),
+            (
+                cfg.turn_tolerance_rad < cfg.turn_slowdown_rad <= math.radians(45.0),
+                "turn_slowdown_deg must be between tolerance and 45deg",
+            ),
+            (
+                0 <= cfg.turn_verify_max_corrections <= 10,
+                "turn_verify_max_corrections must be in [0, 10]",
+            ),
+            (
+                0.03 <= cfg.turn_correction_pulse_sec <= 0.30,
+                "turn_correction_pulse_sec must be in [0.03, 0.30]",
+            ),
+            (
+                0.10 <= cfg.turn_correction_settle_sec <= 1.0,
+                "turn_correction_settle_sec must be in [0.10, 1.0]",
+            ),
             (1 <= cfg.scan_positions <= 16, "scan_positions must be in [1, 16]"),
             (
                 0.5 <= cfg.initial_inventory_observe_sec <= 10.0,

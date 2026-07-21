@@ -84,6 +84,7 @@ class McuBridgeBaseNode(Node):
 
         with self.ser_lock:
             self._open_serial_locked()
+        self._write_line("<LIFT,0>", "startup profile stop")
         self._publish_competition_state(send_status=True)
 
         self.read_thread = threading.Thread(target=self._read_loop, daemon=True)
@@ -196,6 +197,8 @@ class McuBridgeBaseNode(Node):
             f"<STATUS,{self.competition.state}>",
             "periodic competition STATUS",
         )
+        if self.competition.state != RUNNING:
+            self._write_line("<LIFT,0>", "pre-start profile stop")
 
     def _handle_start(self, line: str) -> None:
         try:
@@ -213,6 +216,11 @@ class McuBridgeBaseNode(Node):
         self.get_logger().info(
             f"competition transition {old_state} -> {new_state} (START,{sequence})"
         )
+        if new_state == RUNNING:
+            # Current MCU firmware starts and times the 2 s opening lift on START,2.
+            # Mark it owned here so the Jetson neither retriggers nor cuts that pulse short.
+            self._profile_started = True
+            self._profile_off_sent = True
         self._publish_competition_state(send_status=True)
         self._maybe_start_profile()
 
@@ -221,8 +229,11 @@ class McuBridgeBaseNode(Node):
         if len(msg.data) != 4:
             self.get_logger().warn(f"expected 4 wheel speeds, got {len(msg.data)}")
             return
-        values = msg.data if self.competition.state == RUNNING else (0.0, 0.0, 0.0, 0.0)
-        fl, fr, rl, rr = values
+        # The MCU is already forced off by STATUS while STANDBY/READY. Do not rewrite its eight
+        # PCA motor channels at the controller's 50 Hz publish rate before the match starts.
+        if self.competition.state != RUNNING:
+            return
+        fl, fr, rl, rr = msg.data
         self._write_line(
             f"<BASE,{fl:.3f},{fr:.3f},{rl:.3f},{rr:.3f}>",
             "base command",
@@ -278,6 +289,11 @@ class McuBridgeBaseNode(Node):
     def _handle_line(self, line: str) -> None:
         if not line.endswith(">"):
             return
+        if line.startswith(
+            ("<PCAREADY,", "<PCAWRITE,", "<I2C", "<BANNER,", "<LIFTACK,", "<LIFT,done>")
+        ):
+            self.get_logger().info(f"MCU {line}")
+            return
         if line.startswith("<START,"):
             self._handle_start(line)
             return
@@ -308,9 +324,21 @@ class McuBridgeBaseNode(Node):
         self.pub_odom.publish(Float32MultiArray(data=vals))
 
     def destroy_node(self):
-        # Best-effort hard stop on process shutdown. Arduino's own watchdog/10 s lift limit remain.
-        self._write_line("<BASE,0.000,0.000,0.000,0.000>", "shutdown base stop")
+        # Repeat zero + STOP and flush before closing. This remains compatible with older firmware,
+        # where BASE zero is understood even if the explicit STOP frame is not.
+        for _ in range(3):
+            self._write_line(
+                "<BASE,0.000,0.000,0.000,0.000>", "shutdown base stop"
+            )
+            self._write_line("<STOP>", "shutdown actuator stop")
+            time.sleep(0.03)
         self._write_line("<LIFT,0>", "shutdown profile stop")
+        with self.ser_lock:
+            if self.ser is not None:
+                try:
+                    self.ser.flush()
+                except (serial.SerialException, OSError):
+                    pass
         with self.ser_lock:
             self._close_serial_locked()
         return super().destroy_node()

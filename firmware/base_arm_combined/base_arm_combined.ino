@@ -34,6 +34,7 @@ const uint8_t REV_CH[4] = { 9, 13, 11, 15 };   //           역방향
 const float    MAX_SPEED = 0.6;
 const uint16_t PCA_MIN   = 1500;
 const uint16_t PCA_MAX   = 4095;
+const uint16_t PCA_FULL_OFF = 4096;
 const float    DEADBAND  = 0.02;
 const unsigned long WATCHDOG_MS = 500;
 float wheelCmd[4] = { 0, 0, 0, 0 };
@@ -78,7 +79,9 @@ const int LED = -1;
 // D13 is not used by the encoder pin map below; keep LED heartbeat disabled while lift is on D13.
 const int LIFT_PIN = 13;
 const unsigned long MAX_LIFT_MS = 10000;   // 스톨 번아웃 방지: 최대 on 시간 후 자동 off
+const unsigned long OPENING_LIFT_MS = 2000;
 bool liftOn = false;
+bool liftStartAuthorized = false;
 unsigned long liftOffAt = 0;
 
 // ---- 3단계 경기 시작 버튼 / 상태 LED ----
@@ -121,16 +124,26 @@ void showCompetitionState() {
 }
 
 void applyCompetitionStatus(const char* state) {
-  if (strcmp(state, "STANDBY") == 0) competitionState = COMP_STANDBY;
-  else if (strcmp(state, "READY") == 0) competitionState = COMP_READY;
-  else if (strcmp(state, "RUNNING") == 0) competitionState = COMP_RUNNING;
-  else if (strcmp(state, "DONE") == 0) competitionState = COMP_DONE;
-  else if (strcmp(state, "ERROR") == 0) competitionState = COMP_ERROR;
+  CompetitionState nextState;
+  if (strcmp(state, "STANDBY") == 0) nextState = COMP_STANDBY;
+  else if (strcmp(state, "READY") == 0) nextState = COMP_READY;
+  else if (strcmp(state, "RUNNING") == 0) nextState = COMP_RUNNING;
+  else if (strcmp(state, "DONE") == 0) nextState = COMP_DONE;
+  else if (strcmp(state, "ERROR") == 0) nextState = COMP_ERROR;
   else return;
-  if (competitionState != COMP_RUNNING) {
-    stopAll();
+
+  // Reassert the lift's electrical off level on every non-running STATUS, even when the
+  // competition state itself did not change.
+  if (nextState != COMP_RUNNING) {
     setLift(false);
     liftOn = false;
+  }
+  // The bridge refreshes STATUS once per second. Rewriting all PCA channels for the same
+  // non-running state can make the motor driver chirp even though every commanded value is zero.
+  if (nextState == competitionState) return;
+  competitionState = nextState;
+  if (competitionState != COMP_RUNNING) {
+    stopAll();
   }
   showCompetitionState();
 }
@@ -152,6 +165,13 @@ void updateStartButton(unsigned long now) {
     competitionState = (
       competitionState == COMP_STANDBY ? COMP_READY : COMP_RUNNING
     );
+    if (competitionState == COMP_RUNNING) {
+      liftStartAuthorized = true;
+      setLift(true);
+      liftOn = true;
+      liftOffAt = now + OPENING_LIFT_MS;
+      Serial.print("<LIFTACK,"); Serial.print(OPENING_LIFT_MS); Serial.println(">");
+    }
     showCompetitionState();
     reportAcceptedRelease = true;
     Serial.println("<SW,1>");
@@ -289,17 +309,25 @@ void setWheelPWM(uint8_t w, float v) {
   float mag = fabs(v) / MAX_SPEED;
   if (mag > 1.0) mag = 1.0;
   uint8_t fc = FWD_CH[w], rc = REV_CH[w];
-  if (mag < DEADBAND) { pwmBase.setPWM(fc, 0, 0); pwmBase.setPWM(rc, 0, 0); return; }
+  if (mag < DEADBAND) {
+    pwmBase.setPWM(fc, 0, PCA_FULL_OFF);
+    pwmBase.setPWM(rc, 0, PCA_FULL_OFF);
+    return;
+  }
   uint16_t duty = PCA_MIN + (uint16_t)((float)(PCA_MAX - PCA_MIN) * mag);
-  if (v >= 0) { pwmBase.setPWM(rc, 0, 0); pwmBase.setPWM(fc, 0, duty); }
-  else        { pwmBase.setPWM(fc, 0, 0); pwmBase.setPWM(rc, 0, duty); }
+  if (v >= 0) { pwmBase.setPWM(rc, 0, PCA_FULL_OFF); pwmBase.setPWM(fc, 0, duty); }
+  else        { pwmBase.setPWM(fc, 0, PCA_FULL_OFF); pwmBase.setPWM(rc, 0, duty); }
 }
 
 void stopAll() {
-  for (uint8_t w = 0; w < 4; w++) {
-    wheelCmd[w] = 0;
-    pwmBase.setPWM(FWD_CH[w], 0, 0);
-    pwmBase.setPWM(REV_CH[w], 0, 0);
+  for (uint8_t w = 0; w < 4; w++) wheelCmd[w] = 0;
+  // FULL_OFF is the PCA9685's explicit low-output state. Repeat the complete pass so a
+  // transient I2C error cannot leave only part of the mecanum channels latched on.
+  for (uint8_t pass = 0; pass < 3; pass++) {
+    for (uint8_t w = 0; w < 4; w++) {
+      pwmBase.setPWM(FWD_CH[w], 0, PCA_FULL_OFF);
+      pwmBase.setPWM(REV_CH[w], 0, PCA_FULL_OFF);
+    }
   }
 }
 
@@ -324,16 +352,22 @@ void scanI2C() {   // 버스에 ACK하는 주소 나열 → <I2C,0x40,0x60,...> 
 
 void parseFrame() {
   buf[idx] = '\0';
-  if (strncmp(buf, "BASE,", 5) == 0) {
+  if (strcmp(buf, "STOP") == 0) {
+    stopAll();
+    setLift(false);
+    liftOn = false;
+    Serial.println("<STOPPED>");
+  } else if (strncmp(buf, "BASE,", 5) == 0) {
     float v[4]; char* p = buf + 5;
     for (uint8_t i = 0; i < 4; i++) {
       v[i] = atof(p); char* c = strchr(p, ',');
       if (i < 3) { if (!c) return; p = c + 1; }
     }
-    for (uint8_t i = 0; i < 4; i++) {
-      wheelCmd[i] = competitionState == COMP_RUNNING ? v[i] : 0.0;
-    }
     lastCmdMs = millis();
+    // setup(), state transitions and explicit STOP own the fail-safe off writes. Ignore the
+    // bridge's repeated zero frames before RUNNING instead of touching the PCA at 50 Hz.
+    if (competitionState != COMP_RUNNING) return;
+    for (uint8_t i = 0; i < 4; i++) wheelCmd[i] = v[i];
     for (uint8_t w = 0; w < 4; w++) setWheelPWM(w, wheelCmd[w]);
   } else if (strncmp(buf, "ARM,", 4) == 0) {
     if (competitionState != COMP_RUNNING) return;
@@ -355,7 +389,8 @@ void parseFrame() {
     long ms = atol(buf + 5);
     if (ms <= 0) {                               // <LIFT,0> = 즉시 off
       setLift(false); liftOn = false;
-    } else if (competitionState == COMP_RUNNING) { // <LIFT,ms> = RUNNING에서만 on
+    } else if (competitionState == COMP_RUNNING && liftStartAuthorized && !liftOn) {
+                                                  // 버튼 2회로 RUNNING이 된 후에만 on
       if (ms > (long)MAX_LIFT_MS) ms = MAX_LIFT_MS;
       if (LIFT_PIN >= 0) {
         setLift(true); liftOn = true; liftOffAt = millis() + ms;
@@ -371,6 +406,14 @@ void parseFrame() {
 }
 
 void setup() {
+  // Assert D13 LOW before initializing any other peripheral. The lift may only be enabled later
+  // by an accepted <LIFT,ms> command while the competition state is RUNNING.
+  if (LIFT_PIN >= 0) {
+    pinMode(LIFT_PIN, OUTPUT);
+    setLift(false);
+    liftOn = false;
+    liftStartAuthorized = false;
+  }
   if (LED >= 0) pinMode(LED, OUTPUT);
   pinMode(RED_LED_PIN, OUTPUT);
   pinMode(GREEN_LED_PIN, OUTPUT);
@@ -380,7 +423,6 @@ void setup() {
   buttonChangedAt = millis();
   competitionState = COMP_STANDBY;
   showCompetitionState();
-  if (LIFT_PIN >= 0) { pinMode(LIFT_PIN, OUTPUT); setLift(false); }   // 부팅 시 리프트 모터 off
   Serial.begin(115200);
   Wire.begin();
   Wire.setWireTimeout(3000, true);          // I2C 행 방지 (서보 노이즈 대비)
@@ -408,8 +450,11 @@ void loop() {
   unsigned long now = millis();
   updateStartButton(now);
 
-  // 광각 리프트 모터 자동 off (MAX_LIFT_MS 스톨 방지)
-  if (liftOn && (long)(now - liftOffAt) >= 0) {
+  // Before the second accepted START press, continuously hold the MOSFET command LOW.
+  if (competitionState != COMP_RUNNING || !liftStartAuthorized) {
+    setLift(false);
+    liftOn = false;
+  } else if (liftOn && (long)(now - liftOffAt) >= 0) {
     setLift(false); liftOn = false;
     Serial.println("<LIFT,done>");
   }

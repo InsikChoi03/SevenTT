@@ -33,6 +33,7 @@ import csv
 import json
 import math
 import os
+import re
 import time
 from collections import deque
 
@@ -296,11 +297,21 @@ class RecognitionVizNode(Node):
             "zone_anchor_xy",
             [-1.0, 0.5, -1.0, -1.0, 0.75, -1.0, 0.75, 0.5],
         )
+        self.declare_parameter(
+            "zone_anchor_candidates",
+            [1.0, -1.0, 0.5, 2.0, -1.0, -1.0, 3.0, 0.75, -1.0, 4.0, 0.75, 0.5],
+        )
         self.show_zone_anchors = bool(self.get_parameter("show_zone_anchors").value)
         za = [float(v) for v in self.get_parameter("zone_anchor_xy").value]
-        self.zone_anchors: dict[int, tuple[float, float]] = {}
-        for i in range(0, min(len(za), 8), 2):
-            self.zone_anchors[i // 2 + 1] = (za[i], za[i + 1])
+        zc = [float(v) for v in self.get_parameter("zone_anchor_candidates").value]
+        self.zone_anchors: dict[int, list[tuple[float, float]]] = {}
+        for i in range(0, len(zc) - 2, 3):
+            zone_id = int(round(zc[i]))
+            if zone_id > 0:
+                self.zone_anchors.setdefault(zone_id, []).append((zc[i + 1], zc[i + 2]))
+        if not self.zone_anchors:
+            for i in range(0, min(len(za), 8), 2):
+                self.zone_anchors[i // 2 + 1] = [(za[i], za[i + 1])]
         self.declare_parameter("show_checkpoint_route", True)
         self.declare_parameter(
             "checkpoint_route_xy",
@@ -366,6 +377,7 @@ class RecognitionVizNode(Node):
         self.selected_id = 0
         self.phase = 0
         self.zone = 0
+        self.zone_entry_anchor_indices: dict[int, int] = {}
         self.object_slots: list[dict] = []
         self.current_slot_id = 0
         self.object_slots_schema = ""
@@ -563,6 +575,9 @@ class RecognitionVizNode(Node):
 
     def on_decision(self, msg: String) -> None:
         self.decisions.append(f"[{time.time() - self._t0:5.0f}s] {msg.data}")
+        match = re.match(r"^ZONE\s+(\d+)\s+ENTRY\s+ANCHOR\s+A(\d+)/\d+\b", msg.data)
+        if match:
+            self.zone_entry_anchor_indices[int(match.group(1))] = int(match.group(2))
 
     def on_object_slots(self, msg: String) -> None:
         try:
@@ -1053,13 +1068,19 @@ class RecognitionVizNode(Node):
     def _draw_zone_anchors(self, canvas) -> None:
         if not self.show_zone_anchors or not self.zone_anchors:
             return
-        for zid, (ax, ay) in sorted(self.zone_anchors.items()):
-            px, py = self._w2p(ax, ay)
-            col = _ZONE_COLORS.get(zid, (230, 230, 230))
-            cv2.drawMarker(canvas, (px, py), col, cv2.MARKER_CROSS, 18, 2, cv2.LINE_AA)
-            cv2.circle(canvas, (px, py), 9, col, 1, cv2.LINE_AA)
-            cv2.putText(canvas, f"A{zid}", (px + 10, py - 8),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.42, (245, 245, 245), 1, cv2.LINE_AA)
+        for zid, anchors in sorted(self.zone_anchors.items()):
+            for index, (ax, ay) in enumerate(anchors, start=1):
+                px, py = self._w2p(ax, ay)
+                active = zid == self.zone
+                selected = active and self.zone_entry_anchor_indices.get(zid) == index
+                col = (30, 30, 255) if not active else (40, 80, 255)
+                if selected:
+                    col = (0, 230, 255)
+                cv2.drawMarker(canvas, (px, py), col, cv2.MARKER_TILTED_CROSS,
+                               26 if selected else (22 if active else 18),
+                               4 if selected else (3 if active else 2), cv2.LINE_AA)
+                cv2.putText(canvas, f"A{zid}.{index}", (px + 10, py - 8),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.38, col, 1, cv2.LINE_AA)
 
     def _draw_checkpoint_route(self, canvas) -> None:
         if not self.show_checkpoint_route or not self.checkpoint_route:

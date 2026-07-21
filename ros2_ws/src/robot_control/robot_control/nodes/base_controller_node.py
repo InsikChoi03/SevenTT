@@ -28,6 +28,34 @@ def below_motion_deadband(
     return wheel_magnitude <= wheel_deadband and not pure_rotation
 
 
+def _four_scales(values, fallback: list[float]) -> list[float]:
+    vals = [float(v) for v in values]
+    return vals if len(vals) == 4 else list(fallback)
+
+
+def select_wheel_scales(
+    vx: float,
+    vy: float,
+    omega: float,
+    wheel_scales: list[float],
+    strafe_right_scales: list[float],
+    strafe_left_scales: list[float],
+    rotation_cw_scales: list[float],
+    rotation_ccw_scales: list[float],
+) -> list[float]:
+    pure_rotation = abs(vx) < 0.02 and abs(vy) < 0.02 and abs(omega) > 1e-3
+    if pure_rotation:
+        return list(rotation_cw_scales if omega < 0.0 else rotation_ccw_scales)
+
+    awx, awy = abs(vx), abs(vy)
+    tot = awx + awy
+    if tot < 1e-6:
+        return list(wheel_scales)
+
+    strafe = strafe_right_scales if vy < 0.0 else strafe_left_scales
+    return [(awx * wheel_scales[i] + awy * strafe[i]) / tot for i in range(4)]
+
+
 class BaseControllerNode(Node):
     def __init__(self) -> None:
         super().__init__("base_controller_node")
@@ -47,6 +75,10 @@ class BaseControllerNode(Node):
         # so vy<0 = rightward strafe -> right scales; vy>0 = leftward -> left scales.
         self.declare_parameter("strafe_right_scales", [0.70, 0.70, 0.80, 0.70])
         self.declare_parameter("strafe_left_scales", [0.65, 0.75, 0.75, 0.65])
+        # Pure in-place rotation trim.  Keep this separate from wheel_scales so a weak wheel can be
+        # helped during scan turns without changing forward/strafe behavior.
+        self.declare_parameter("rotation_cw_scales", [1.0, 1.0, 1.0, 1.0])
+        self.declare_parameter("rotation_ccw_scales", [1.0, 1.0, 1.0, 1.0])
         # STICTION: the heavy base only moves above ~this <BASE> magnitude (firmware normalises by
         # MAX_SPEED 0.6, so 0.42 ~ 0.7 duty). The velocity pipeline commands 0.05-0.20 which just
         # buzzed — so any real move is floored to this (direction preserved). 0 disables.
@@ -85,12 +117,21 @@ class BaseControllerNode(Node):
         self.lx = float(self.get_parameter("lx").value)
         self.ly = float(self.get_parameter("ly").value)
         self.cmd_timeout = float(self.get_parameter("cmd_timeout_sec").value)
-        sc = [float(v) for v in self.get_parameter("wheel_scales").value]
-        self.wheel_scales = sc if len(sc) == 4 else [1.0, 1.0, 1.0, 1.0]
-        sr = [float(v) for v in self.get_parameter("strafe_right_scales").value]
-        self.strafe_right = sr if len(sr) == 4 else [0.70, 0.70, 0.80, 0.70]
-        sl = [float(v) for v in self.get_parameter("strafe_left_scales").value]
-        self.strafe_left = sl if len(sl) == 4 else [0.65, 0.75, 0.75, 0.65]
+        self.wheel_scales = _four_scales(
+            self.get_parameter("wheel_scales").value, [1.0, 1.0, 1.0, 1.0]
+        )
+        self.strafe_right = _four_scales(
+            self.get_parameter("strafe_right_scales").value, [0.70, 0.70, 0.80, 0.70]
+        )
+        self.strafe_left = _four_scales(
+            self.get_parameter("strafe_left_scales").value, [0.65, 0.75, 0.75, 0.65]
+        )
+        self.rotation_cw_scales = _four_scales(
+            self.get_parameter("rotation_cw_scales").value, [1.0, 1.0, 1.0, 1.0]
+        )
+        self.rotation_ccw_scales = _four_scales(
+            self.get_parameter("rotation_ccw_scales").value, [1.0, 1.0, 1.0, 1.0]
+        )
         self.wheel_min = float(self.get_parameter("wheel_min").value)
         self.wheel_min_strafe = float(self.get_parameter("wheel_min_strafe").value)
         self.wheel_min_rot = float(self.get_parameter("wheel_min_rot").value)
@@ -185,6 +226,22 @@ class BaseControllerNode(Node):
                             reason="strafe_left_scales must have 4 values",
                         )
                     self.strafe_left = vals
+                elif name == "rotation_cw_scales":
+                    vals = [float(v) for v in p.value]
+                    if len(vals) != 4:
+                        return SetParametersResult(
+                            successful=False,
+                            reason="rotation_cw_scales must have 4 values",
+                        )
+                    self.rotation_cw_scales = vals
+                elif name == "rotation_ccw_scales":
+                    vals = [float(v) for v in p.value]
+                    if len(vals) != 4:
+                        return SetParametersResult(
+                            successful=False,
+                            reason="rotation_ccw_scales must have 4 values",
+                        )
+                    self.rotation_ccw_scales = vals
                 elif name == "wheel_min":
                     self.wheel_min = float(p.value)
                 elif name == "wheel_min_strafe":
@@ -258,16 +315,18 @@ class BaseControllerNode(Node):
         v_rl = vx + vy - k * omega
         v_rr = vx - vy + k * omega
 
-        # Direction-dependent per-wheel trim so BOTH forward and strafe track straight: forward uses
-        # wheel_scales, strafing uses the tuned per-direction scales, diagonals blend by |vx|:|vy|.
-        fwd = self.wheel_scales
-        strafe = self.strafe_right if vy < 0.0 else self.strafe_left
-        awx, awy = abs(vx), abs(vy)
-        tot = awx + awy
-        if tot < 1e-6:
-            sc = fwd                                    # pure rotation / stop -> forward trim
-        else:
-            sc = [(awx * fwd[i] + awy * strafe[i]) / tot for i in range(4)]
+        # Direction-dependent per-wheel trim so forward/strafe/rotation can be tuned independently:
+        # forward uses wheel_scales, strafe blends by |vx|:|vy|, pure rotation uses rotation_*_scales.
+        sc = select_wheel_scales(
+            vx,
+            vy,
+            omega,
+            self.wheel_scales,
+            self.strafe_right,
+            self.strafe_left,
+            self.rotation_cw_scales,
+            self.rotation_ccw_scales,
+        )
         wheels = [v_fl * sc[0], v_fr * sc[1], v_rl * sc[2], v_rr * sc[3]]
         wheels = [max(-1.0, min(1.0, w)) for w in wheels]
 

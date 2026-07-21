@@ -16,16 +16,17 @@ arm_ik.py는 아직 HOME_CMD/GRIPPER 캘리브 전(TODO)이라, 검증된 raw �
 
 ── 모듈로 쓰기 (추후 pick_run / mission_fsm 등에서) ──
     from arm_pick2r import Arm2R
-    with Arm2R("/dev/ttyUSB0") as arm:   # 열고 INIT로 스냅
+    with Arm2R("/dev/ttyUSB0", force_running=True) as arm:  # RUNNING 게이트 열고 INIT로 스냅
         arm.grip()                        # 집기: pick 자세 → 닫기
         arm.release()                     # 놓기: 현재 올린 자세에서 열기
 
 ── CLI 테스트 ──
-    python3 scripts/arm_pick2r.py               # 집기 → 놓기 1회
-    python3 scripts/arm_pick2r.py --only grip
-    python3 scripts/arm_pick2r.py --only release
-    python3 scripts/arm_pick2r.py --loop 3
-    python3 scripts/arm_pick2r.py --move-delay 1.0 --grip-delay 0.5
+    python3 scripts/arm_pick2r.py --force-running              # 집기 → 놓기 1회
+    python3 scripts/arm_pick2r.py --force-running --only stow
+    python3 scripts/arm_pick2r.py --force-running --only grip
+    python3 scripts/arm_pick2r.py --force-running --only release
+    python3 scripts/arm_pick2r.py --force-running --loop 3
+    python3 scripts/arm_pick2r.py --force-running --move-delay 1.0 --grip-delay 0.5
 """
 from __future__ import annotations
 
@@ -50,12 +51,14 @@ class Arm2R:
     놓기 이동 중에는 잡은 채(닫힘) 유지한 뒤 마지막에만 연다."""
 
     def __init__(self, port="/dev/ttyUSB0", baud=115200,
-                 move_delay=0.8, grip_delay=0.6, reset_wait=2.2):
+                 move_delay=0.8, grip_delay=0.6, reset_wait=2.2,
+                 force_running=False):
         self.port = port
         self.baud = baud
         self.move_delay = move_delay      # 팔 도달 후 그리퍼 움직이기 전 추가 대기(초)
         self.grip_delay = grip_delay      # 그리퍼 개폐 후 다음 동작 전 추가 대기(초)
         self.reset_wait = reset_wait
+        self.force_running = force_running
         self.ser = None
         # 마지막으로 보낸 목표 자세 [어깨, 손목, 그리퍼] — 이동시간 계산용. open()에서 INIT로 스냅.
         self._pose = [INIT["shoulder"], INIT["wrist"], INIT["gripper"]]
@@ -66,11 +69,17 @@ class Arm2R:
         self.ser = serial.Serial(self.port, self.baud, timeout=0.1)
         time.sleep(self.reset_wait)      # MCU 리셋 대기 (통합보드=베이스/리프트도 함께 리셋)
         self._drain(0.5)
+        if self.force_running:
+            self._write_line("<STATUS,RUNNING>")
+            self._drain(0.2)
         self.go_init()                   # 첫 <ARM> → boot-limp 해제, INIT로 스냅 흡수
         return self
 
     def close(self):
         if self.ser is not None:
+            if self.force_running:
+                self._write_line("<STATUS,STANDBY>")
+                self._drain(0.2)
             self.ser.close()
             self.ser = None
 
@@ -81,9 +90,12 @@ class Arm2R:
         self.close()
 
     # ── 저수준 ──
+    def _write_line(self, line):
+        self.ser.write((line.rstrip() + "\n").encode("ascii"))
+
     def _send(self, shoulder, wrist, gripper):
         t = [int(round(shoulder)), int(round(wrist)), int(round(gripper)), 90, 90, 90]
-        self.ser.write(("<ARM," + ",".join(str(x) for x in t) + ">\n").encode())
+        self._write_line("<ARM," + ",".join(str(x) for x in t) + ">")
 
     def _drain(self, s):
         end = time.time() + s
@@ -122,12 +134,14 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--port", default="/dev/ttyUSB0")
     ap.add_argument("--baud", type=int, default=115200)
-    ap.add_argument("--only", choices=["grip", "release"], help="지정 시 해당 동작만")
+    ap.add_argument("--only", choices=["stow", "grip", "release"], help="지정 시 해당 동작만")
     ap.add_argument("--loop", type=int, default=1, help="집기→놓기 반복 (--only 시 무시)")
     ap.add_argument("--move-delay", type=float, default=0.8, help="팔 도달 후 그리퍼 전 추가 대기(초)")
     ap.add_argument("--grip-delay", type=float, default=0.6, help="그리퍼 개폐 후 추가 대기(초)")
     ap.add_argument("--cycle-pause", type=float, default=0.5, help="집기↔놓기 사이 대기(초)")
     ap.add_argument("--init-delay", type=float, default=0.0, help="호환용 옵션(현재 자동 초기복귀 없음)")
+    ap.add_argument("--force-running", action="store_true",
+                    help="통합 펌웨어의 ARM 게이트를 위해 시작 때 STATUS,RUNNING, 종료 때 STATUS,STANDBY 전송")
     args = ap.parse_args()
 
     try:
@@ -137,8 +151,11 @@ def main():
         return 1
 
     try:
-        arm = Arm2R(args.port, args.baud, args.move_delay, args.grip_delay)
+        arm = Arm2R(args.port, args.baud, args.move_delay, args.grip_delay,
+                    force_running=args.force_running)
         print("⚠️ 첫 <ARM>에 INIT(110,10,100)으로 스냅합니다. 그리퍼 밑에 손/물건 없는지 확인.")
+        if args.force_running:
+            print("  [gate] STATUS,RUNNING으로 팔 게이트를 열고, 종료 시 STATUS,STANDBY로 닫습니다.")
         arm.open()
     except Exception as e:
         print(f"[err] 포트 {args.port} 열기 실패: {e}")
@@ -146,7 +163,10 @@ def main():
         return 1
 
     try:
-        if args.only == "grip":
+        if args.only == "stow":
+            print("  [대기자세]")
+            arm.go_init()
+        elif args.only == "grip":
             print("  [집기]")
             arm.grip()
         elif args.only == "release":
