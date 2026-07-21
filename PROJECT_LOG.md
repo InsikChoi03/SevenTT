@@ -26,10 +26,10 @@
 
 ## 2. 현재 상태 (Snapshot — 이 섹션만 최신값으로 덮어쓰기)
 
-- **현재 버전:** `v4.0.0` (`new` 브랜치 릴리스 커밋 `a7b5b77`, Git 태그 없음)
-- **최종 업데이트:** 2026-07-20 21:27 (KST)
+- **현재 버전:** `v4.1.0` (`new` 브랜치 릴리스 커밋 `cc3bb25`, Git 태그 없음)
+- **최종 업데이트:** 2026-07-21 17:05 (KST)
 - **최종 작업자:** `@AI`
-- **한 줄 요약:** 독립 로컬 앵커 시험에서 반경 50cm 후보를 IMU·body 시각 heading으로 한 바퀴 조사하고, 첫 타겟 과일을 즉시 ALIGN·실제 집기한 뒤 종료하는 v4.0.0 흐름을 구현했다.
+- **한 줄 요약:** 메인 경기를 Z1~Z4 dodecahedron 전용 흐름으로 전환하고, 직교 Lane heading lock·stand-off 접근과 MCU/실행 종료 안전을 추가한 v4.1.0을 확정했다.
 
 ---
 
@@ -140,12 +140,63 @@
 - [x] 독립 로컬 앵커 시험에 50cm 후보 inventory, IMU 누적 360도 제한, body 중앙 시각 heading 보정, 3Hz 중앙 우선 SigLIP 판정을 구현 — `@AI` (2026-07-20 완료)
 - [x] 첫 타겟 과일 확정 시 남은 후보 조사를 취소하고 motion tuning 기반 ALIGN 후 실제 2R PICK_PLACE 1회를 실행해 종료하도록 연결 — `@AI` (2026-07-20 완료)
 - [ ] `v4.0.0` 로컬 앵커 실주행에서 50cm inventory 중복 수, 시각 heading lock, body 좌표 ALIGN 및 실제 과일 1회 집기 성공 여부를 반복 검증 — `@insik`
+- [x] 메인 경기 설정을 anchor/Set2 슬롯 대신 Z1~Z4 순회와 dodecahedron 4개 수집 전용 흐름으로 전환 — `@AI` (2026-07-21 완료)
+- [x] zone별 복수 진입 anchor 중 현재 pose에서 가장 가까운 후보를 고정하고 라이브 맵에 선택 후보를 표시 — `@AI` (2026-07-21 완료)
+- [x] 직교 Lane heading lock, 물체 stand-off 경로, 정지 후 heading 안정화와 IMU 폐루프 body 재탐색 제어를 구현 — `@AI` (2026-07-21 완료)
+- [x] MCU PCA9685 FULL_OFF·명시적 STOP·프로파일 강제 OFF와 메인 실행기 프로세스/카메라 preflight 종료 안전을 강화 — `@AI` (2026-07-21 완료)
+- [ ] `v4.1.0` 메인 실주행에서 Z1~Z4 진입 anchor 선택, 2초 fresh 관측, dodecahedron stand-off·ALIGN·PICK과 zone 전환을 반복 검증 — `@insik`
+- [ ] `opening_enabled=false`와 RUNNING 버튼 즉시 D13 2초 ON 조합이 최종 경기 시작 의도와 일치하는지 확인 — `@insik`, `@AI`
+- [ ] 직진 wheel scale `[1.0, 0.90, 0.75, 1.0]`과 Lane heading lock이 실제 주행의 우측 편향·좌우 흔들림을 줄이는지 측정 — `@insik`
 
 ---
 
 ## 5. 변경 이력 (Changelog) — ⛔ 삭제 금지 / 최신 항목이 맨 위
 
 <!-- 새 엔트리는 바로 이 줄 아래에 추가하세요. 기존 엔트리는 건드리지 마세요. -->
+
+### `v4.1.0` — 2026-07-21 17:05 (KST) · 작업자: `@AI` · ID: `2026-07-21-01`
+- **변경 요약:** 메인 경기를 Z1~Z4 dodecahedron 전용 미션으로 전환하고 직교 Lane heading·stand-off 접근, 로컬 앵커 회전 안정화와 MCU/실행 종료 안전을 통합했다.
+- **상세:**
+  - `anchor_mission`과 기존 Set2/FruitSlot 경로를 끄고 `zone_mission`, zone filter, zone anchor 이동과 2초 fresh 관측을 켜 Z1→Z4 구역에서 dodecahedron 최대 4개만 처리하도록 경기 설정을 변경했다.
+  - 슬롯이 없는 zone 모드에서도 dodecahedron track이 생성되도록 world model의 slot 필수 birth gate를 해제하고, zone별 복수 anchor 중 진입 시 현재 pose에서 가장 가까운 후보 하나를 고정하도록 했다.
+  - 라이브 맵에 모든 zone anchor 후보와 현재 선택된 후보를 구분해 표시하고, Set2 슬롯 오버레이는 숨겨 현재 구역·경로 판단을 직관적으로 확인할 수 있게 했다.
+  - LanePlanner에 직교 endpoint connector와 물체 앞 stand-off 계획을 추가하고, 메인 FSM에 field heading 고정, 원형 heading 필터, 지속 이탈 재정렬, 방향 반전 settle과 직교 구간 주행을 연결했다.
+  - APPROACH 목표·heading을 latch하고 stand-off 도착 후 brake/settle 및 연속 heading 수렴을 거쳐 ALIGN으로 진입하며, body target 재탐색 회전도 시간 기반이 아닌 IMU heading 폐루프로 변경했다.
+  - 로컬 앵커 회전은 목표에서 멀 때 안정 출력으로 연속 회전하고 목표 7.5도 이내에서 정지한 뒤 IMU/body를 검증하며, 실패할 때만 안정 출력의 짧은 보정 펄스를 사용하도록 바꿨다.
+  - 순수 시계/반시계 회전에 별도 바퀴 scale을 적용하고 낮은 회전 명령이 일반 deadband에서 제거되지 않도록 base controller를 보완했으며, 직진 실측 편향 보정 scale을 설정했다.
+  - Arduino PCA9685 정지를 `FULL_OFF`로 전환하고 전 채널 반복 정지와 `<STOP>`을 추가했으며, Jetson bridge가 비-RUNNING에서 모터 frame을 반복 전송하지 않고 종료 시 zero·STOP·프로파일 OFF를 flush하도록 강화했다.
+  - 두 번째 시작 버튼의 RUNNING 전환에서 D13 프로파일을 2초 구동하고 비-RUNNING·부팅·종료 시 LOW를 반복 보장하도록 펌웨어와 bridge의 profile 소유권을 동기화했다.
+  - 메인 실행기가 이전 launch process group과 stale MCU bridge를 먼저 종료하고 Argus 해제 뒤 wide camera preflight를 최대 3회 재시도하며, Ctrl-C에서 actuator·rosbag·launch 자식을 단계적으로 정리하도록 개선했다.
+  - 단독 팔 점검에 `--force-running`과 `stow`를 추가하고 PWM/servo 진단 스크립트를 신설해 통합 펌웨어의 RUNNING gate 안에서 개별 채널을 검사할 수 있게 했다.
+  - 로컬 앵커·LanePlanner·heading lock·stand-off·zone anchor·base deadband 관련 테스트 73개, Python/Bash 문법 검사와 `git diff --check`를 통과했다.
+  - `new` 브랜치에 코드 릴리스 커밋 `cc3bb25`(`release: add zone lane navigation and actuator safety v4.1.0`)을 생성했다.
+- **변경 파일:**
+  - `firmware/base_arm_combined/base_arm_combined.ino` / 수정
+  - `ros2_ws/src/robot_bringup/config/local_anchor_test.yaml` / 수정
+  - `ros2_ws/src/robot_bringup/config/motion_tuning.yaml` / 수정
+  - `ros2_ws/src/robot_control/robot_control/nodes/base_controller_node.py` / 수정
+  - `ros2_ws/src/robot_control/test/test_base_controller_deadband.py` / 수정
+  - `ros2_ws/src/robot_hardware/robot_hardware/nodes/mcu_bridge_base_node.py` / 수정
+  - `ros2_ws/src/robot_perception/robot_perception/nodes/recognition_viz_node.py` / 수정
+  - `ros2_ws/src/robot_perception/robot_perception/nodes/world_model_node.py` / 수정
+  - `ros2_ws/src/robot_planning/robot_planning/lane_planner.py` / 수정
+  - `ros2_ws/src/robot_planning/robot_planning/local_anchor_fsm.py` / 수정
+  - `ros2_ws/src/robot_planning/robot_planning/nodes/local_anchor_test_node.py` / 수정
+  - `ros2_ws/src/robot_planning/robot_planning/nodes/local_anchor_web_node.py` / 수정
+  - `ros2_ws/src/robot_planning/robot_planning/nodes/mission_fsm_node.py` / 수정
+  - `ros2_ws/src/robot_planning/test/test_align_heading_control.py` / 신규
+  - `ros2_ws/src/robot_planning/test/test_approach_standoff_control.py` / 신규
+  - `ros2_ws/src/robot_planning/test/test_lane_heading_lock.py` / 신규
+  - `ros2_ws/src/robot_planning/test/test_lane_planner.py` / 수정
+  - `ros2_ws/src/robot_planning/test/test_local_anchor_fsm.py` / 수정
+  - `ros2_ws/src/robot_planning/test/test_zone_anchor_candidates.py` / 신규
+  - `scripts/arm_pick2r.py` / 수정
+  - `scripts/arm_pwm_diag.py` / 신규
+  - `scripts/arm_servo_diag.py` / 신규
+  - `scripts/run_test_field.sh` / 수정
+  - `PROJECT_LOG.md` / 수정
+- **다음 할 일 반영:** zone 전용 미션·복수 anchor·Lane heading/stand-off·MCU 종료 안전 구현을 완료 처리하고, 실제 zone 주행 검증, opening/D13 시작 정책 확인과 wheel scale 편향 측정 항목을 추가했다.
+- **버전 근거:** 독립 로컬 앵커 v4.0.0을 유지하면서 메인 미션에 새 zone 전용 실행 모드, 복수 진입 anchor, 직교 Lane heading 및 stand-off 접근, 새 진단·테스트와 하드웨어 종료 안전 기능을 추가했으므로 하위 호환을 유지하는 기능 릴리스인 `MINOR` 버전 `v4.1.0`으로 올렸다. 저장소의 기존 방식에 따라 별도 Git 태그는 생성하지 않았다.
 
 ### `v4.0.0` — 2026-07-20 21:27 (KST) · 작업자: `@AI` · ID: `2026-07-20-03`
 - **변경 요약:** 독립 로컬 앵커 시험을 50cm 단일 회전 탐색부터 첫 타겟 과일의 즉시 ALIGN·실제 집기·종료까지 수행하는 새 end-to-end 흐름으로 확장했다.
