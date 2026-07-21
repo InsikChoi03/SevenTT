@@ -26,7 +26,7 @@ class PickSequencerNode(Node):
         super().__init__("pick_sequencer_node")
 
         # 2R verified poses (re-taught 2026-07-08). Servo degrees.
-        self.declare_parameter("init_pose", [110.0, 30.0, 50.0])    # shoulder, wrist, gripper (stowed)
+        self.declare_parameter("init_pose", [110.0, 10.0, 100.0])   # shoulder, wrist, gripper (verified idle)
         self.declare_parameter("pick_shoulder_wrist", [25.0, 150.0])
         self.declare_parameter("place_shoulder_wrist", [110.0, 30.0])
         self.declare_parameter("grip_open", 115.0)
@@ -43,7 +43,7 @@ class PickSequencerNode(Node):
         self.place_sw = (plsw[0], plsw[1])
         self.grip_open = float(self.get_parameter("grip_open").value)
         self.grip_closed = float(self.get_parameter("grip_closed").value)
-        self.stow_pose = (self.place_sw[0], self.place_sw[1], self.grip_closed)
+        self.stow_pose = tuple(self.init_pose)
         self.move_sec = float(self.get_parameter("move_sec").value)
         self.grasp_sec = float(self.get_parameter("grasp_sec").value)
         self.preopen_sec = float(self.get_parameter("preopen_sec").value)
@@ -121,7 +121,7 @@ class PickSequencerNode(Node):
             ("LIFT",     self.move_sec,  (ish, iwr, self.grip_closed)),    # lift to init, holding
             ("TO_PLACE", self.move_sec,  (plsh, plwr, self.grip_closed)),  # move to place, holding
             ("PLACE",    self.grasp_sec, (plsh, plwr, self.grip_open)),    # open at place pose
-            ("STOW",     self.grasp_sec, (plsh, plwr, self.grip_closed)),  # drive with gripper closed
+            ("STOW",     self.grasp_sec, self.stow_pose),                  # return to driving pose
         ]
         self._launch("PICK_PLACE")
 
@@ -130,7 +130,7 @@ class PickSequencerNode(Node):
         self.seq = [
             ("TO_PLACE", self.move_sec,  (sh, wr, self.grip_closed)),  # move to place, holding
             ("RELEASE",  self.grasp_sec, (sh, wr, self.grip_open)),    # open at place pose
-            ("STOW",     self.grasp_sec, (sh, wr, self.grip_closed)),  # drive with gripper closed
+            ("STOW",     self.grasp_sec, self.stow_pose),              # return to driving pose
         ]
         self._launch("RELEASE")
 
@@ -154,10 +154,7 @@ class PickSequencerNode(Node):
     # --------------------------------------------------------------------- tick
     def tick(self) -> None:
         if not self.running:
-            if self._now_s() < self._init_until:
-                self._publish(tuple(self.init_pose))   # snap-absorb: hold INIT on boot
-            else:
-                self._publish(self.stow_pose)          # match driving: arm up at tray side, gripper closed
+            self._publish(self.stow_pose)              # hold init_pose throughout match driving
             return
         el = self._now_s() - self.seq_start_s
         if el >= self.total:

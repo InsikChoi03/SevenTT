@@ -304,26 +304,37 @@ def test_body_center_lock_rejects_low_confidence_and_large_imu_disagreement():
     assert fsm.summary()["visual_lock_count"] == 0
 
 
-def test_turn_runs_continuously_until_slowdown_zone():
-    cfg = LocalAnchorConfig(turn_omega=0.10, turn_slow_omega=0.07)
+def test_turn_rapid_fires_stable_pulses_with_short_brake_pause():
+    cfg = LocalAnchorConfig(
+        turn_omega=0.10,
+        turn_pulse_sec=0.24,
+        turn_burst_pause_sec=0.18,
+    )
     fsm = LocalAnchorFruitFsm(cfg)
     fsm.candidates = [candidate(1, -90)]
     fsm.route = [1]
     fsm._face_current_candidate(0.0)
 
     assert fsm.tick(0.0, 0.0).omega == 0.0
-    first = fsm.tick(0.05, math.radians(-5.0))
-    second = fsm.tick(0.10, math.radians(-10.0))
-    assert first.omega == -0.10
-    assert second.omega == -0.10
-    assert fsm.state == "TURN_CONTINUOUS"
+    assert fsm.state == "TURN_PULSE"
+    assert fsm.tick(0.05, math.radians(-5.0)).omega == -0.10
+    assert fsm.tick(0.13, math.radians(-10.0)).omega == -0.10
+    assert fsm.tick(0.25, math.radians(-20.0)).omega == 0.0
+    assert fsm.state == "TURN_SETTLE"
+    assert fsm.tick(0.42, math.radians(-20.0)).omega == 0.0
+    fsm.tick(0.44, math.radians(-20.0))
+    assert fsm.state == "TURN_MEASURE"
+    fsm.tick(0.45, math.radians(-20.0))
+    assert fsm.state == "TURN_PULSE"
+    assert fsm.summary()["turn_pulses"] == 2
 
 
-def test_turn_stops_inside_fifteen_degrees_then_pulses_if_still_short():
+def test_turn_stops_after_pulse_once_inside_ten_degrees_then_verifies():
     cfg = LocalAnchorConfig(
         turn_omega=0.10,
-        turn_slow_omega=0.07,
-        turn_slowdown_rad=math.radians(15.0),
+        turn_slowdown_rad=math.radians(10.0),
+        turn_pulse_sec=0.24,
+        turn_burst_pause_sec=0.18,
         turn_verify_sec=0.60,
         turn_correction_pulse_sec=0.10,
     )
@@ -333,14 +344,27 @@ def test_turn_stops_inside_fifteen_degrees_then_pulses_if_still_short():
     fsm._face_current_candidate(0.0)
     fsm.tick(0.0, 0.0)
 
-    command = fsm.tick(0.1, math.radians(-20.0))
-    assert command.omega == 0.0
+    assert fsm.tick(0.25, math.radians(-21.0)).omega == 0.0
+    assert fsm.state == "TURN_SETTLE"
+    fsm.tick(0.44, math.radians(-21.0))
+    fsm.tick(0.45, math.radians(-21.0))
     assert fsm.state == "TURN_VERIFY"
 
-    assert fsm.tick(0.69, math.radians(-20.0)).omega == 0.0
-    assert fsm.tick(0.71, math.radians(-20.0)).omega == 0.0
+    assert fsm.tick(1.04, math.radians(-21.0)).omega == 0.0
+    assert fsm.tick(1.06, math.radians(-21.0)).omega == 0.0
     assert fsm.state == "TURN_PULSE"
-    assert fsm.tick(0.72, math.radians(-20.0)).omega == -0.10
+    assert fsm.tick(1.07, math.radians(-21.0)).omega == -0.10
+
+
+def test_nonvisual_turn_finishes_inside_five_degree_tolerance():
+    cfg = LocalAnchorConfig(turn_tolerance_rad=math.radians(5.0))
+    fsm = LocalAnchorFruitFsm(cfg)
+    fsm._begin_turn(math.radians(-30.0), "FACE_SETTLE", 0.0, "test")
+
+    fsm.tick(0.0, math.radians(-25.1))
+
+    assert fsm.state == "FACE_SETTLE"
+    assert fsm.summary()["turn_pulses"] == 0
 
 
 def test_first_center_observation_stops_then_three_frames_lock_heading():
@@ -350,19 +374,18 @@ def test_first_center_observation_stops_then_three_frames_lock_heading():
     fsm.route = [1]
     fsm._face_current_candidate(0.0)
     fsm.tick(0.0, 0.0)
-    assert fsm.tick(0.1, math.radians(-35.0)).omega == 0.0
-    assert fsm.state == "TURN_VERIFY"
+    assert fsm.tick(0.04, math.radians(-35.0)).omega < 0.0
 
     assert not fsm.note_visual_fruit_center(
-        320.0, 0.9, 0.11, math.radians(-35.0), math.radians(-2.0)
+        320.0, 0.9, 0.05, math.radians(-35.0), math.radians(-2.0)
     )
     assert fsm.state == "TURN_VERIFY"
-    assert fsm.tick(0.12, math.radians(-35.0)).omega == 0.0
+    assert fsm.tick(0.06, math.radians(-35.0)).omega == 0.0
     assert not fsm.note_visual_fruit_center(
-        321.0, 0.9, 0.13, math.radians(-35.0), math.radians(-1.0)
+        321.0, 0.9, 0.07, math.radians(-35.0), math.radians(-1.0)
     )
     assert fsm.note_visual_fruit_center(
-        319.0, 0.9, 0.14, math.radians(-35.0), math.radians(1.0)
+        319.0, 0.9, 0.08, math.radians(-35.0), math.radians(1.0)
     )
     assert fsm.state == "FACE_SETTLE"
 
@@ -378,16 +401,18 @@ def test_failed_visual_verify_uses_short_correction_pulse_only_after_timeout():
     fsm.route = [1]
     fsm._face_current_candidate(0.0)
     fsm.tick(0.0, 0.0)
-    fsm.tick(0.1, math.radians(-43.0))
+    fsm.tick(0.25, math.radians(-43.0))
+    fsm.tick(0.44, math.radians(-43.0))
+    fsm.tick(0.45, math.radians(-43.0))
     assert fsm.state == "TURN_VERIFY"
     fsm.note_visual_fruit_center(
-        390.0, 0.9, 0.2, math.radians(-43.0), math.radians(-5.0)
+        390.0, 0.9, 0.46, math.radians(-43.0), math.radians(-5.0)
     )
 
-    assert fsm.tick(0.69, math.radians(-43.0)).omega == 0.0
-    assert fsm.tick(0.71, math.radians(-43.0)).omega == 0.0
+    assert fsm.tick(1.04, math.radians(-43.0)).omega == 0.0
+    assert fsm.tick(1.06, math.radians(-43.0)).omega == 0.0
     assert fsm.state == "TURN_PULSE"
-    assert fsm.tick(0.72, math.radians(-43.0)).omega < 0.0
+    assert fsm.tick(1.07, math.radians(-43.0)).omega < 0.0
 
 
 def test_first_target_classification_cancels_remaining_route_and_starts_align():

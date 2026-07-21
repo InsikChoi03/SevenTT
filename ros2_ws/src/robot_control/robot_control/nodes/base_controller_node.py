@@ -348,7 +348,9 @@ class BaseControllerNode(Node):
             and abs(vx) < 0.02
             and abs(omega) <= 1e-3
         )
-        align_profile = aligning or opening_align_strafe
+        # ALIGN translation keeps its calibrated no-boost unit-step profile. Pure heading-search
+        # pulses use the normal rotation profile so every stop/start can re-arm rotation torque.
+        align_profile = (aligning and not is_rot) or opening_align_strafe
         kick = False                                  # boost/brake pulse this tick -> bypass slew
         # For pure rotation, mecanum IK scales omega by (lx + ly).  With k=0.2, an intentional
         # omega=0.07 becomes a 0.014 wheel command, below the generic 0.02 wheel deadband.  Do not

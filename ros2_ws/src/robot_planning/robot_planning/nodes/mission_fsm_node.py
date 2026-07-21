@@ -9,7 +9,8 @@ States:
     CLASSIFY          - SigLIP gate (+ shape heuristic for set1)
     PICK              - arm pickup motion
     STORE_IN_TRAY     - place in body tray, increment counters
-    DRIVE_TO_STORAGE  - move to storage zone
+    WAIT_FOR_STORAGE  - hold after early mission completion until the timed parking deadline
+    DRIVE_TO_STORAGE  - staging, face-origin, straight-reverse storage route
     ALIGN_OVER_BIN    - align over storage box
     DUMP_ALL          - tilt/release tray
     END               - terminal
@@ -134,6 +135,200 @@ def lane_heading_violation_time_step(
     return start_s, float(now_s) - start_s >= max(0.0, float(required_sec))
 
 
+def timed_storage_due(
+    *,
+    run_started: bool,
+    triggered: bool,
+    completed: bool,
+    now_s: float,
+    run_start_s: float,
+    trigger_sec: float,
+) -> bool:
+    """Return whether the RUNNING-relative storage deadline has been reached once."""
+    return bool(
+        run_started
+        and not triggered
+        and not completed
+        and trigger_sec > 0.0
+        and float(now_s) - float(run_start_s) >= float(trigger_sec)
+    )
+
+
+def parking_face_heading(
+    staging_x: float,
+    staging_y: float,
+    face_x: float,
+    face_y: float,
+) -> float:
+    """Heading from the parking staging point toward the requested face point."""
+    return math.atan2(float(face_y) - float(staging_y), float(face_x) - float(staging_x))
+
+
+def straight_forward_command(
+    *,
+    current_heading: float,
+    target_heading: float,
+    distance_m: float,
+    max_speed: float,
+    heading_kp: float,
+    omega_max: float,
+) -> tuple[float, float, float]:
+    """Return a forward-only command with zero lateral translation and heading hold."""
+    error = math.atan2(
+        math.sin(float(target_heading) - float(current_heading)),
+        math.cos(float(target_heading) - float(current_heading)),
+    )
+    speed = min(abs(float(max_speed)), max(0.04, 0.5 * max(0.0, float(distance_m))))
+    omega_limit = abs(float(omega_max))
+    omega = max(-omega_limit, min(omega_limit, max(0.0, float(heading_kp)) * error))
+    return speed, 0.0, omega
+
+
+def straight_reverse_command(
+    *,
+    current_heading: float,
+    target_heading: float,
+    distance_m: float,
+    max_speed: float,
+    heading_kp: float,
+    omega_max: float,
+) -> tuple[float, float, float]:
+    """Return a reverse-only command with zero lateral translation and heading hold."""
+    error = math.atan2(
+        math.sin(float(target_heading) - float(current_heading)),
+        math.cos(float(target_heading) - float(current_heading)),
+    )
+    speed = min(abs(float(max_speed)), max(0.04, 0.5 * max(0.0, float(distance_m))))
+    omega_limit = abs(float(omega_max))
+    omega = max(-omega_limit, min(omega_limit, max(0.0, float(heading_kp)) * error))
+    return -speed, 0.0, omega
+
+
+class PulsedHeadingController:
+    """Closed-loop pulse/settle controller for torque-stable in-place turns."""
+
+    def __init__(
+        self,
+        *,
+        pulse_omega: float = 0.10,
+        slowdown_rad: float = math.radians(10.0),
+        coarse_pulse_sec: float = 0.24,
+        coarse_settle_sec: float = 0.18,
+        verify_sec: float = 0.60,
+        fine_pulse_sec: float = 0.10,
+        fine_settle_sec: float = 0.35,
+        max_pulses: int = 60,
+        timeout_sec: float = 30.0,
+    ) -> None:
+        self.pulse_omega = abs(float(pulse_omega))
+        self.slowdown_rad = abs(float(slowdown_rad))
+        self.coarse_pulse_sec = max(0.0, float(coarse_pulse_sec))
+        self.coarse_settle_sec = max(0.0, float(coarse_settle_sec))
+        self.verify_sec = max(0.0, float(verify_sec))
+        self.fine_pulse_sec = max(0.0, float(fine_pulse_sec))
+        self.fine_settle_sec = max(0.0, float(fine_settle_sec))
+        self.max_pulses = max(1, int(max_pulses))
+        self.timeout_sec = max(0.0, float(timeout_sec))
+        self.reset()
+
+    def reset(self) -> None:
+        self.key = None
+        self.target_heading = 0.0
+        self.phase = "measure"
+        self.phase_start_s = 0.0
+        self.turn_start_s = 0.0
+        self.pulse_sign = 0.0
+        self.pulse_duration_sec = 0.0
+        self.settle_duration_sec = 0.0
+        self.pulse_count = 0
+
+    @staticmethod
+    def _error(target_heading: float, current_heading: float) -> float:
+        return math.atan2(
+            math.sin(float(target_heading) - float(current_heading)),
+            math.cos(float(target_heading) - float(current_heading)),
+        )
+
+    def step(
+        self,
+        *,
+        now_s: float,
+        current_heading: float,
+        target_heading: float,
+        tolerance_rad: float,
+        key: object,
+        omega_limit: float | None = None,
+    ) -> tuple[bool, float, str | None]:
+        """Return ``(aligned, omega, event)``; translation is always owned by the caller."""
+        now = float(now_s)
+        if key != self.key:
+            self.reset()
+            self.key = key
+            self.target_heading = math.atan2(
+                math.sin(float(target_heading)), math.cos(float(target_heading))
+            )
+            self.turn_start_s = now
+
+        error = self._error(self.target_heading, current_heading)
+        tolerance = max(0.0, float(tolerance_rad))
+        omega = self.pulse_omega
+        if omega_limit is not None:
+            omega = min(omega, max(0.0, abs(float(omega_limit))))
+
+        if self.phase == "hold":
+            return False, 0.0, None
+
+        if self.phase == "pulse":
+            if now - self.phase_start_s < self.pulse_duration_sec:
+                return False, self.pulse_sign * omega, None
+            self.phase = "settle"
+            self.phase_start_s = now
+            return False, 0.0, "settle"
+
+        if self.phase == "settle":
+            if now - self.phase_start_s >= self.settle_duration_sec:
+                self.phase = "measure"
+            return False, 0.0, None
+
+        if self.phase == "verify":
+            if now - self.phase_start_s < self.verify_sec:
+                return False, 0.0, None
+            if abs(error) <= tolerance:
+                self.reset()
+                return True, 0.0, "complete"
+            timed_out = self.timeout_sec > 0.0 and now - self.turn_start_s >= self.timeout_sec
+            if self.pulse_count >= self.max_pulses or timed_out or omega <= 0.0:
+                self.phase = "hold"
+                return False, 0.0, "timeout"
+            self.pulse_count += 1
+            self.pulse_sign = math.copysign(1.0, error)
+            self.pulse_duration_sec = self.fine_pulse_sec
+            self.settle_duration_sec = self.fine_settle_sec
+            self.phase = "pulse"
+            self.phase_start_s = now
+            return False, 0.0, "fine_pulse"
+
+        if abs(error) <= tolerance:
+            self.reset()
+            return True, 0.0, "complete"
+        timed_out = self.timeout_sec > 0.0 and now - self.turn_start_s >= self.timeout_sec
+        if self.pulse_count >= self.max_pulses or timed_out or omega <= 0.0:
+            self.phase = "hold"
+            return False, 0.0, "timeout"
+        if abs(error) <= self.slowdown_rad:
+            self.phase = "verify"
+            self.phase_start_s = now
+            return False, 0.0, "verify"
+
+        self.pulse_count += 1
+        self.pulse_sign = math.copysign(1.0, error)
+        self.pulse_duration_sec = self.coarse_pulse_sec
+        self.settle_duration_sec = self.coarse_settle_sec
+        self.phase = "pulse"
+        self.phase_start_s = now
+        return False, 0.0, "coarse_pulse"
+
+
 COMPETITION_QOS = QoSProfile(
     history=HistoryPolicy.KEEP_LAST,
     depth=1,
@@ -145,7 +340,8 @@ COMPETITION_QOS = QoSProfile(
 STATES = [
     "OPENING", "SCAN", "ANCHOR_OBSERVE", "SELECT_TARGET", "ANCHOR_FACE_TARGET",
     "APPROACH", "ALIGN", "CLASSIFY", "PICK", "STORE_IN_TRAY", "ANCHOR_RETURN",
-    "ANCHOR_FACE_NEXT", "ZONE_STABILIZE", "DRIVE_TO_STORAGE", "ALIGN_OVER_BIN", "DUMP_ALL", "END",
+    "ANCHOR_FACE_NEXT", "ZONE_STABILIZE", "WAIT_FOR_STORAGE", "DRIVE_TO_STORAGE",
+    "ALIGN_OVER_BIN", "DUMP_ALL", "END",
 ]
 
 
@@ -215,6 +411,19 @@ class MissionFsmNode(Node):
         self.declare_parameter("pick_duration_sec", 3.0)
         self.declare_parameter("storage_x", 0.2)
         self.declare_parameter("storage_y", 0.2)
+        self.declare_parameter("timed_storage_enabled", False)
+        self.declare_parameter("timed_storage_start_sec", 150.0)
+        self.declare_parameter("storage_staging_x", 1.5)
+        self.declare_parameter("storage_staging_y", 1.5)
+        self.declare_parameter("storage_face_x", 0.0)
+        self.declare_parameter("storage_face_y", 0.0)
+        self.declare_parameter("storage_staging_reach_tol_m", 0.10)
+        self.declare_parameter("storage_heading_tolerance_rad", 0.06)
+        self.declare_parameter("storage_reverse_speed", 0.08)
+        self.declare_parameter("storage_reverse_heading_kp", 1.0)
+        self.declare_parameter("storage_reverse_omega_max", 0.06)
+        self.declare_parameter("storage_reverse_realign_rad", 0.1745)
+        self.declare_parameter("storage_reach_tol_m", 0.08)
         self.declare_parameter("shape_target_total", 4)   # set1 shape * 4
         self.declare_parameter("fruit_target_total", 0)   # set2 disabled by default: shapes only
         self.declare_parameter("publish_rate_hz", 5.0)
@@ -232,6 +441,7 @@ class MissionFsmNode(Node):
         # Mapping and object-flow start only after both wall estimates have converged.
         # Timed through /base_command so the base_controller's start-boost + stop-brake apply.
         self.declare_parameter("opening_enabled", True)
+        self.declare_parameter("opening_wall_validation_enabled", True)
         self.declare_parameter("startup_warmup_sec", 0.0)
         self.declare_parameter("opening_speed", 0.35)        # >= wheel_min so it's the actual speed
         self.declare_parameter("opening_forward_sec", 1.0)
@@ -262,6 +472,16 @@ class MissionFsmNode(Node):
         self.declare_parameter("direct_nav_omega_max", 0.405)
         self.declare_parameter("direct_nav_face_tol", 0.35)
         self.declare_parameter("direct_nav_stop_radius_m", 0.08)
+        # Local-anchor-proven in-place turn profile: pulse, stop, remeasure, then pulse again.
+        self.declare_parameter("nav_turn_pulse_omega", 0.10)
+        self.declare_parameter("nav_turn_slowdown_rad", math.radians(10.0))
+        self.declare_parameter("nav_turn_coarse_pulse_sec", 0.24)
+        self.declare_parameter("nav_turn_coarse_settle_sec", 0.18)
+        self.declare_parameter("nav_turn_verify_sec", 0.60)
+        self.declare_parameter("nav_turn_fine_pulse_sec", 0.10)
+        self.declare_parameter("nav_turn_fine_settle_sec", 0.35)
+        self.declare_parameter("nav_turn_max_pulses", 60)
+        self.declare_parameter("nav_turn_timeout_sec", 30.0)
         self.declare_parameter("lane_heading_lock_enabled", True)
         self.declare_parameter("lane_heading_initial_align_enabled", False)
         self.declare_parameter("lane_heading_axis_tolerance_m", 0.06)
@@ -526,12 +746,47 @@ class MissionFsmNode(Node):
         self.pick_duration_sec = float(self.get_parameter("pick_duration_sec").value)
         self.storage_x = float(self.get_parameter("storage_x").value)
         self.storage_y = float(self.get_parameter("storage_y").value)
+        self.timed_storage_enabled = bool(
+            self.get_parameter("timed_storage_enabled").value
+        )
+        self.timed_storage_start_sec = max(
+            0.0, float(self.get_parameter("timed_storage_start_sec").value)
+        )
+        self.storage_staging_x = float(self.get_parameter("storage_staging_x").value)
+        self.storage_staging_y = float(self.get_parameter("storage_staging_y").value)
+        self.storage_face_x = float(self.get_parameter("storage_face_x").value)
+        self.storage_face_y = float(self.get_parameter("storage_face_y").value)
+        self.storage_staging_reach_tol_m = max(
+            0.02, float(self.get_parameter("storage_staging_reach_tol_m").value)
+        )
+        self.storage_heading_tolerance_rad = max(
+            0.01, float(self.get_parameter("storage_heading_tolerance_rad").value)
+        )
+        self.storage_reverse_speed = abs(
+            float(self.get_parameter("storage_reverse_speed").value)
+        )
+        self.storage_reverse_heading_kp = max(
+            0.0, float(self.get_parameter("storage_reverse_heading_kp").value)
+        )
+        self.storage_reverse_omega_max = abs(
+            float(self.get_parameter("storage_reverse_omega_max").value)
+        )
+        self.storage_reverse_realign_rad = max(
+            self.storage_heading_tolerance_rad,
+            float(self.get_parameter("storage_reverse_realign_rad").value),
+        )
+        self.storage_reach_tol_m = max(
+            0.02, float(self.get_parameter("storage_reach_tol_m").value)
+        )
         self.shape_target_total = int(self.get_parameter("shape_target_total").value)
         self.fruit_target_total = int(self.get_parameter("fruit_target_total").value)
         self.dry_pick = bool(self.get_parameter("dry_pick").value)
         self.end_after_quota = bool(self.get_parameter("end_after_quota").value)
         self.select_timeout_sec = float(self.get_parameter("select_timeout_sec").value)
         self.opening_enabled = bool(self.get_parameter("opening_enabled").value)
+        self.opening_wall_validation_enabled = bool(
+            self.get_parameter("opening_wall_validation_enabled").value
+        )
         self.startup_warmup_sec = float(self.get_parameter("startup_warmup_sec").value)
         self.opening_speed = float(self.get_parameter("opening_speed").value)
         self.opening_forward_sec = float(self.get_parameter("opening_forward_sec").value)
@@ -588,6 +843,17 @@ class MissionFsmNode(Node):
         self.direct_nav_omega_max = float(self.get_parameter("direct_nav_omega_max").value)
         self.direct_nav_face_tol = float(self.get_parameter("direct_nav_face_tol").value)
         self.direct_nav_stop_radius_m = float(self.get_parameter("direct_nav_stop_radius_m").value)
+        self._pulsed_heading = PulsedHeadingController(
+            pulse_omega=float(self.get_parameter("nav_turn_pulse_omega").value),
+            slowdown_rad=float(self.get_parameter("nav_turn_slowdown_rad").value),
+            coarse_pulse_sec=float(self.get_parameter("nav_turn_coarse_pulse_sec").value),
+            coarse_settle_sec=float(self.get_parameter("nav_turn_coarse_settle_sec").value),
+            verify_sec=float(self.get_parameter("nav_turn_verify_sec").value),
+            fine_pulse_sec=float(self.get_parameter("nav_turn_fine_pulse_sec").value),
+            fine_settle_sec=float(self.get_parameter("nav_turn_fine_settle_sec").value),
+            max_pulses=int(self.get_parameter("nav_turn_max_pulses").value),
+            timeout_sec=float(self.get_parameter("nav_turn_timeout_sec").value),
+        )
         self.lane_heading_lock_enabled = bool(
             self.get_parameter("lane_heading_lock_enabled").value
         )
@@ -878,6 +1144,7 @@ class MissionFsmNode(Node):
         self._plan_idx = 0
         self._plan_start_xy: tuple[float, float] | None = None
         self._plan_route_mode = "grid_only"
+        self._post_pick_lane_entry_pending = False
         self._plan_generation = 0
         self._lane_heading_segment_key: tuple[int, int] | None = None
         self._lane_heading_phase = "align"
@@ -1005,6 +1272,11 @@ class MissionFsmNode(Node):
         self._competition_state = "STANDBY"
         self._run_started = False
         self._run_initial_state = "OPENING" if self.opening_enabled else "SCAN"
+        self._timed_storage_triggered = False
+        self._storage_route_completed = False
+        self._storage_route_phase = "to_staging"
+        self._storage_staging_heading: float | None = None
+        self._storage_reverse_heading: float | None = None
         self._opening_leg = "wait"
         self._opening_turn_target: float | None = None
         self._opening_heading_stable_count = 0
@@ -1138,6 +1410,11 @@ class MissionFsmNode(Node):
         self.selected = None
         self.set_type = 0
         self._opportunistic_set2_active = False
+        self._timed_storage_triggered = False
+        self._storage_route_completed = False
+        self._storage_route_phase = "to_staging"
+        self._storage_staging_heading = None
+        self._storage_reverse_heading = None
         self._opening_leg = "wait"
         self._opening_turn_target = None
         self._opening_heading_stable_count = 0
@@ -1155,6 +1432,7 @@ class MissionFsmNode(Node):
         self._world_mapping_enabled = not self.opening_enabled
         self._plan = None
         self._plan_start_xy = None
+        self._post_pick_lane_entry_pending = False
         self._lane_heading_segment_key = None
         self._lane_heading_phase = "align"
         self._lane_heading_filtered = None
@@ -1221,6 +1499,14 @@ class MissionFsmNode(Node):
     def _enter(self, new_state: str) -> None:
         prev = self.state
         if (
+            new_state == "DRIVE_TO_STORAGE"
+            and self.timed_storage_enabled
+            and self._run_started
+            and not self._timed_storage_triggered
+            and not self._storage_route_completed
+        ):
+            new_state = "WAIT_FOR_STORAGE"
+        if (
             self.anchor_mission_enabled
             and self._anchor_current_slot_id is not None
             and prev in {"APPROACH", "ALIGN", "CLASSIFY"}
@@ -1243,6 +1529,16 @@ class MissionFsmNode(Node):
         self._lane_heading_reverse_start_s = 0.0
         self._reset_object_connector_brake()
         self._plan_escape = False
+        if new_state == "DRIVE_TO_STORAGE":
+            self._storage_route_phase = "to_staging"
+            self._storage_staging_heading = None
+            self._storage_reverse_heading = parking_face_heading(
+                self.storage_staging_x,
+                self.storage_staging_y,
+                self.storage_face_x,
+                self.storage_face_y,
+            )
+            self._reset_pulsed_heading()
         if new_state == "ALIGN":
             self._align_phase = "measure"       # start each ALIGN by measuring the settled position
             self._yaw_scan_step = 0
@@ -1357,7 +1653,13 @@ class MissionFsmNode(Node):
                 self._search_step()
             else:
                 th = self.world.robot_theta if self.world is not None else 0.0
-                self._drive_toward(zx, zy, th, exclude_id=0)
+                self._drive_toward(
+                    zx,
+                    zy,
+                    th,
+                    exclude_id=0,
+                    route_mode=self._next_travel_route_mode(),
+                )
             return
         if not self.planner_enabled:
             wp = self._patrol_waypoints[self._patrol_idx]
@@ -1374,7 +1676,13 @@ class MissionFsmNode(Node):
                 self._coverage = list(self._patrol_waypoints)
         wp = self._coverage[self._coverage_idx]
         th = self.world.robot_theta if self.world is not None else 0.0
-        self._drive_toward(wp[0], wp[1], th, exclude_id=0)
+        self._drive_toward(
+            wp[0],
+            wp[1],
+            th,
+            exclude_id=0,
+            route_mode=self._next_travel_route_mode(),
+        )
         if (d := self._distance_to(wp[0], wp[1])) is not None and d < self.patrol_reach_tol:
             self._coverage_idx += 1
             self._plan = None                            # next sweep waypoint replans its route
@@ -2873,6 +3181,52 @@ class MissionFsmNode(Node):
         c.vx, c.vy, c.omega = float(vx), float(vy), float(omega)
         self.pub_cmd.publish(c)
 
+    def _pulsed_heading_controller(self) -> PulsedHeadingController:
+        controller = getattr(self, "_pulsed_heading", None)
+        if controller is None:
+            controller = PulsedHeadingController()
+            self._pulsed_heading = controller
+        return controller
+
+    def _reset_pulsed_heading(self) -> None:
+        controller = getattr(self, "_pulsed_heading", None)
+        if controller is not None:
+            controller.reset()
+
+    def _turn_in_place_pulsed(
+        self,
+        target_heading: float,
+        tolerance_rad: float,
+        key: object,
+        omega_limit: float | None = None,
+        *,
+        stop_when_aligned: bool = True,
+    ) -> bool:
+        """Rotate with torque-restoring pulses and zero translation between measurements."""
+        if self.world is None:
+            self._drive(0.0, 0.0, 0.0)
+            return False
+        aligned, omega, event = self._pulsed_heading_controller().step(
+            now_s=self._now_s(),
+            current_heading=float(self.world.robot_theta),
+            target_heading=float(target_heading),
+            tolerance_rad=float(tolerance_rad),
+            key=key,
+            omega_limit=omega_limit,
+        )
+        if not aligned or stop_when_aligned:
+            self._drive(0.0, 0.0, omega)
+        if event in {"coarse_pulse", "fine_pulse"}:
+            self._decide(
+                f"TURN {event.upper()} target={math.degrees(target_heading):+.1f}deg"
+            )
+        elif event == "timeout":
+            self.get_logger().error(
+                "pulsed in-place turn did not converge; holding base stopped",
+                throttle_duration_sec=2.0,
+            )
+        return aligned
+
     def _drive_toward_direct(self, dest_x: float, dest_y: float, yaw: float = 0.0) -> None:
         """Drive to a field waypoint by publishing /base_command directly from the FSM.
 
@@ -2889,42 +3243,58 @@ class MissionFsmNode(Node):
         bx, by = base
         dist = math.hypot(bx, by)
         if dist <= self.direct_nav_stop_radius_m:
-            yaw_err = self._wrap_pi(float(yaw) - float(self.world.robot_theta))
-            if abs(yaw_err) <= self.direct_nav_face_tol:
-                self._drive(0.0, 0.0, 0.0)
-            else:
-                om = max(
-                    -self.direct_nav_omega_max,
-                    min(self.direct_nav_omega_max, self.direct_nav_kp_ang * yaw_err),
-                )
-                self._drive(0.0, 0.0, om)
+            self._turn_in_place_pulsed(
+                yaw,
+                self.direct_nav_face_tol,
+                ("direct_final", round(float(dest_x), 3), round(float(dest_y), 3)),
+                self.direct_nav_omega_max,
+            )
             return
-        heading_err = math.atan2(by, bx)
-        om = max(
-            -self.direct_nav_omega_max,
-            min(self.direct_nav_omega_max, self.direct_nav_kp_ang * heading_err),
+        target_heading = math.atan2(
+            float(dest_y) - float(self.world.robot_y),
+            float(dest_x) - float(self.world.robot_x),
         )
-        if abs(heading_err) > self.direct_nav_face_tol:
-            self._drive(0.0, 0.0, om)
-        else:
+        aligned = self._turn_in_place_pulsed(
+            target_heading,
+            self.direct_nav_face_tol,
+            ("direct_travel", round(float(dest_x), 3), round(float(dest_y), 3)),
+            self.direct_nav_omega_max,
+            stop_when_aligned=False,
+        )
+        if aligned:
             self._drive(max(0.0, self.direct_nav_speed), 0.0, 0.0)
 
     def _rotate_to_heading(
         self, target_heading: float, tolerance_rad: float, omega_max: float
     ) -> bool:
-        """Rotate in place until measured robot heading reaches the requested field heading."""
-        if self.world is None:
-            self._drive(0.0, 0.0, 0.0)
-            return False
-        aligned, omega = heading_control_command(
-            float(self.world.robot_theta),
-            float(target_heading),
+        """Pulse in place until measured robot heading reaches the requested field heading."""
+        return self._turn_in_place_pulsed(
+            target_heading,
             tolerance_rad,
-            self.direct_nav_kp_ang,
+            ("rotate", getattr(self, "state", ""), round(float(target_heading), 3)),
             omega_max,
         )
-        self._drive(0.0, 0.0, omega)
-        return aligned
+
+    def _drive_to_post_pick_lane_entry(self, dest_x: float, dest_y: float) -> None:
+        """Face the first lane waypoint, then enter it with zero commanded yaw."""
+        if self.world is None:
+            self._drive(0.0, 0.0, 0.0)
+            return
+        dx = float(dest_x) - float(self.world.robot_x)
+        dy = float(dest_y) - float(self.world.robot_y)
+        if math.hypot(dx, dy) <= self.wp_reach_tol_m:
+            self._drive(0.0, 0.0, 0.0)
+            return
+        target_heading = math.atan2(dy, dx)
+        aligned = self._turn_in_place_pulsed(
+            target_heading,
+            self.lane_heading_align_tolerance_rad,
+            ("post_pick_entry", round(float(dest_x), 3), round(float(dest_y), 3)),
+            self.direct_nav_omega_max,
+            stop_when_aligned=False,
+        )
+        if aligned:
+            self._drive(max(0.0, self.direct_nav_speed), 0.0, 0.0)
 
     def _reset_approach_motion(self) -> None:
         self._approach_standoff_xy = None
@@ -2946,7 +3316,10 @@ class MissionFsmNode(Node):
             exclude_id = int(self.current_target.id) if self.current_target is not None else 0
             obstacles = self._obstacles_snapshot(exclude_id, (gx, gy))
             result = self._planner.plan_object_standoff(
-                robot_xy, (gx, gy), obstacles
+                robot_xy,
+                (gx, gy),
+                obstacles,
+                route_mode=self._next_travel_route_mode(),
             )
             if result is None:
                 self._decide("APPROACH GRID STAND-OFF unavailable -> HOLD")
@@ -3019,6 +3392,7 @@ class MissionFsmNode(Node):
             self._approach_heading_latched - self._approach_heading_filtered
         )
         if abs(error) <= max(0.0, float(heading_tolerance_rad)):
+            self._reset_pulsed_heading()
             self._approach_heading_stable_count += 1
             self._drive(0.0, 0.0, 0.0)
             if self._approach_heading_stable_count >= self.approach_heading_stable_frames:
@@ -3031,9 +3405,20 @@ class MissionFsmNode(Node):
             return True, False
 
         self._approach_heading_stable_count = 0
-        limit = max(0.0, float(omega_max))
-        omega = max(-limit, min(limit, self.direct_nav_kp_ang * error))
-        self._drive(0.0, 0.0, omega)
+        self._turn_in_place_pulsed(
+            self._approach_heading_latched,
+            heading_tolerance_rad,
+            (
+                "approach_heading",
+                round(float(self._approach_standoff_xy[0]), 3)
+                if self._approach_standoff_xy is not None
+                else 0.0,
+                round(float(self._approach_standoff_xy[1]), 3)
+                if self._approach_standoff_xy is not None
+                else 0.0,
+            ),
+            omega_max,
+        )
         return True, False
 
     def _reset_object_connector_brake(self) -> None:
@@ -3072,8 +3457,11 @@ class MissionFsmNode(Node):
         start: tuple[float, float],
         dest: tuple[float, float],
         segment_key: tuple[int, int],
+        *,
+        force_initial_align: bool = False,
+        forward_only: bool = False,
     ) -> bool:
-        """Follow a cardinal lane leg without forcing an in-place turn at segment entry."""
+        """Face a cardinal lane leg in place, then follow it without lateral translation."""
         if not self.lane_heading_lock_enabled or self.world is None:
             return False
         heading = cardinal_segment_heading(
@@ -3085,6 +3473,7 @@ class MissionFsmNode(Node):
         raw_heading = float(self.world.robot_theta)
         error = self._wrap_pi(heading - raw_heading)
         if self._lane_heading_segment_key != segment_key:
+            self._reset_pulsed_heading()
             self._lane_heading_segment_key = segment_key
             self._lane_heading_filtered = raw_heading
             self._lane_heading_violation_start_s = None
@@ -3094,76 +3483,21 @@ class MissionFsmNode(Node):
             self._lane_heading_turn_sign = 0
             self._lane_heading_reverse_start_s = 0.0
             self._decide(f"LANE HEADING {math.degrees(heading):+.0f}deg")
-            if not self.lane_heading_initial_align_enabled:
+            if abs(error) <= self.lane_heading_align_tolerance_rad:
                 self._lane_heading_phase = "drive"
-                self._decide(
-                    f"LANE ENTRY TRANSLATE error={math.degrees(error):+.1f}deg"
-                )
-            elif abs(error) <= self.lane_heading_realign_tolerance_rad:
-                self._lane_heading_phase = "drive"
-            elif abs(error) <= self.lane_heading_soft_entry_tolerance_rad:
-                self._lane_heading_phase = "soft_entry"
-                self._lane_heading_entry_start_s = now
-                self._lane_heading_turn_sign = 1 if error > 0.0 else -1
-                self._decide(
-                    f"LANE SOFT ENTRY error={math.degrees(error):+.1f}deg"
-                )
             else:
                 self._lane_heading_phase = "align"
+                self._decide(
+                    f"LANE ENTRY PULSE ALIGN error={math.degrees(error):+.1f}deg"
+                )
 
         if self._distance_to(dest[0], dest[1]) <= self.direct_nav_stop_radius_m:
             self._drive(0.0, 0.0, 0.0)
             return True
 
-        if self._lane_heading_phase == "soft_entry":
-            if abs(error) <= self.lane_heading_realign_tolerance_rad:
-                self._lane_heading_phase = "drive"
-                self._lane_heading_filtered = raw_heading
-                self._lane_heading_violation_start_s = None
-                self._lane_heading_entry_start_s = 0.0
-                self._lane_heading_turn_sign = 0
-                self._decide(
-                    f"LANE SOFT ENTRY COMPLETE error={math.degrees(error):+.1f}deg"
-                )
-                self._drive(max(0.0, self.direct_nav_speed), 0.0, 0.0)
-                return True
-            turn_sign = 1 if error > 0.0 else -1
-            if self._lane_heading_turn_sign != 0 and turn_sign != self._lane_heading_turn_sign:
-                self._lane_heading_phase = "drive"
-                self._lane_heading_filtered = raw_heading
-                self._lane_heading_violation_start_s = None
-                self._lane_heading_entry_start_s = 0.0
-                self._lane_heading_turn_sign = 0
-                self._decide(
-                    f"LANE SOFT ENTRY CROSSED error={math.degrees(error):+.1f}deg"
-                )
-                self._drive(max(0.0, self.direct_nav_speed), 0.0, 0.0)
-                return True
-            if now - self._lane_heading_entry_start_s >= self.lane_heading_soft_entry_timeout_sec:
-                self._drive(0.0, 0.0, 0.0)
-                self._lane_heading_phase = "align"
-                self._lane_heading_entry_start_s = 0.0
-                self._lane_heading_turn_sign = 0
-                self._decide("LANE SOFT ENTRY TIMEOUT -> ALIGN")
-                return True
-            omega = max(
-                -self.lane_heading_soft_entry_omega_max,
-                min(
-                    self.lane_heading_soft_entry_omega_max,
-                    self.lane_heading_soft_entry_kp * error,
-                ),
-            )
-            speed = min(
-                max(0.0, self.direct_nav_speed),
-                self.lane_heading_soft_entry_speed,
-            )
-            self._lane_heading_filtered = raw_heading
-            self._lane_heading_turn_sign = turn_sign
-            self._drive(speed, 0.0, omega)
-            return True
-
         if self._lane_heading_phase == "reverse_settle":
             self._drive(0.0, 0.0, 0.0)
+            self._reset_pulsed_heading()
             self._lane_heading_filtered = raw_heading
             if now - self._lane_heading_reverse_start_s >= self.lane_heading_reverse_settle_sec:
                 self._lane_heading_phase = "align"
@@ -3172,33 +3506,17 @@ class MissionFsmNode(Node):
             return True
 
         if self._lane_heading_phase == "align":
-            if abs(error) <= self.lane_heading_align_tolerance_rad:
-                self._drive(0.0, 0.0, 0.0)
+            aligned = self._turn_in_place_pulsed(
+                heading,
+                self.lane_heading_align_tolerance_rad,
+                ("lane_heading", segment_key),
+                self.lane_heading_omega_max,
+            )
+            if aligned:
                 self._lane_heading_phase = "settle"
                 self._lane_heading_settle_start_s = now
                 self._lane_heading_filtered = raw_heading
                 self._lane_heading_turn_sign = 0
-            else:
-                turn_sign = 1 if error > 0.0 else -1
-                if (
-                    self._lane_heading_turn_sign != 0
-                    and turn_sign != self._lane_heading_turn_sign
-                ):
-                    self._drive(0.0, 0.0, 0.0)
-                    self._lane_heading_phase = "reverse_settle"
-                    self._lane_heading_reverse_start_s = now
-                    self._lane_heading_turn_sign = 0
-                    self._decide(
-                        "LANE TURN REVERSAL -> "
-                        f"SETTLE {self.lane_heading_reverse_settle_sec:.2f}s"
-                    )
-                    return True
-                omega = max(
-                    -self.lane_heading_omega_max,
-                    min(self.lane_heading_omega_max, self.lane_heading_kp * error),
-                )
-                self._lane_heading_turn_sign = turn_sign
-                self._drive(0.0, 0.0, omega)
             return True
 
         if self._lane_heading_phase == "settle":
@@ -3230,6 +3548,7 @@ class MissionFsmNode(Node):
             )
         if realign:
             self._drive(0.0, 0.0, 0.0)
+            self._reset_pulsed_heading()
             self._lane_heading_phase = "align"
             self._lane_heading_filtered = raw_heading
             self._lane_heading_violation_start_s = None
@@ -3279,7 +3598,7 @@ class MissionFsmNode(Node):
             )
             if abs(filtered_error) <= self.lane_heading_deadband_rad:
                 omega = 0.0
-        self._drive(speed * bx / base_dist, speed * by / base_dist, omega)
+        self._drive(speed, 0.0, omega)
         return True
 
     @staticmethod
@@ -3350,6 +3669,17 @@ class MissionFsmNode(Node):
 
     def _reset_zone_scan_timer(self) -> None:
         self._zone_no_target_since = None
+
+    def _next_travel_route_mode(self, default: str = "grid_only") -> str:
+        """Use the direct first-lane connector for exactly one post-pick travel plan."""
+        if (
+            getattr(self, "_plan", None) is not None
+            and getattr(self, "_plan_route_mode", default) == "post_pick_entry"
+        ):
+            return "post_pick_entry"
+        if getattr(self, "_post_pick_lane_entry_pending", False):
+            return "post_pick_entry"
+        return default
 
     def _zone_is_stabilized(self) -> bool:
         if not self.zone_mission_enabled or not self.zone_stabilize_enabled:
@@ -3532,6 +3862,8 @@ class MissionFsmNode(Node):
             self._plan_escape = False
             if vias:
                 self._plan = vias
+                if route_mode == "post_pick_entry":
+                    self._post_pick_lane_entry_pending = False
             else:
                 escape = self._front_escape_waypoint(obstacles)
                 if escape is not None:
@@ -3559,6 +3891,9 @@ class MissionFsmNode(Node):
             self._plan_stamp = now
             if self._plan:
                 route = " -> ".join(f"({x:.2f},{y:.2f})" for x, y in self._plan)
+                if route_mode == "post_pick_entry":
+                    first_x, first_y = self._plan[0]
+                    self._decide(f"POST-PICK LANE ENTRY ({first_x:.2f},{first_y:.2f})")
                 self._decide(f"LANE ROUTE {route}")
                 self.get_logger().info(f"latched lane route: {route}")
             else:
@@ -3602,8 +3937,13 @@ class MissionFsmNode(Node):
             else self._plan[self._plan_idx - 1]
         )
         segment_key = (self._plan_generation, self._plan_idx)
+        post_pick_plan = self._plan_route_mode == "post_pick_entry"
         cardinal_handled = segment_start is not None and self._drive_cardinal_lane_segment(
-            segment_start, (wx, wy), segment_key
+            segment_start,
+            (wx, wy),
+            segment_key,
+            force_initial_align=post_pick_plan,
+            forward_only=post_pick_plan,
         )
         if not cardinal_handled:
             self._lane_heading_segment_key = None
@@ -3615,7 +3955,9 @@ class MissionFsmNode(Node):
             self._lane_heading_entry_start_s = 0.0
             self._lane_heading_turn_sign = 0
             self._lane_heading_reverse_start_s = 0.0
-            if self._plan_route_mode == "object_approach" and last:
+            if self._plan_route_mode == "post_pick_entry" and self._plan_idx == 0:
+                self._drive_to_post_pick_lane_entry(wx, wy)
+            elif self._plan_route_mode == "object_approach" and last:
                 self._drive_toward_direct(wx, wy, via_yaw)
             else:
                 self._drive(0.0, 0.0, 0.0)
@@ -4332,7 +4674,8 @@ class MissionFsmNode(Node):
             self._opportunistic_set2_active = False
             self._enter("ANCHOR_RETURN")
             return
-        if self.set_type == 1:
+        picked_shape = self.set_type == 1
+        if picked_shape:
             self.tray_shape += 1
         elif self.set_type == 2:
             self.tray_fruit += 1
@@ -4345,6 +4688,9 @@ class MissionFsmNode(Node):
         self._clear_current_slot()
         self.set_type = 0
         self._opportunistic_set2_active = False
+        if self.zone_mission_enabled and picked_shape:
+            self._post_pick_lane_entry_pending = True
+            self._decide("PICK COMPLETE -> NEXT LANE ENTRY")
 
         # In the legacy phased flow, advance to Set2 once Set1 quota is met. Mixed mode keeps
         # selecting from both quotas and only uses phase as the current target type.
@@ -4377,6 +4723,198 @@ class MissionFsmNode(Node):
         else:
             self._enter("SELECT_TARGET")
 
+    def _maybe_start_timed_storage(self) -> None:
+        """Preempt the field mission at the RUNNING-relative storage deadline."""
+        if not self.timed_storage_enabled:
+            return
+        due = timed_storage_due(
+            run_started=self._run_started,
+            triggered=self._timed_storage_triggered,
+            completed=self._storage_route_completed,
+            now_s=self._now_s(),
+            run_start_s=self._node_start_s,
+            trigger_sec=self.timed_storage_start_sec,
+        )
+        if not due:
+            return
+        if self.state in {"DRIVE_TO_STORAGE", "ALIGN_OVER_BIN", "DUMP_ALL"}:
+            self._timed_storage_triggered = True
+            return
+        # Do not drive away while the arm is physically executing a pick. STORE_IN_TRAY runs on the
+        # next tick to commit the completed pick, then the deadline starts parking immediately.
+        if self.state in {"PICK", "STORE_IN_TRAY"}:
+            self._drive(0.0, 0.0, 0.0)
+            return
+
+        self._timed_storage_triggered = True
+        self.current_target = None
+        self._clear_current_slot()
+        self._anchor_current_slot_id = None
+        self.set_type = 0
+        self._opportunistic_set2_active = False
+        self._post_pick_lane_entry_pending = False
+        self._decide(
+            f"TIMED STORAGE t={self._now_s() - self._node_start_s:.1f}s "
+            f"-> STAGING ({self.storage_staging_x:.2f},{self.storage_staging_y:.2f})"
+        )
+        self._enter("DRIVE_TO_STORAGE")
+
+    def _finish_storage_reverse(self, reason: str) -> None:
+        self._drive(0.0, 0.0, 0.0)
+        self._storage_route_completed = True
+        self._decide(
+            f"STORAGE REACHED ({self.storage_x:.2f},{self.storage_y:.2f}) {reason}"
+        )
+        self._enter("ALIGN_OVER_BIN")
+
+    def _step_drive_to_storage(self) -> None:
+        """Drive to staging, face the origin, then reverse straight into the storage point."""
+        if self.world is None:
+            self._drive(0.0, 0.0, 0.0)
+            return
+
+        if self._storage_route_phase == "to_staging":
+            distance = self._distance_to(self.storage_staging_x, self.storage_staging_y)
+            if distance is not None and distance <= self.storage_staging_reach_tol_m:
+                self._drive(0.0, 0.0, 0.0)
+                self._storage_route_phase = "face_origin"
+                self._reset_pulsed_heading()
+                self._decide(
+                    f"STORAGE STAGING REACHED ({self.storage_staging_x:.2f},"
+                    f"{self.storage_staging_y:.2f}) -> FACE "
+                    f"({self.storage_face_x:.2f},{self.storage_face_y:.2f})"
+                )
+                return
+            if distance is None:
+                self._drive(0.0, 0.0, 0.0)
+                return
+            if self._storage_staging_heading is None:
+                self._storage_staging_heading = math.atan2(
+                    self.storage_staging_y - float(self.world.robot_y),
+                    self.storage_staging_x - float(self.world.robot_x),
+                )
+                self._reset_pulsed_heading()
+                self._decide(
+                    f"STORAGE DIRECT HEADING "
+                    f"{math.degrees(self._storage_staging_heading):+.1f}deg"
+                )
+            aligned = self._turn_in_place_pulsed(
+                self._storage_staging_heading,
+                self.storage_heading_tolerance_rad,
+                key=("storage_face_staging", round(self._storage_staging_heading, 6)),
+            )
+            if aligned:
+                self._storage_route_phase = "straight_to_staging"
+                self._decide(
+                    f"STORAGE DIRECT -> ({self.storage_staging_x:.2f},"
+                    f"{self.storage_staging_y:.2f})"
+                )
+            return
+
+        if self._storage_route_phase == "straight_to_staging":
+            distance = self._distance_to(self.storage_staging_x, self.storage_staging_y)
+            if distance is None:
+                self._drive(0.0, 0.0, 0.0)
+                return
+            if distance <= self.storage_staging_reach_tol_m:
+                self._drive(0.0, 0.0, 0.0)
+                self._storage_route_phase = "face_origin"
+                self._reset_pulsed_heading()
+                self._decide(
+                    f"STORAGE STAGING REACHED ({self.storage_staging_x:.2f},"
+                    f"{self.storage_staging_y:.2f}) -> FACE "
+                    f"({self.storage_face_x:.2f},{self.storage_face_y:.2f})"
+                )
+                return
+            heading = self._storage_staging_heading
+            if heading is None:
+                self._storage_route_phase = "to_staging"
+                return
+            heading_error = self._wrap_pi(heading - float(self.world.robot_theta))
+            if abs(heading_error) >= self.storage_reverse_realign_rad:
+                self._drive(0.0, 0.0, 0.0)
+                self._storage_route_phase = "to_staging"
+                self._storage_staging_heading = None
+                self._reset_pulsed_heading()
+                self._decide(
+                    f"STORAGE DIRECT RE-ALIGN error="
+                    f"{math.degrees(heading_error):+.1f}deg"
+                )
+                return
+            vx, vy, omega = straight_forward_command(
+                current_heading=float(self.world.robot_theta),
+                target_heading=heading,
+                distance_m=distance,
+                max_speed=self.direct_nav_speed,
+                heading_kp=self.storage_reverse_heading_kp,
+                omega_max=self.storage_reverse_omega_max,
+            )
+            self._drive(vx, vy, omega)
+            return
+
+        heading = self._storage_reverse_heading
+        if heading is None:
+            heading = parking_face_heading(
+                self.storage_staging_x,
+                self.storage_staging_y,
+                self.storage_face_x,
+                self.storage_face_y,
+            )
+            self._storage_reverse_heading = heading
+
+        if self._storage_route_phase == "face_origin":
+            aligned = self._turn_in_place_pulsed(
+                heading,
+                self.storage_heading_tolerance_rad,
+                key=("storage_face_origin", round(heading, 6)),
+            )
+            if aligned:
+                self._storage_route_phase = "reverse"
+                self._decide(
+                    f"STORAGE HEADING {math.degrees(heading):+.1f}deg -> REVERSE"
+                )
+            return
+
+        distance = self._distance_to(self.storage_x, self.storage_y)
+        if distance is None:
+            self._drive(0.0, 0.0, 0.0)
+            return
+        if distance <= self.storage_reach_tol_m:
+            self._finish_storage_reverse("within tolerance")
+            return
+
+        heading_error = self._wrap_pi(heading - float(self.world.robot_theta))
+        if abs(heading_error) >= self.storage_reverse_realign_rad:
+            self._drive(0.0, 0.0, 0.0)
+            self._storage_route_phase = "face_origin"
+            self._reset_pulsed_heading()
+            self._decide(
+                f"STORAGE REVERSE RE-ALIGN error={math.degrees(heading_error):+.1f}deg"
+            )
+            return
+
+        base_target = self._to_base(self.storage_x, self.storage_y)
+        if base_target is not None and base_target[0] >= 0.0:
+            if distance <= max(0.20, 2.0 * self.storage_reach_tol_m):
+                self._finish_storage_reverse("target passed")
+            else:
+                self._drive(0.0, 0.0, 0.0)
+                self.get_logger().error(
+                    "storage target is no longer behind the robot; holding stopped",
+                    throttle_duration_sec=2.0,
+                )
+            return
+
+        vx, vy, omega = straight_reverse_command(
+            current_heading=float(self.world.robot_theta),
+            target_heading=heading,
+            distance_m=distance,
+            max_speed=self.storage_reverse_speed,
+            heading_kp=self.storage_reverse_heading_kp,
+            omega_max=self.storage_reverse_omega_max,
+        )
+        self._drive(vx, vy, omega)
+
     # -------------------------------------------------------------- transitions
     def _step(self) -> None:
         """Condition-driven transition for the current state (one tick)."""
@@ -4398,7 +4936,13 @@ class MissionFsmNode(Node):
                     if d_zone is None or d_zone > self.zone_center_reach_tol_m:
                         self._reset_zone_scan_timer()
                         th = self.world.robot_theta if self.world is not None else 0.0
-                        self._drive_toward(zx, zy, th, exclude_id=0)
+                        self._drive_toward(
+                            zx,
+                            zy,
+                            th,
+                            exclude_id=0,
+                            route_mode=self._next_travel_route_mode(),
+                        )
                         return
                     self._zone_anchor_reached_idx = self._zone_idx
                     self._decide(f"ZONE {self._active_zone_id()} ANCHOR REACHED")
@@ -4584,7 +5128,11 @@ class MissionFsmNode(Node):
                 self._enter("ALIGN")
                 return
             self._drive_toward(
-                sx, sy, bearing, exclude_id=exclude, route_mode="grid_only"
+                sx,
+                sy,
+                bearing,
+                exclude_id=exclude,
+                route_mode=self._next_travel_route_mode(),
             )
 
         elif self.state == "ALIGN":
@@ -4600,12 +5148,11 @@ class MissionFsmNode(Node):
         elif self.state == "STORE_IN_TRAY":
             self._do_store_in_tray()
 
+        elif self.state == "WAIT_FOR_STORAGE":
+            self._drive(0.0, 0.0, 0.0)
+
         elif self.state == "DRIVE_TO_STORAGE":
-            th = self.world.robot_theta if self.world is not None else 0.0
-            self._drive_toward(self.storage_x, self.storage_y, th, exclude_id=0)  # collision-free to bin
-            d = self._distance_to(self.storage_x, self.storage_y)
-            if d is not None and d < self.approach_dist_m:
-                self._enter("ALIGN_OVER_BIN")
+            self._step_drive_to_storage()
 
         elif self.state == "ALIGN_OVER_BIN":
             if self._time_in_state() >= self.align_settle_sec:
@@ -4782,6 +5329,18 @@ class MissionFsmNode(Node):
             # HEADING_ONLY mode is published by tick(). It updates the estimated field yaw while
             # deliberately holding x/y and all relative/mapped geometry fixed.
             self._drive(0.0, 0.0, 0.0)
+            if not self.opening_wall_validation_enabled:
+                if t < self.opening_heading_observe_sec:
+                    return
+                self._opening_wall_heading_valid = False
+                self._wall_translation_unlocked = True
+                self._set_world_mapping_enabled(True, "opening wall validation disabled")
+                self._opening_leg = "settle"
+                self.state_enter_s = self._now_s()
+                self.get_logger().info(
+                    "opening wall validation disabled -> enable mapping/object-flow"
+                )
+                return
             if t < self.opening_heading_observe_sec or not self._opening_heading_debug_fresh():
                 return
             self._opening_leg = "heading_verify"
@@ -5222,6 +5781,7 @@ class MissionFsmNode(Node):
         # 1) drive condition-based transitions
         running = self._run_started and self._competition_state == "RUNNING"
         if running:
+            self._maybe_start_timed_storage()
             self._step()
             if self.state != "OPENING":
                 self._set_world_mapping_enabled(True)

@@ -26,10 +26,10 @@
 
 ## 2. 현재 상태 (Snapshot — 이 섹션만 최신값으로 덮어쓰기)
 
-- **현재 버전:** `v4.1.0` (`new` 브랜치 릴리스 커밋 `cc3bb25`, Git 태그 없음)
-- **최종 업데이트:** 2026-07-21 17:05 (KST)
+- **현재 버전:** `v5.0.0` (`new` 브랜치, Git 태그 없음)
+- **최종 업데이트:** 2026-07-21 23:17 (KST)
 - **최종 작업자:** `@AI`
-- **한 줄 요약:** 메인 경기를 Z1~Z4 dodecahedron 전용 흐름으로 전환하고, 직교 Lane heading lock·stand-off 접근과 MCU/실행 종료 안전을 추가한 v4.1.0을 확정했다.
+- **한 줄 요약:** IMU 기반 제자리 회전·직선 주행, 150초 직선 주차, 단일 벽 경계 모델, 팔 대기 자세와 8080 라이브 화면을 통합한 v5.0.0을 확정했다.
 
 ---
 
@@ -147,12 +147,44 @@
 - [ ] `v4.1.0` 메인 실주행에서 Z1~Z4 진입 anchor 선택, 2초 fresh 관측, dodecahedron stand-off·ALIGN·PICK과 zone 전환을 반복 검증 — `@insik`
 - [ ] `opening_enabled=false`와 RUNNING 버튼 즉시 D13 2초 ON 조합이 최종 경기 시작 의도와 일치하는지 확인 — `@insik`, `@AI`
 - [ ] 직진 wheel scale `[1.0, 0.90, 0.75, 1.0]`과 Lane heading lock이 실제 주행의 우측 편향·좌우 흔들림을 줄이는지 측정 — `@insik`
+- [x] IMU yaw 무감쇠 적분, 펄스 제자리 회전, 150초 직선 주차, 단일 벽 경계 모델, 팔 주행 대기 자세와 8080 프레임 폴링 화면을 v5.0.0으로 통합 — `@AI` (2026-07-21 완료)
+- [ ] 실제 경기 실행 중 `http://127.0.0.1:8080/health`가 `ok`이고 합성 화면이 연속 갱신되는지 확인 — `@insik`
+- [ ] PICK 후 첫 레인 진입점 도착 시 브레이크·정지·다음 구간 heading 정렬을 추가해 연속 과주행을 방지 — `@AI`
+- [ ] 150초에 `(1.5,1.5)` 직선 이동→원점 heading 정렬→`(1.8,1.8)` 후진 주차가 실제 경기장에서 완료되는지 검증 — `@insik`
 
 ---
 
 ## 5. 변경 이력 (Changelog) — ⛔ 삭제 금지 / 최신 항목이 맨 위
 
 <!-- 새 엔트리는 바로 이 줄 아래에 추가하세요. 기존 엔트리는 건드리지 마세요. -->
+
+### `v5.0.0` — 2026-07-21 23:17 (KST) · 작업자: `@AI` · ID: `2026-07-21-02`
+- **변경 요약:** v4.1.0 이후 누적된 위치 추정·주행·주차·벽 인식·팔 자세·웹 라이브 개선을 메인 경기 v5.0.0으로 통합했다.
+- **상세:**
+  - IMU yaw 변화량은 엔코더 정지 감쇠를 거치지 않고 100% 적분하며, 카메라/object-flow 보정에만 엔코더 상태 감쇠를 유지하도록 위치 추정을 분리했다.
+  - 로컬 앵커에서 검증한 회전 펄스·정지·IMU 재측정 방식을 일반 제자리 회전에 적용하고, 레인 진입 전 heading 정렬과 직교 구간의 전진 전용 제어를 강화했다.
+  - PICK 후 기존 위치 복귀 대신 다음 경로의 첫 레인 waypoint를 향해 heading을 맞추고 직진한 뒤 lane planner 경로를 이어가도록 post-pick 진입 모드를 추가했다.
+  - APPROACH stand-off, lane heading 필터·지속 이탈 판정, 방향 반전 안정화와 관련 테스트를 보강했다.
+  - RUNNING 시작 150초 뒤 현재 미션을 정리하고 `(1.5,1.5)`까지 heading 정렬 후 직선 전진한 다음 원점을 바라보고 `(1.8,1.8)`까지 직선 후진하는 주차 상태기를 추가했다.
+  - 오프닝 벽 검증과 18초 release 대기를 설정으로 해제할 수 있게 하고, 벽 인식은 단일 `wall_floor_boundary_seg_v3.pt` 모델의 centerline을 사용하도록 전환했다.
+  - 현재 `motion_tuning.yaml`의 Set1 목표 라벨을 `octahedron`으로 변경한 설정을 포함했다.
+  - 로봇팔 초기·주행 대기 자세를 `[120,5,100]`으로 통일하고 PICK 완료 후에도 해당 자세로 복귀하도록 했으며, 터미널에서 0~170도 자세를 5회 입력하는 독립 테스트 스크립트를 추가했다.
+  - 메인 합성 화면의 8080 서버를 HTML·상태·단일 JPEG·MJPEG 경로로 분리하고, 브라우저 화면은 `/frame.jpg` 폴링 방식으로 변경했으며 `live.png` 백업 저장을 활성화했다.
+  - 직진 우측 편향 보정을 위한 바퀴 scale과 로컬 앵커 회전 파라미터를 갱신하고, 관련 YAML 설정을 동기화했다.
+  - ROS 2 전체 7개 패키지 빌드와 위치 추정·오프닝·주차·APPROACH·Lane heading·LanePlanner·로컬 앵커 회귀 테스트 78개를 통과했다.
+- **변경 파일:**
+  - `PROJECT_LOG.md` / 수정
+  - `ros2_ws/src/robot_bringup/config/{local_anchor_test,motion_tuning,perception,test_field}.yaml` / 수정
+  - `ros2_ws/src/robot_control/robot_control/nodes/{base_controller_node,pick_sequencer_node}.py` / 수정
+  - `ros2_ws/src/robot_perception/robot_perception/nodes/{localizer_node,recognition_viz_node}.py` / 수정
+  - `ros2_ws/src/robot_perception/test/test_localizer_imu_yaw.py` / 신규
+  - `ros2_ws/src/robot_planning/robot_planning/{lane_planner,local_anchor_fsm}.py` / 수정
+  - `ros2_ws/src/robot_planning/robot_planning/nodes/{local_anchor_test_node,mission_fsm_node}.py` / 수정
+  - `ros2_ws/src/robot_planning/test/{test_approach_standoff_control,test_lane_heading_lock,test_lane_planner,test_local_anchor_fsm}.py` / 수정
+  - `ros2_ws/src/robot_planning/test/{test_opening_wall_validation,test_timed_storage_route}.py` / 신규
+  - `scripts/arm_pose_prompt_test.py` / 신규
+- **다음 할 일 반영:** v5.0.0 통합 항목을 완료 처리하고, 실경기 웹 갱신·150초 주차 검증과 PICK 후 첫 레인 진입점 브레이크 보강을 신규 TODO로 추가했다.
+- **버전 근거:** 위치 추정, 일반 주행 회전, PICK 후 경로 재진입, 경기 제한시간 주차와 웹 관측 경로까지 메인 경기 동작 구조가 함께 변경되어 사용자 지정에 따라 MAJOR를 `v5.0.0`으로 올렸다.
 
 ### `v4.1.0` — 2026-07-21 17:05 (KST) · 작업자: `@AI` · ID: `2026-07-21-01`
 - **변경 요약:** 메인 경기를 Z1~Z4 dodecahedron 전용 미션으로 전환하고 직교 Lane heading·stand-off 접근, 로컬 앵커 회전 안정화와 MCU/실행 종료 안전을 통합했다.

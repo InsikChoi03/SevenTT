@@ -155,14 +155,15 @@ class LocalAnchorTestNode(Node):
         self.declare_parameter("scan_positions", 8)
         self.declare_parameter("turn_omega", 0.10)
         self.declare_parameter("turn_slow_omega", 0.07)
-        self.declare_parameter("turn_slowdown_deg", 15.0)
-        self.declare_parameter("turn_pulse_sec", 0.12)
+        self.declare_parameter("turn_slowdown_deg", 10.0)
+        self.declare_parameter("turn_pulse_sec", 0.24)
+        self.declare_parameter("turn_burst_pause_sec", 0.18)
         self.declare_parameter("turn_settle_sec", 0.70)
         self.declare_parameter("turn_verify_sec", 0.60)
         self.declare_parameter("turn_verify_max_corrections", 4)
         self.declare_parameter("turn_correction_pulse_sec", 0.10)
         self.declare_parameter("turn_correction_settle_sec", 0.35)
-        self.declare_parameter("turn_tolerance_deg", 3.0)
+        self.declare_parameter("turn_tolerance_deg", 5.0)
         self.declare_parameter("max_turn_pulses", 60)
         self.declare_parameter("scan_observe_sec", 1.00)
         self.declare_parameter("single_lap_inspection", True)
@@ -230,6 +231,7 @@ class LocalAnchorTestNode(Node):
             turn_slow_omega=float(value("turn_slow_omega")),
             turn_slowdown_rad=math.radians(float(value("turn_slowdown_deg"))),
             turn_pulse_sec=float(value("turn_pulse_sec")),
+            turn_burst_pause_sec=float(value("turn_burst_pause_sec")),
             turn_settle_sec=float(value("turn_settle_sec")),
             turn_verify_sec=float(value("turn_verify_sec")),
             turn_verify_max_corrections=int(value("turn_verify_max_corrections")),
@@ -497,6 +499,10 @@ class LocalAnchorTestNode(Node):
                 "turn_slow_omega must be in [0.03, turn_omega]",
             ),
             (0.03 <= cfg.turn_pulse_sec <= 0.50, "turn_pulse_sec must be in [0.03, 0.50]"),
+            (
+                0.10 <= cfg.turn_burst_pause_sec <= 0.50,
+                "turn_burst_pause_sec must be in [0.10, 0.50]",
+            ),
             (0.20 <= cfg.turn_settle_sec <= 2.0, "turn_settle_sec must be in [0.20, 2.0]"),
             (
                 0.20 <= cfg.turn_verify_sec <= 2.0,

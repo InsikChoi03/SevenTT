@@ -319,7 +319,7 @@ class LanePlanner:
                 out.append(p)
         return out
 
-    def plan_object_standoff(self, start, target, obstacles):
+    def plan_object_standoff(self, start, target, obstacles, route_mode="grid_only"):
         """Choose the cheapest reachable lane-hole centre surrounding an object."""
         sx, sy = float(start[0]), float(start[1])
         tx, ty = float(target[0]), float(target[1])
@@ -343,7 +343,7 @@ class LanePlanner:
             if stand_off is None:
                 continue
             path = self.plan(
-                (sx, sy), stand_off, obstacles, route_mode="grid_only"
+                (sx, sy), stand_off, obstacles, route_mode=route_mode
             )
             if not path:
                 continue
@@ -363,14 +363,16 @@ class LanePlanner:
     def plan(self, start, dest, obstacles, route_mode="legacy"):
         """Collision-free via list from `start` to `dest` (field xy, metres). Returns a list of
         (x,y) ENDING at the exact dest (robot's own position is NOT included), or None if no lane
-        route exists. `grid_only` makes both endpoint connectors cardinal; `object_approach` also
-        keeps the final pre-stand-off waypoint on a lane line instead of forcing it to a 0.5 m
-        grid intersection. `legacy` preserves the original direct endpoint behavior. `obstacles`
-        must already EXCLUDE the target being approached."""
+        route exists. `grid_only` makes both endpoint connectors cardinal; `post_pick_entry`
+        connects the pickup pose directly to the selected first lane waypoint, then keeps every
+        remaining segment cardinal. `object_approach` also keeps the final pre-stand-off waypoint
+        on a lane line instead of forcing it to a 0.5 m grid intersection. `legacy` preserves the
+        original direct endpoint behavior. `obstacles` must already EXCLUDE the target being
+        approached."""
         sx, sy = float(start[0]), float(start[1])
         dx, dy = float(dest[0]), float(dest[1])
         obstacles = [(float(ox), float(oy)) for ox, oy in obstacles]
-        if route_mode not in {"legacy", "grid_only", "object_approach"}:
+        if route_mode not in {"legacy", "grid_only", "post_pick_entry", "object_approach"}:
             raise ValueError(f"unsupported lane route mode: {route_mode}")
         if math.hypot(dx - sx, dy - sy) < 1e-6:
             return [(dx, dy)]
@@ -388,7 +390,11 @@ class LanePlanner:
             return None
         if route_mode != "legacy":
             start_connectors = self._endpoint_connectors(
-                nodes, (sx, sy), obstacles, from_point=True, allow_direct=False
+                nodes,
+                (sx, sy),
+                obstacles,
+                from_point=True,
+                allow_direct=route_mode == "post_pick_entry",
             )
             goal_connectors = self._endpoint_connectors(
                 nodes,

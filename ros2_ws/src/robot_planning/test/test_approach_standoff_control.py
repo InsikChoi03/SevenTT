@@ -108,8 +108,14 @@ def test_approach_heading_count_resets_until_filtered_heading_is_stable():
     _, ready = node._step_approach_arrival(0.05, math.radians(5.7), 0.405)
     assert not ready
     assert node._approach_heading_stable_count == 0
+    assert commands[-1] == (0.0, 0.0, 0.0)
+
+    now[0] += 0.01
+    _, ready = node._step_approach_arrival(0.05, math.radians(5.7), 0.405)
+    assert not ready
     assert commands[-1][2] < 0.0
 
+    now[0] += 0.30
     node.world.robot_theta = target_heading
     results = []
     for _ in range(3):
@@ -133,6 +139,60 @@ def test_only_final_object_connector_requires_waypoint_brake():
     node._plan[-1] = (0.7, 0.2)
     node._plan_route_mode = "grid_only"
     assert not node._object_connector_brake_required(1)
+
+
+def test_post_pick_route_mode_is_consumed_by_one_latched_plan():
+    node = MissionFsmNode.__new__(MissionFsmNode)
+    node._plan = None
+    node._plan_route_mode = "grid_only"
+    node._post_pick_lane_entry_pending = True
+
+    assert node._next_travel_route_mode() == "post_pick_entry"
+
+    node._post_pick_lane_entry_pending = False
+    node._plan = [(-0.75, 0.75), (-0.25, 0.75)]
+    node._plan_route_mode = "post_pick_entry"
+    assert node._next_travel_route_mode() == "post_pick_entry"
+
+    node._plan = None
+    assert node._next_travel_route_mode() == "grid_only"
+
+
+def test_post_pick_lane_entry_aligns_then_drives_without_omega():
+    node = MissionFsmNode.__new__(MissionFsmNode)
+    node.world = SimpleNamespace(robot_x=0.0, robot_y=0.0, robot_theta=0.0)
+    node.wp_reach_tol_m = 0.12
+    node.lane_heading_align_tolerance_rad = math.radians(2.0)
+    node.direct_nav_kp_ang = 1.5
+    node.direct_nav_omega_max = 0.405
+    node.direct_nav_speed = 0.12
+    now = [0.0]
+    commands = []
+    node._now_s = lambda: now[0]
+    node._decide = lambda _text: None
+    node._drive = lambda vx, vy, omega=0.0: commands.append((vx, vy, omega))
+
+    node._drive_to_post_pick_lane_entry(0.0, 1.0)
+    assert commands[-1] == (0.0, 0.0, 0.0)
+
+    now[0] = 0.05
+    node._drive_to_post_pick_lane_entry(0.0, 1.0)
+    assert commands[-1][0:2] == (0.0, 0.0)
+    assert commands[-1][2] > 0.0
+
+    node.world.robot_theta = math.pi / 2.0
+    now[0] = 0.25
+    node._drive_to_post_pick_lane_entry(0.0, 1.0)
+    now[0] = 0.44
+    node._drive_to_post_pick_lane_entry(0.0, 1.0)
+    now[0] = 0.45
+    node._drive_to_post_pick_lane_entry(0.0, 1.0)
+    assert commands[-1] == (0.12, 0.0, 0.0)
+
+    node.world.robot_y = 0.90
+    now[0] = 0.46
+    node._drive_to_post_pick_lane_entry(0.0, 1.0)
+    assert commands[-1] == (0.0, 0.0, 0.0)
 
 
 def test_final_object_connector_brake_holds_zero_for_settle_time():

@@ -96,12 +96,12 @@ wall_localizer_node:
     ignore_robot_rect: [0.34, 0.25, 0.66, 0.88]
     max_range_m: 2.3
     use_segmentation_mask: true
-    segmentation_model_path: "/home/seventt/seventt/workspace/models/wall_seg_v1.pt"
+    segmentation_model_path: "/home/seventt/seventt/workspace/models/wall_floor_boundary_seg_v3.pt"
     segmentation_input_size: 640
     segmentation_min_confidence: 0.30
     segmentation_run_rate_hz: 1.0
     segmentation_morph_kernel: 5
-    wall_boundary_verify_enabled: true
+    wall_boundary_verify_enabled: false
     wall_surface_class_id: 0
     wall_boundary_class_id: 1
     wall_boundary_model_path: ""
@@ -113,7 +113,7 @@ wall_localizer_node:
     segmentation_min_component_area: 120
     segmentation_max_components: 6
     segmentation_min_line_length_px: 55
-    segmentation_mask_line_mode: "floor_side_edge"
+    segmentation_mask_line_mode: "centerline"
     wall_surface_edge_approx_epsilon_ratio: 0.012
     wall_surface_edge_refine_px: 7.0
     wall_surface_inner_edge_band_m: 0.18
@@ -368,7 +368,7 @@ mission_fsm_node:
 pick_sequencer_node:
   ros__parameters:
     # 2026-07-08 팀원 재보정값. test_field.launch.py with_arm:=true 실행 시 이 값이 우선 적용된다.
-    init_pose: [110.0, 30.0, 50.0]        # 주행 대기: 보관함 쪽 상단, 그리퍼 닫힘
+    init_pose: [120.0, 5.0, 100.0]        # 검증된 초기/주행 대기 자세 [어깨, 손목, 그리퍼]
     pick_shoulder_wrist: [25.0, 150.0]    # 집기 도달: 어깨·손목
     place_shoulder_wrist: [110.0, 30.0]   # 놓기: 닫은 채 이동 후 이 위치에서 열기
     grip_open: 115.0                      # 열림/놓기

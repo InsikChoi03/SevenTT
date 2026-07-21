@@ -64,6 +64,7 @@ except Exception:  # noqa: BLE001 - camera panels disabled without cv_bridge
 
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse
 
 
 class _MjpegStreamer:
@@ -80,12 +81,89 @@ class _MjpegStreamer:
                 pass
 
             def do_GET(self):
-                if self.path == "/favicon.ico":
+                path = urlparse(self.path).path
+                if path in ("/", "/index.html"):
+                    self._index()
+                elif path == "/stream.mjpg":
+                    self._stream()
+                elif path == "/frame.jpg":
+                    self._frame()
+                elif path == "/health":
+                    self._health()
+                elif path == "/favicon.ico":
                     self.send_error(404)
+                else:
+                    self.send_error(404)
+
+            def _index(self):
+                html = b"""<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Competition Live</title>
+  <style>
+    html, body { margin: 0; width: 100%; height: 100%; background: #0b0b0b; overflow: hidden; }
+    body { display: grid; place-items: center; }
+    canvas { display: block; max-width: 100vw; max-height: 100vh; width: auto; height: auto; }
+  </style>
+</head>
+<body><canvas id="live" width="1332" height="800"></canvas>
+<script>
+  const canvas = document.getElementById("live");
+  const context = canvas.getContext("2d");
+  const image = new Image();
+
+  image.onload = () => {
+    if (canvas.width !== image.naturalWidth || canvas.height !== image.naturalHeight) {
+      canvas.width = image.naturalWidth;
+      canvas.height = image.naturalHeight;
+    }
+    context.drawImage(image, 0, 0);
+    window.setTimeout(refresh, 100);
+  };
+  image.onerror = () => window.setTimeout(refresh, 250);
+
+  function refresh() {
+    image.src = "/frame.jpg?t=" + Date.now();
+  }
+  refresh();
+</script>
+</body>
+</html>
+"""
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Content-Length", str(len(html)))
+                self.end_headers()
+                self.wfile.write(html)
+
+            def _health(self):
+                data = b"ok\n" if streamer.latest is not None else b"waiting for first frame\n"
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def _frame(self):
+                buf = streamer.latest
+                if buf is None:
+                    self.send_error(503, "waiting for first frame")
                     return
                 self.send_response(200)
+                self.send_header("Content-Type", "image/jpeg")
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Content-Length", str(len(buf)))
+                self.end_headers()
+                self.wfile.write(buf)
+
+            def _stream(self):
+                self.send_response(200)
                 self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
-                self.send_header("Cache-Control", "no-cache, private")
+                self.send_header("Cache-Control", "no-store")
                 self.end_headers()
                 try:
                     while True:
@@ -95,8 +173,9 @@ class _MjpegStreamer:
                                 b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: "
                                 + str(len(buf)).encode() + b"\r\n\r\n" + buf + b"\r\n"
                             )
+                            self.wfile.flush()
                         time.sleep(0.1)
-                except (BrokenPipeError, ConnectionResetError):
+                except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
                     pass   # browser tab closed
 
         self._httpd = ThreadingHTTPServer(("0.0.0.0", port), Handler)

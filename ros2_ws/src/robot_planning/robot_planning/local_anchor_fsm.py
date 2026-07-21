@@ -86,14 +86,15 @@ class LocalAnchorConfig:
     scan_positions: int = 8
     turn_omega: float = 0.10
     turn_slow_omega: float = 0.07
-    turn_slowdown_rad: float = math.radians(15.0)
-    turn_pulse_sec: float = 0.12
+    turn_slowdown_rad: float = math.radians(10.0)
+    turn_pulse_sec: float = 0.24
+    turn_burst_pause_sec: float = 0.18
     turn_settle_sec: float = 0.70
     turn_verify_sec: float = 0.60
     turn_verify_max_corrections: int = 4
     turn_correction_pulse_sec: float = 0.10
     turn_correction_settle_sec: float = 0.35
-    turn_tolerance_rad: float = math.radians(3.0)
+    turn_tolerance_rad: float = math.radians(5.0)
     max_turn_pulses: int = 60
     scan_observe_sec: float = 1.00
     single_lap_inspection: bool = True
@@ -204,6 +205,7 @@ class LocalAnchorFruitFsm:
         self._pulse_sign = 0.0
         self._pulse_duration_sec = 0.0
         self._settle_duration_sec = 0.0
+        self._settle_return_state = "TURN_MEASURE"
         self._visual_turn_hint = 0.0
         self._visual_correction_attempts = 0
         self._class_label = ""
@@ -300,20 +302,51 @@ class LocalAnchorFruitFsm:
         self._pulse_sign = 0.0
         self._pulse_duration_sec = 0.0
         self._settle_duration_sec = 0.0
+        self._settle_return_state = "TURN_MEASURE"
         self._visual_turn_hint = 0.0
         self._visual_correction_attempts = 0
         self._visual_center_hits = 0
         self._enter("TURN_MEASURE", now, detail)
 
-    def _begin_correction_pulse(self, now: float, error: float) -> None:
+    def _begin_pulse(
+        self,
+        now: float,
+        error: float,
+        *,
+        duration_sec: float,
+        settle_sec: float,
+        settle_return_state: str,
+        detail: str,
+    ) -> None:
         if self._turn_pulses >= max(1, int(self.config.max_turn_pulses)):
             self.fault(now, f"turn did not converge at target {self._turn_target:.3f} rad")
             return
         self._turn_pulses += 1
         self._pulse_sign = math.copysign(1.0, error)
-        self._pulse_duration_sec = self.config.turn_correction_pulse_sec
-        self._settle_duration_sec = self.config.turn_correction_settle_sec
-        self._enter("TURN_PULSE", now, "turn correction pulse")
+        self._pulse_duration_sec = max(0.0, float(duration_sec))
+        self._settle_duration_sec = max(0.0, float(settle_sec))
+        self._settle_return_state = str(settle_return_state)
+        self._enter("TURN_PULSE", now, detail)
+
+    def _begin_burst_pulse(self, now: float, error: float) -> None:
+        self._begin_pulse(
+            now,
+            error,
+            duration_sec=self.config.turn_pulse_sec,
+            settle_sec=self.config.turn_burst_pause_sec,
+            settle_return_state="TURN_MEASURE",
+            detail="rapid turn pulse",
+        )
+
+    def _begin_correction_pulse(self, now: float, error: float) -> None:
+        self._begin_pulse(
+            now,
+            error,
+            duration_sec=self.config.turn_correction_pulse_sec,
+            settle_sec=self.config.turn_correction_settle_sec,
+            settle_return_state="TURN_VERIFY",
+            detail="turn correction pulse",
+        )
 
     def _turn_error(self, current_yaw: float) -> float:
         if self._turn_target_unwrapped is None:
@@ -762,29 +795,13 @@ class LocalAnchorFruitFsm:
 
         if self.state == "TURN_MEASURE":
             error = self._turn_error(current_yaw)
-            if abs(error) <= cfg.turn_tolerance_rad:
-                if self._requires_visual_verify():
-                    self._begin_visual_verify(now, "IMU target reached; visual verify")
-                else:
-                    self._enter(self._turn_return_state, now, self.detail)
+            if abs(error) <= cfg.turn_tolerance_rad and not self._requires_visual_verify():
+                self._enter(self._turn_return_state, now, self.detail)
+            elif abs(error) <= cfg.turn_slowdown_rad:
+                self._begin_visual_verify(now, "inside 10deg gate; stopped for IMU/body verify")
             else:
-                self._pulse_sign = math.copysign(1.0, error)
-                self._enter("TURN_CONTINUOUS", now, self.detail)
+                self._begin_burst_pulse(now, error)
             return MotionCommand()
-
-        if self.state == "TURN_CONTINUOUS":
-            error = self._turn_error(current_yaw)
-            if abs(error) <= cfg.turn_tolerance_rad:
-                if self._requires_visual_verify():
-                    self._begin_visual_verify(now, "IMU target reached; visual verify")
-                else:
-                    self._enter(self._turn_return_state, now, self.detail)
-                return MotionCommand()
-            self._pulse_sign = math.copysign(1.0, error)
-            if abs(error) <= cfg.turn_slowdown_rad:
-                self._begin_visual_verify(now, "near turn target; stop and verify")
-                return MotionCommand()
-            return MotionCommand(omega=self._pulse_sign * abs(cfg.turn_omega))
 
         if self.state == "TURN_VERIFY":
             if now - self.state_enter_s < cfg.turn_verify_sec:
@@ -822,7 +839,10 @@ class LocalAnchorFruitFsm:
 
         if self.state == "TURN_SETTLE":
             if now - self.state_enter_s >= self._settle_duration_sec:
-                self._begin_visual_verify(now, "settled after visual correction")
+                if self._settle_return_state == "TURN_VERIFY":
+                    self._begin_visual_verify(now, "settled after precision correction")
+                else:
+                    self._enter("TURN_MEASURE", now, "measure after rapid pulse")
             return MotionCommand()
 
         if self.state == "INITIAL_INVENTORY":

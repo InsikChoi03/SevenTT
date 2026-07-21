@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from robot_planning.lane_planner import cardinal_segment_heading
 from robot_planning.nodes.mission_fsm_node import (
     MissionFsmNode,
+    PulsedHeadingController,
     circular_heading_filter,
     lane_heading_violation_time_step,
 )
@@ -68,6 +69,49 @@ def test_heading_violation_timer_resets_after_good_frame():
     assert not realign
 
 
+def test_pulsed_heading_controller_stops_between_torque_pulses():
+    controller = PulsedHeadingController()
+
+    aligned, omega, event = controller.step(
+        now_s=0.0,
+        current_heading=math.radians(-20.0),
+        target_heading=0.0,
+        tolerance_rad=math.radians(2.0),
+        key=("lane", 1),
+    )
+    assert not aligned
+    assert omega == 0.0
+    assert event == "coarse_pulse"
+
+    _, omega, _ = controller.step(
+        now_s=0.05,
+        current_heading=math.radians(-18.0),
+        target_heading=0.0,
+        tolerance_rad=math.radians(2.0),
+        key=("lane", 1),
+    )
+    assert omega == 0.10
+
+    _, omega, event = controller.step(
+        now_s=0.25,
+        current_heading=math.radians(3.0),
+        target_heading=0.0,
+        tolerance_rad=math.radians(2.0),
+        key=("lane", 1),
+    )
+    assert omega == 0.0
+    assert event == "settle"
+
+    _, omega, _ = controller.step(
+        now_s=0.42,
+        current_heading=math.radians(3.0),
+        target_heading=0.0,
+        tolerance_rad=math.radians(2.0),
+        key=("lane", 1),
+    )
+    assert omega == 0.0
+
+
 def test_cardinal_follower_drives_directly_when_aligned_and_stops_to_realign():
     node = MissionFsmNode.__new__(MissionFsmNode)
     node.lane_heading_lock_enabled = True
@@ -125,7 +169,91 @@ def test_cardinal_follower_drives_directly_when_aligned_and_stops_to_realign():
     assert all(omega == 0.0 for vx, _vy, omega in commands if vx != 0.0)
 
 
-def test_cardinal_follower_uses_soft_entry_and_never_reverses_entry_omega():
+def test_post_pick_cardinal_follower_forces_align_and_never_commands_strafe():
+    node = MissionFsmNode.__new__(MissionFsmNode)
+    node.lane_heading_lock_enabled = True
+    node.lane_heading_initial_align_enabled = False
+    node.lane_heading_axis_tolerance_m = 0.06
+    node.lane_heading_align_tolerance_rad = math.radians(2.0)
+    node.lane_heading_realign_tolerance_rad = math.radians(10.0)
+    node.lane_heading_soft_entry_tolerance_rad = math.radians(10.0)
+    node.lane_heading_soft_entry_speed = 0.07
+    node.lane_heading_soft_entry_kp = 0.40
+    node.lane_heading_soft_entry_omega_max = 0.04
+    node.lane_heading_soft_entry_timeout_sec = 1.0
+    node.lane_heading_realign_arm_sec = 0.0
+    node.lane_heading_realign_hold_sec = 0.45
+    node.lane_heading_drive_omega_max = 0.08
+    node.lane_heading_filter_alpha = 0.20
+    node.lane_heading_settle_sec = 0.30
+    node.lane_heading_reverse_settle_sec = 0.30
+    node.lane_heading_kp = 1.2
+    node.lane_heading_omega_max = 0.16
+    node.lane_heading_deadband_rad = math.radians(3.0)
+    node.direct_nav_speed = 0.12
+    node.direct_nav_stop_radius_m = 0.08
+    node.world = SimpleNamespace(
+        robot_x=0.0, robot_y=0.0, robot_theta=math.radians(30.0)
+    )
+    node._lane_heading_segment_key = None
+    node._lane_heading_phase = "align"
+    node._lane_heading_filtered = None
+    node._lane_heading_violation_start_s = None
+    node._lane_heading_realign_armed_at_s = 0.0
+    node._lane_heading_settle_start_s = 0.0
+    node._lane_heading_entry_start_s = 0.0
+    node._lane_heading_turn_sign = 0
+    node._lane_heading_reverse_start_s = 0.0
+
+    now = [0.0]
+    commands = []
+    node._now_s = lambda: now[0]
+    node._distance_to = lambda _x, _y: 1.0
+    node._decide = lambda _text: None
+    node._drive = lambda vx, vy, omega=0.0: commands.append((vx, vy, omega))
+
+    args = ((0.0, 0.0), (1.0, 0.0), (7, 1))
+    assert node._drive_cardinal_lane_segment(
+        *args, force_initial_align=True, forward_only=True
+    )
+    assert node._lane_heading_phase == "align"
+    assert commands[-1][0] == 0.0
+    assert commands[-1][1] == 0.0
+
+    now[0] = 0.1
+    node._drive_cardinal_lane_segment(
+        *args, force_initial_align=True, forward_only=True
+    )
+    assert commands[-1] == (0.0, 0.0, -0.10)
+
+    node.world.robot_theta = 0.0
+    now[0] = 0.25
+    node._drive_cardinal_lane_segment(
+        *args, force_initial_align=True, forward_only=True
+    )
+    now[0] = 0.44
+    node._drive_cardinal_lane_segment(
+        *args, force_initial_align=True, forward_only=True
+    )
+    now[0] = 0.45
+    node._drive_cardinal_lane_segment(
+        *args, force_initial_align=True, forward_only=True
+    )
+    assert node._lane_heading_phase == "settle"
+    now[0] = 0.76
+    node._drive_cardinal_lane_segment(
+        *args, force_initial_align=True, forward_only=True
+    )
+    assert node._lane_heading_phase == "drive"
+    now[0] = 0.77
+    node._drive_cardinal_lane_segment(
+        *args, force_initial_align=True, forward_only=True
+    )
+    assert commands[-1] == (0.12, 0.0, 0.0)
+    assert all(vy == 0.0 for _vx, vy, _omega in commands)
+
+
+def test_cardinal_follower_uses_stopped_fine_pulses_for_small_entry_error():
     node = MissionFsmNode.__new__(MissionFsmNode)
     node.lane_heading_lock_enabled = True
     node.lane_heading_initial_align_enabled = True
@@ -171,28 +299,18 @@ def test_cardinal_follower_uses_soft_entry_and_never_reverses_entry_omega():
 
     args = ((0.0, 0.0), (1.0, 0.0), (1, 0))
     node._drive_cardinal_lane_segment(*args)
-    assert node._lane_heading_phase == "soft_entry"
-    assert commands[-1] == (0.07, 0.0, 0.04)
-    assert decisions[-1] == "LANE SOFT ENTRY error=+6.0deg"
+    assert node._lane_heading_phase == "align"
+    assert commands[-1] == (0.0, 0.0, 0.0)
+    assert decisions[1] == "LANE ENTRY PULSE ALIGN error=+6.0deg"
 
-    now[0] = 0.1
-    node.world.robot_theta = math.radians(-2.0)
+    now[0] = 0.61
     node._drive_cardinal_lane_segment(*args)
-    assert node._lane_heading_phase == "drive"
-    assert commands[-1] == (0.12, 0.0, 0.0)
+    assert commands[-1] == (0.0, 0.0, 0.0)
 
-    now[0] = 0.2
-    node.world.robot_theta = math.radians(-6.0)
-    crossed_args = ((0.0, 0.0), (1.0, 0.0), (2, 0))
-    node._drive_cardinal_lane_segment(*crossed_args)
-    assert commands[-1][2] > 0.0
-
-    now[0] = 0.3
-    node.world.robot_theta = math.radians(4.0)
-    node._drive_cardinal_lane_segment(*crossed_args)
-    assert node._lane_heading_phase == "drive"
-    assert commands[-1] == (0.12, 0.0, 0.0)
-    assert decisions[-1] == "LANE SOFT ENTRY CROSSED error=-4.0deg"
+    now[0] = 0.62
+    node._drive_cardinal_lane_segment(*args)
+    assert commands[-1] == (0.0, 0.0, 0.10)
+    assert all(vx == 0.0 and vy == 0.0 for vx, vy, _omega in commands)
 
 
 def test_cardinal_follower_stops_before_reversing_turn_direction():
@@ -241,31 +359,36 @@ def test_cardinal_follower_stops_before_reversing_turn_direction():
 
     args = ((0.0, 0.0), (1.0, 0.0), (1, 0))
     node._drive_cardinal_lane_segment(*args)
-    assert commands[-1][2] > 0.0
+    assert commands[-1] == (0.0, 0.0, 0.0)
 
     now[0] = 0.05
+    node._drive_cardinal_lane_segment(*args)
+    assert commands[-1][2] > 0.0
+
+    now[0] = 0.10
     node.world.robot_theta = math.radians(20.0)
     node._drive_cardinal_lane_segment(*args)
-    assert node._lane_heading_phase == "reverse_settle"
-    assert commands[-1] == (0.0, 0.0, 0.0)
-    assert decisions[-1] == "LANE TURN REVERSAL -> SETTLE 0.30s"
+    assert commands[-1][2] > 0.0
 
-    now[0] = 0.34
+    now[0] = 0.25
     node._drive_cardinal_lane_segment(*args)
-    assert node._lane_heading_phase == "reverse_settle"
     assert commands[-1] == (0.0, 0.0, 0.0)
 
-    now[0] = 0.36
+    now[0] = 0.44
     node._drive_cardinal_lane_segment(*args)
     assert node._lane_heading_phase == "align"
     assert commands[-1] == (0.0, 0.0, 0.0)
 
-    now[0] = 0.37
+    now[0] = 0.45
+    node._drive_cardinal_lane_segment(*args)
+    assert commands[-1] == (0.0, 0.0, 0.0)
+
+    now[0] = 0.46
     node._drive_cardinal_lane_segment(*args)
     assert commands[-1][2] < 0.0
 
 
-def test_cardinal_follower_skips_initial_turn_and_translates_in_base_frame():
+def test_cardinal_follower_aligns_before_entry_and_never_translates_laterally():
     node = MissionFsmNode.__new__(MissionFsmNode)
     node.lane_heading_lock_enabled = True
     node.lane_heading_initial_align_enabled = False
@@ -312,22 +435,30 @@ def test_cardinal_follower_skips_initial_turn_and_translates_in_base_frame():
     args = ((0.0, 0.0), (1.0, 0.0), (1, 0))
     node._drive_cardinal_lane_segment(*args)
 
-    assert node._lane_heading_phase == "drive"
-    assert math.isclose(commands[-1][0], 0.0, abs_tol=1e-9)
-    assert math.isclose(commands[-1][1], -0.07, abs_tol=1e-9)
-    assert commands[-1][2] == 0.0
-    assert decisions[-1] == "LANE ENTRY TRANSLATE error=-90.0deg"
+    assert node._lane_heading_phase == "align"
+    assert commands[-1] == (0.0, 0.0, 0.0)
+    assert decisions[1] == "LANE ENTRY PULSE ALIGN error=-90.0deg"
 
-    now[0] = 1.0
+    now[0] = 0.05
+    node._drive_cardinal_lane_segment(*args)
+    assert commands[-1] == (0.0, 0.0, -0.10)
+
+    node.world.robot_theta = 0.0
+    now[0] = 0.25
+    node._drive_cardinal_lane_segment(*args)
+    now[0] = 0.44
+    node._drive_cardinal_lane_segment(*args)
+    now[0] = 0.45
+    node._drive_cardinal_lane_segment(*args)
+    assert node._lane_heading_phase == "settle"
+
+    now[0] = 0.76
+    node._drive_cardinal_lane_segment(*args)
+    now[0] = 0.77
     node._drive_cardinal_lane_segment(*args)
     assert node._lane_heading_phase == "drive"
-    assert commands[-1][2] == 0.0
-
-    now[0] = 1.25
-    node._drive_cardinal_lane_segment(*args)
-    assert node._lane_heading_phase == "drive"
-    assert math.isclose(commands[-1][1], -0.12, abs_tol=1e-9)
-    assert commands[-1][2] == -0.03
+    assert commands[-1] == (0.07, 0.0, 0.0)
+    assert all(vy == 0.0 for _vx, vy, _omega in commands)
 
 
 def test_cardinal_follower_corrects_small_drift_during_realign_arm_window():
@@ -353,9 +484,7 @@ def test_cardinal_follower_corrects_small_drift_during_realign_arm_window():
     node.lane_heading_deadband_rad = math.radians(3.0)
     node.direct_nav_speed = 0.12
     node.direct_nav_stop_radius_m = 0.08
-    node.world = SimpleNamespace(
-        robot_x=0.0, robot_y=0.0, robot_theta=math.radians(-5.0)
-    )
+    node.world = SimpleNamespace(robot_x=0.0, robot_y=0.0, robot_theta=0.0)
     node._lane_heading_segment_key = None
     node._lane_heading_phase = "align"
     node._lane_heading_filtered = None
@@ -366,14 +495,20 @@ def test_cardinal_follower_corrects_small_drift_during_realign_arm_window():
     node._lane_heading_turn_sign = 0
     node._lane_heading_reverse_start_s = 0.0
 
+    now = [0.0]
     commands = []
-    node._now_s = lambda: 0.0
+    node._now_s = lambda: now[0]
     node._distance_to = lambda _x, _y: 1.0
     node._decide = lambda _text: None
     node._drive = lambda vx, vy, omega=0.0: commands.append((vx, vy, omega))
 
     node._drive_cardinal_lane_segment((0.0, 0.0), (1.0, 0.0), (1, 0))
+    assert commands[-1] == (0.07, 0.0, 0.0)
 
+    now[0] = 0.1
+    node.world.robot_theta = math.radians(-5.0)
+    node._drive_cardinal_lane_segment((0.0, 0.0), (1.0, 0.0), (1, 0))
     assert commands[-1][0] > 0.0
+    assert commands[-1][1] == 0.0
     assert commands[-1][2] > 0.0
     assert commands[-1][2] <= 0.08

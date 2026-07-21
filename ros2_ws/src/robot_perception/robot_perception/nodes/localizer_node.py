@@ -727,6 +727,11 @@ class LocalizerNode(Node):
     ) -> Tuple[float, float, float]:
         """Attenuate a robot-frame pose delta according to encoder-derived motion mode."""
         forward_gain, lateral_gain, yaw_gain = self._motion_constraint_gains(source)
+        # Gyro yaw is a direct physical measurement and must not be discarded while the slower
+        # encoder state still reports STOP at the start of a short rotation pulse. Encoder-derived
+        # attenuation remains active for camera and landmark corrections.
+        if source == "imu":
+            yaw_gain = 1.0
         return dfwd * forward_gain, dleft * lateral_gain, dtheta * yaw_gain
 
     def _constrain_world_delta(

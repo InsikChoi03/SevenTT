@@ -148,6 +148,25 @@ def test_grid_only_ignores_legacy_direct_simplification():
     assert all(_is_cardinal(a, b) for a, b in zip([start] + path, path))
 
 
+def test_post_pick_entry_drives_directly_to_first_lane_then_stays_cardinal():
+    lp = LanePlanner(
+        spacing=0.5,
+        bounds=(-2, 2, -2, 2),
+        margin=0.22,
+        origin_mode="fixed",
+        simplify=False,
+    )
+    start = (-1.40, -1.10)
+    dest = (1.10, 1.40)
+
+    path = lp.plan(start, dest, [], route_mode="post_pick_entry")
+
+    assert path is not None and path[-1] == dest
+    assert not _is_cardinal(start, path[0])
+    assert all(_is_cardinal(a, b) for a, b in zip(path, path[1:]))
+    _verify_clear(lp, start, path, [])
+
+
 def test_object_approach_places_last_waypoint_on_lane_line():
     lp = LanePlanner(
         spacing=0.5,
