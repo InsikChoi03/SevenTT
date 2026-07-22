@@ -60,6 +60,38 @@ _LABEL_TO_SET_TYPE: dict[str, int] = {
 # promoted from fruit_photo_cube to the concrete fruit, keep it typed Set2).
 _FRUIT_LABELS = frozenset({"apple", "orange", "banana", "pineapple"})
 
+
+def resolve_recent_yolo_identity(
+    body_votes: dict[str, float],
+    wide_votes: dict[str, float],
+    label_history: list[str],
+    plain_cube_required: int,
+) -> tuple[str, int]:
+    """Resolve YOLO identity while requiring clean recent evidence for a plain cube.
+
+    Plain and fruit-photo cubes are exposed only after ``plain_cube_required`` consecutive
+    observations of the same label. Mixed cube histories remain unknown instead of oscillating
+    between Set1 and Set2.
+    """
+    required = max(1, int(plain_cube_required))
+    recent = list(label_history[-required:])
+    if len(recent) >= required and all(label == "fruit_photo_cube" for label in recent):
+        return "fruit_photo_cube", 2
+
+    if len(recent) >= required and all(label == "cube" for label in recent):
+        return "cube", 1
+
+    pool = body_votes if body_votes else wide_votes
+    shapes = {
+        label: score
+        for label, score in pool.items()
+        if label not in ("cube", "fruit_photo_cube", "arrival")
+    }
+    if shapes:
+        best = max(shapes, key=shapes.get)
+        return best, _LABEL_TO_SET_TYPE.get(best, 0)
+    return "", 0
+
 # Identity is decided PER SOURCE (see Track.body_votes/wide_votes): the body cam is the close,
 # reliable camera, so when it has classified an object its confidence-summed vote wins outright;
 # the wide cam only names objects the body never saw. This beats a single blended weight, which
@@ -135,6 +167,8 @@ class Track:
     # polyhedra look alike) never overrides it. Within a source, votes are confidence-summed.
     wide_votes: dict = field(default_factory=dict)    # wide YOLO label -> summed conf
     body_votes: dict = field(default_factory=dict)    # body YOLO label -> summed conf
+    # Recent confident YOLO labels in cross-camera arrival order.
+    label_history: list[str] = field(default_factory=list)
     fruit_votes: dict = field(default_factory=dict)   # SigLIP fruit -> summed conf
     # Landmark anchoring: once a track is stable it LOCKS to a frozen world position, and
     # further re-observations are used to correct the ROBOT pose (not to move the track).
@@ -303,11 +337,11 @@ class WorldModelNode(Node):
         self.declare_parameter("grid_track_lock_alpha", 1.0)
         self.declare_parameter(
             "zone_anchor_xy",
-            [-1.0, 0.5, -1.0, -1.0, 0.75, -1.0, 0.75, 0.5],
+            [-1.0, 0.5, -1.0, -1.0, 1.25, -1.25, 0.75, 0.5],
         )
         self.declare_parameter(
             "zone_anchor_candidates",
-            [1.0, -1.0, 0.5, 2.0, -1.0, -1.0, 3.0, 0.75, -1.0, 4.0, 0.75, 0.5],
+            [1.0, -1.0, 0.5, 2.0, -1.0, -1.0, 3.0, 1.25, -1.25, 4.0, 0.75, 0.5],
         )
         self.declare_parameter("grid_moved_threshold_m", 0.22)
 
@@ -321,6 +355,7 @@ class WorldModelNode(Node):
         # LOWER bar than the wide cam — otherwise a real 0.6–0.8 body octa/icosa never establishes an
         # identity, gets no protection, and is swallowed by a neighbouring high-conf cube track.
         self.declare_parameter("class_conf_threshold_body", 0.50)
+        self.declare_parameter("plain_cube_confirm_observations", 5)
         self.declare_parameter("fruit_cube_sticky_enabled", False)
         self.declare_parameter("fruit_cube_sticky_conf_wide", 0.75)
         self.declare_parameter("fruit_cube_sticky_conf_body", 0.50)
@@ -393,6 +428,9 @@ class WorldModelNode(Node):
         self.grid_moved_threshold = max(0.0, float(self.get_parameter("grid_moved_threshold_m").value))
         self.class_conf_threshold = float(self.get_parameter("class_conf_threshold").value)
         self.class_conf_threshold_body = float(self.get_parameter("class_conf_threshold_body").value)
+        self.plain_cube_confirm_observations = min(
+            32, max(1, int(self.get_parameter("plain_cube_confirm_observations").value))
+        )
         self.fruit_cube_sticky_enabled = bool(self.get_parameter("fruit_cube_sticky_enabled").value)
         self.fruit_cube_sticky_conf_wide = float(self.get_parameter("fruit_cube_sticky_conf_wide").value)
         self.fruit_cube_sticky_conf_body = float(self.get_parameter("fruit_cube_sticky_conf_body").value)
@@ -707,6 +745,13 @@ class WorldModelNode(Node):
                 self.grid_track_lock_alpha = min(1.0, max(0.0, float(param.value)))
             elif param.name == "fruit_cube_sticky_enabled":
                 self.fruit_cube_sticky_enabled = bool(param.value)
+            elif param.name == "plain_cube_confirm_observations":
+                self.plain_cube_confirm_observations = min(32, max(1, int(param.value)))
+                for track in self.tracks.values():
+                    track.label_history = track.label_history[
+                        -self.plain_cube_confirm_observations:
+                    ]
+                    self._refresh_identity(track)
             elif param.name == "fruit_cube_sticky_conf_wide":
                 self.fruit_cube_sticky_conf_wide = float(param.value)
             elif param.name == "fruit_cube_sticky_conf_body":
@@ -1353,10 +1398,21 @@ class WorldModelNode(Node):
                 body_hits=fruit_body_hits,
                 wide_hits=fruit_wide_hits,
             )
+            body_votes: dict[str, float] = {}
+            wide_votes: dict[str, float] = {}
+            label_history: list[str] = []
+            if conf >= vote_thresh and label:
+                votes = body_votes if is_body else wide_votes
+                votes[label] = max(0.05, conf)
+            if self._is_recent_label_evidence(label, conf, is_body, vote_thresh):
+                label_history.append(label)
             self._candidates.append({"x": x, "y": y, "n": 1, "t": now, "conf": conf,
                                      "label": label,
                                      "set": (2 if fruit_seen else set_type),
                                      "body": is_body,
+                                     "body_votes": body_votes,
+                                     "wide_votes": wide_votes,
+                                     "label_history": label_history,
                                      "fruit_cube_seen": fruit_seen,
                                      "fruit_cube_conf": conf if fruit_hit else 0.0,
                                      "fruit_cube_wide_hits": fruit_wide_hits,
@@ -1368,6 +1424,14 @@ class WorldModelNode(Node):
         best["t"] = now
         best["conf"] = max(best["conf"], conf)
         best["body"] = best["body"] or is_body
+        if conf >= vote_thresh and label:
+            votes_key = "body_votes" if is_body else "wide_votes"
+            votes = best.setdefault(votes_key, {})
+            votes[label] = votes.get(label, 0.0) + max(0.05, conf)
+        if self._is_recent_label_evidence(label, conf, is_body, vote_thresh):
+            history = best.setdefault("label_history", [])
+            history.append(label)
+            del history[:-self.plain_cube_confirm_observations]
         if self._is_fruit_cube_evidence(label, conf, is_body):
             if is_body:
                 best["fruit_cube_body_hits"] = int(best.get("fruit_cube_body_hits", 0)) + 1
@@ -1397,6 +1461,9 @@ class WorldModelNode(Node):
             source=("body" if body else "wide"), seen_body=body,
             last_body_sec=(now if is_body else 0.0), last_wide_sec=(0.0 if is_body else now),
             n_obs=best["n"], n_body=(best["n"] if body else 0),
+            wide_votes=dict(best.get("wide_votes", {})),
+            body_votes=dict(best.get("body_votes", {})),
+            label_history=list(best.get("label_history", [])),
             spawn_grid_id=grid_id, current_grid_id=grid_id,
             grid_state=("grid_spawned" if snapped else "off_grid"), grid_snapped=snapped,
             fruit_cube_seen=bool(best.get("fruit_cube_seen", False)),
@@ -1406,8 +1473,6 @@ class WorldModelNode(Node):
         )
         if tr.fruit_cube_seen:
             tr.set_type = 2
-        if conf >= vote_thresh:
-            self._vote(tr, label, conf, is_body)
         self._refresh_identity(tr)
         self.tracks[tid] = tr
         self._candidates.remove(best)
@@ -1513,6 +1578,8 @@ class WorldModelNode(Node):
         # Position/presence updated above for ANY detection; identity only from CONFIDENT ones.
         if conf >= vote_thresh:
             self._vote(tr, label, conf, is_body)
+        elif self._is_recent_label_evidence(label, conf, is_body, vote_thresh):
+            self._record_recent_label(tr, label)
         self._refresh_identity(tr)
         # Lock a stable track into a frozen world anchor once it has enough confident evidence.
         if (
@@ -1527,13 +1594,39 @@ class WorldModelNode(Node):
         # Never un-blacklist (blacklisted flag is left untouched).
         return best_id
 
-    @staticmethod
-    def _vote(tr: Track, label: str, conf: float, is_body: bool) -> None:
-        """Add one confidence-weighted class vote into this source's pool."""
+    def _vote(self, tr: Track, label: str, conf: float, is_body: bool) -> None:
+        """Add a confidence-weighted vote and retain a bounded recent-label window."""
         if not label:
             return
         pool = tr.body_votes if is_body else tr.wide_votes
         pool[label] = pool.get(label, 0.0) + max(0.05, conf)
+        self._record_recent_label(tr, label)
+
+    def _record_recent_label(self, tr: Track, label: str) -> None:
+        if not label:
+            return
+        tr.label_history.append(label)
+        del tr.label_history[:-self.plain_cube_confirm_observations]
+
+    def _is_recent_label_evidence(
+        self,
+        label: str,
+        conf: float,
+        is_body: bool,
+        vote_thresh: float,
+    ) -> bool:
+        if not label:
+            return False
+        if conf >= vote_thresh:
+            return True
+        if label != "fruit_photo_cube":
+            return False
+        fruit_thresh = (
+            self.fruit_cube_sticky_conf_body
+            if is_body
+            else self.fruit_cube_sticky_conf_wide
+        )
+        return conf >= fruit_thresh
 
     def _is_fruit_cube_evidence(self, label: str, conf: float, is_body: bool) -> bool:
         if not self.fruit_cube_sticky_enabled or label != "fruit_photo_cube":
@@ -1548,8 +1641,7 @@ class WorldModelNode(Node):
                  or int(wide_hits) >= max(1, self.fruit_cube_sticky_min_wide_hits))
         )
 
-    @staticmethod
-    def _refresh_identity(tr: Track) -> None:
+    def _refresh_identity(self, tr: Track) -> None:
         """Best-estimate identity. SigLIP fruit wins for Set2; otherwise the BODY cam's vote
         decides whenever it has classified the object (close/reliable), falling back to the wide
         cam only for objects the body never saw. Within the chosen source, argmax of the
@@ -1570,16 +1662,14 @@ class WorldModelNode(Node):
             tr.class_label = "fruit_photo_cube"
             tr.set_type = 2
             return
-        pool = tr.body_votes if tr.body_votes else tr.wide_votes
-        if pool:
-            # fruit_photo_cube handled above; pick the best SHAPE vote for a Set1 object.
-            shapes = {k: v for k, v in pool.items() if k not in ("fruit_photo_cube", "arrival")}
-            if shapes:
-                best = max(shapes, key=shapes.get)
-                tr.class_label = best
-                st = _LABEL_TO_SET_TYPE.get(best, 0)
-                if st:
-                    tr.set_type = st
+        label, set_type = resolve_recent_yolo_identity(
+            tr.body_votes,
+            tr.wide_votes,
+            tr.label_history,
+            self.plain_cube_confirm_observations,
+        )
+        tr.class_label = label
+        tr.set_type = set_type
 
     # -------------------------------------------------------- landmark correction
     def _maybe_publish_correction(self) -> None:
@@ -1909,6 +1999,9 @@ class WorldModelNode(Node):
                                (ta.fruit_votes, tb.fruit_votes)):
                     for k, v in pb.items():
                         pa[k] = pa.get(k, 0.0) + v
+                history_limit = self.plain_cube_confirm_observations
+                merged_history = ta.label_history + tb.label_history
+                ta.label_history = merged_history[-history_limit:]
                 ta.confidence = max(ta.confidence, tb.confidence)
                 ta.fruit_confidence = max(ta.fruit_confidence, tb.fruit_confidence)
                 ta.fruit_cube_wide_hits += tb.fruit_cube_wide_hits

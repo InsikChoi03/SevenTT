@@ -72,6 +72,34 @@ def is_precision_strafe_command(
     )
 
 
+def select_brake_pulse_parameters(
+    *,
+    align_profile: bool,
+    rotation_profile: bool,
+    align_brake_off: bool,
+    wheel_brake_ms: float,
+    wheel_brake_scale: float,
+    rotation_wheel_brake_ms: float,
+    rotation_wheel_brake_scale: float,
+    align_wheel_brake_ms: float,
+    align_wheel_brake_scale: float,
+) -> tuple[float, float]:
+    """Select independent ALIGN, in-place rotation, or translation brake parameters."""
+    if align_profile:
+        if align_brake_off:
+            return 0.0, 0.0
+        return (
+            max(0.0, float(align_wheel_brake_ms)),
+            max(0.0, float(align_wheel_brake_scale)),
+        )
+    if rotation_profile:
+        return (
+            max(0.0, float(rotation_wheel_brake_ms)),
+            max(0.0, float(rotation_wheel_brake_scale)),
+        )
+    return max(0.0, float(wheel_brake_ms)), max(0.0, float(wheel_brake_scale))
+
+
 class BaseControllerNode(Node):
     def __init__(self) -> None:
         super().__init__("base_controller_node")
@@ -121,14 +149,14 @@ class BaseControllerNode(Node):
         self.declare_parameter("opening_wheel_boost_rot", legacy_boost)
         self.declare_parameter("opening_wheel_boost_ms", 120)
         self.declare_parameter("wheel_deadband", 0.02)   # below this = treat as stop
-        # BRAKE: mirror of the start boost. The heavy base coasts past target after a command stops,
-        # so on EVERY move->stop we emit a brief reverse pulse (opposite the last travel direction,
-        # scaled) to kill that coast — the same brake the serial motion tuner applies per segment.
-        # This also fires when the ALIGN visual-servo settles between nudges: that's benign because
-        # ALIGN re-measures the settled position each cycle (closed loop) and the pulse only trims
-        # coast, but if ALIGN regresses lower wheel_brake_scale or set wheel_brake_ms:0. 0 disables.
+        # BRAKE: translation, pure in-place rotation, and ALIGN use independent reverse pulses.
+        # wheel_brake_* remains the translation/strafe profile for backward-compatible YAML.
         self.declare_parameter("wheel_brake_ms", 120)
         self.declare_parameter("wheel_brake_scale", 0.315)
+        self.declare_parameter("rotation_wheel_brake_ms", 120)
+        self.declare_parameter("rotation_wheel_brake_scale", 0.315)
+        self.declare_parameter("align_wheel_brake_ms", 120)
+        self.declare_parameter("align_wheel_brake_scale", 0.315)
 
         self.lx = float(self.get_parameter("lx").value)
         self.ly = float(self.get_parameter("ly").value)
@@ -165,8 +193,19 @@ class BaseControllerNode(Node):
         self.wheel_deadband = float(self.get_parameter("wheel_deadband").value)
         self.wheel_brake_ms = float(self.get_parameter("wheel_brake_ms").value)
         self.wheel_brake_scale = float(self.get_parameter("wheel_brake_scale").value)
-        # ALIGN fine-positioning is GENTLER: the full start-boost (0.65) + stop-brake make each tiny
-        # nudge jerk ("휙휙"). During ALIGN use a softer kick and NO brake so the base creeps.
+        self.rotation_wheel_brake_ms = float(
+            self.get_parameter("rotation_wheel_brake_ms").value
+        )
+        self.rotation_wheel_brake_scale = float(
+            self.get_parameter("rotation_wheel_brake_scale").value
+        )
+        self.align_wheel_brake_ms = float(
+            self.get_parameter("align_wheel_brake_ms").value
+        )
+        self.align_wheel_brake_scale = float(
+            self.get_parameter("align_wheel_brake_scale").value
+        )
+        # ALIGN fine-positioning has its own boost and independently switchable brake profile.
         self.declare_parameter("align_wheel_boost", 0.45)
         self.declare_parameter("align_brake_off", True)
         self.declare_parameter("precision_strafe_duty", 0.315)
@@ -195,6 +234,7 @@ class BaseControllerNode(Node):
         self._brake_cmd = [0.0, 0.0, 0.0, 0.0]
         self._last_move_wheels = [0.0, 0.0, 0.0, 0.0]
         self._last_align_profile_move = False
+        self._last_rotation_move = False
 
         self.last_cmd_time = self.get_clock().now()
         self.last_cmd = (0.0, 0.0, 0.0)
@@ -296,6 +336,14 @@ class BaseControllerNode(Node):
                     self.wheel_brake_ms = float(p.value)
                 elif name == "wheel_brake_scale":
                     self.wheel_brake_scale = float(p.value)
+                elif name == "rotation_wheel_brake_ms":
+                    self.rotation_wheel_brake_ms = float(p.value)
+                elif name == "rotation_wheel_brake_scale":
+                    self.rotation_wheel_brake_scale = float(p.value)
+                elif name == "align_wheel_brake_ms":
+                    self.align_wheel_brake_ms = float(p.value)
+                elif name == "align_wheel_brake_scale":
+                    self.align_wheel_brake_scale = float(p.value)
                 elif name == "align_wheel_boost":
                     self.align_wheel_boost = float(p.value)
                 elif name == "align_brake_off":
@@ -393,12 +441,21 @@ class BaseControllerNode(Node):
         ):
             if self._moving:                          # transition move -> rest: start the brake pulse
                 self._moving = False
-                brake = self.wheel_brake_ms > 0.0 and self.wheel_brake_scale > 0.0
-                if (aligning or self._last_align_profile_move) and self.align_brake_off:
-                    brake = False                     # no coast-brake during fine ALIGN (it jerks)
+                brake_ms, brake_scale = select_brake_pulse_parameters(
+                    align_profile=aligning or self._last_align_profile_move,
+                    rotation_profile=self._last_rotation_move,
+                    align_brake_off=self.align_brake_off,
+                    wheel_brake_ms=self.wheel_brake_ms,
+                    wheel_brake_scale=self.wheel_brake_scale,
+                    rotation_wheel_brake_ms=self.rotation_wheel_brake_ms,
+                    rotation_wheel_brake_scale=self.rotation_wheel_brake_scale,
+                    align_wheel_brake_ms=self.align_wheel_brake_ms,
+                    align_wheel_brake_scale=self.align_wheel_brake_scale,
+                )
+                brake = brake_ms > 0.0 and brake_scale > 0.0
                 if brake:
-                    self._brake_until = now + self.wheel_brake_ms / 1000.0
-                    self._brake_cmd = [max(-1.0, min(1.0, -w * self.wheel_brake_scale))
+                    self._brake_until = now + brake_ms / 1000.0
+                    self._brake_cmd = [max(-1.0, min(1.0, -w * brake_scale))
                                        for w in self._last_move_wheels]
             if now < self._brake_until:
                 wheels = list(self._brake_cmd)        # reverse pulse decelerates the coast
@@ -455,6 +512,7 @@ class BaseControllerNode(Node):
                 kick = True                           # boost pulse must hit immediately
             self._last_move_wheels = list(wheels)     # remember travel direction for the stop brake
             self._last_align_profile_move = align_profile
+            self._last_rotation_move = is_rot
 
         # Slew-limit toward the target so accel/decel is smooth (no jack-rabbit start / no slip).
         # Brake pulses bypass slew (kick) so they hit hard enough to actually cut the coast.

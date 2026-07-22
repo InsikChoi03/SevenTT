@@ -374,11 +374,11 @@ class RecognitionVizNode(Node):
         self.declare_parameter("show_zone_anchors", True)
         self.declare_parameter(
             "zone_anchor_xy",
-            [-1.0, 0.5, -1.0, -1.0, 0.75, -1.0, 0.75, 0.5],
+            [-1.0, 0.5, -1.0, -1.0, 1.25, -1.25, 0.75, 0.5],
         )
         self.declare_parameter(
             "zone_anchor_candidates",
-            [1.0, -1.0, 0.5, 2.0, -1.0, -1.0, 3.0, 0.75, -1.0, 4.0, 0.75, 0.5],
+            [1.0, -1.0, 0.5, 2.0, -1.0, -1.0, 3.0, 1.25, -1.25, 4.0, 0.75, 0.5],
         )
         self.show_zone_anchors = bool(self.get_parameter("show_zone_anchors").value)
         za = [float(v) for v in self.get_parameter("zone_anchor_xy").value]

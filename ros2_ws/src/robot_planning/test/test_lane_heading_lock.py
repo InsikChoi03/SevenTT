@@ -190,6 +190,9 @@ def test_cardinal_follower_drives_directly_when_aligned_and_stops_to_realign():
     assert node._lane_heading_phase == "drive"
     assert commands[-1] == (0.12, 0.0, 0.0)
 
+    assert node._drive_cardinal_lane_segment(*args, speed_limit_mps=0.07)
+    assert commands[-1] == (0.07, 0.0, 0.0)
+
     node.world.robot_theta = math.radians(10.0)
     for _ in range(20):
         now[0] += 0.05

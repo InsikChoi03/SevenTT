@@ -45,7 +45,7 @@ localizer_node:
     stationary_wheel_eps_mps: 0.02
     stationary_cmd_eps: 0.03
     stationary_required_sec: 0.8
-    suppress_object_flow_when_stationary: false  # 벽 유무와 무관하게 object-flow 병진 사용
+    suppress_object_flow_when_stationary: false  # 상태 오판으로 실제 이동을 막지 않음
     freeze_pose_when_stationary: true
     wall_anchor_gain: 0.50
     wall_anchor_max_step_m: 0.03
@@ -57,7 +57,16 @@ localizer_node:
     wall_field_deadband_m: 0.005
     wall_correction_stale_sec: 1.5
     use_imu_heading: true                 # IMU heading 보정 ON: 벽 보정 OFF 조건 비교 테스트
-    imu_motion_smoothing_enabled: true    # accel 적분 없이 IMU 상태로 순간 x/y correction gain만 조절
+    imu_motion_smoothing_enabled: false   # STOP/ROTATING/IMPACT 상태별 고정 병진 감쇠 비활성화
+    imu_flow_consistency_enabled: true    # 이전 flow 속도+IMU 가속도로 급격한 flow 변화만 연속 감쇠
+    imu_flow_min_gain: 0.10               # 큰 값도 폐기하지 않는 최소 반영 gain
+    imu_flow_full_trust_error_mps: 0.15   # 이 속도 오차 이하는 flow 전량 반영
+    imu_flow_soft_error_mps: 0.40         # 이 속도 오차 이상은 최소 gain 적용
+    imu_flow_accel_deadband_mps2: 0.20    # IMU 평면 가속도 노이즈 제거
+    imu_flow_accel_clip_mps2: 1.50        # 충격 가속도 제한
+    imu_flow_accel_bias_alpha: 0.01       # 기울기/저주파 bias 추종 계수
+    imu_flow_accel_filter_alpha: 0.25     # 평면 가속도 저역통과 계수
+    imu_flow_max_dt_sec: 0.30             # 긴 flow 공백에서는 속도 예측 초기화
     imu_motion_publish_debug: true        # /localization/imu_motion_state 발행
     imu_stationary_gyro_eps_radps: 0.035
     imu_stationary_accel_norm_eps: 0.35
@@ -212,11 +221,12 @@ world_model_node:
     grid_track_lock_enabled: true         # 주행 테스트 중 확인된 물체 track을 격자점에 고정한다.
     grid_track_lock_radius_m: 0.26
     grid_track_lock_alpha: 1.0
-    zone_anchor_xy: [-1.0, 0.5, -1.0, -1.0, 0.75, -1.0, 0.75, 0.5]
+    zone_anchor_xy: [-1.0, 0.5, -1.0, -1.0, 1.25, -1.25, 0.75, 0.5]
     grid_moved_threshold_m: 0.22
     # 위치 vs 분류 분리 + 음의 증거(FOV 안인데 미검출 시 지속 감점 → 팬텀/집어간 물체 정리)
     class_conf_threshold: 0.85            # 광각 IDENTITY 커트라인(높게): 이 이상만 클래스 투표(광각=위치 위주)
     class_conf_threshold_body: 0.50       # 본체=신원 권위자라 낮은 바에서도 투표(0.6~0.8 octa/icosa도 자기 정체성 확립→과병합 방지)
+    plain_cube_confirm_observations: 5    # 최근 유효 라벨 5개가 모두 cube일 때만 순수 일반 큐브로 확정
     fruit_cube_sticky_enabled: false      # 오분류 고착을 막고 이후 shape vote로 재분류를 허용한다
     fruit_cube_sticky_conf_wide: 0.75
     fruit_cube_sticky_conf_body: 0.50
@@ -282,6 +292,13 @@ mission_fsm_node:
     approach_dist_m: 0.375                 # 집기 전 ALIGN 전환 거리: 37.5cm
     align_settle_sec: 1.0
     classify_timeout_sec: 3.5             # 트랙기반 게이트(set1 즉시), set2 SigLIP 여유
+    classify_body_max_age_sec: 0.60       # 최종 판별에는 CLASSIFY 진입 후의 새 Body 프레임만 사용
+    classify_body_settle_sec: 0.40        # ALIGN 완료 후 최종 라벨 투표 전 완전 정지 대기
+    classify_body_max_frames: 10          # 목표/동일 비목표 5표가 없을 때 한 번의 판별 최대 프레임
+    classify_body_retry_backoff_sec: 0.25 # 판별 불확실 시 한 번만 짧게 후진
+    classify_body_retry_settle_sec: 0.40  # 후진 뒤 재판별 전 정지 대기
+    classify_octa_wide_final_enabled: true # 옥타만 Wide 라벨로 최종 확인; Body 라벨은 무시
+    classify_wide_confirm_frames: 3       # 현재 타깃과 공간 매칭된 새 Wide 옥타 검출 3회
     pick_duration_sec: 11.0               # 그립 닫힘과 팔 복귀 완료 후 다음 주행 시작
     shape_target_total: 4                 # 정십이면체 4개
     fruit_target_total: 0                 # 오렌지 큐브 무시: 정십이면체만 집기
@@ -345,25 +362,36 @@ mission_fsm_node:
     zone_mission_enabled: true
     zone_order: [1, 2, 3, 4]
     zone_bounds_m: [-2.0, -0.25, -0.25, 2.0,  -2.0, -0.25, -2.0, -0.25,  -0.25, 2.0, -2.0, -0.25,  -0.25, 2.0, -0.25, 2.0]
-    zone_anchor_xy: [-1.0, 0.5, -1.0, -1.0, 0.75, -1.0, 0.75, 0.5]
+    zone_anchor_xy: [-1.0, 0.5, -1.0, -1.0, 1.25, -1.25, 0.75, 0.5]
     zone_no_target_advance_sec: 6.0
     zone_center_reach_tol_m: 0.25
+    zone_anchor_slowdown_enabled: true
+    zone_anchor_slowdown_distance_m: 0.50
+    zone_anchor_slow_speed: 0.07
     zone_stabilize_enabled: true
     zone_stabilize_sec: 3.0
     zone_stabilize_require_fresh_seen: true
+    plain_cube_ambiguous_observations: 5
+    zone_ambiguous_exclusion_radius_m: 0.18
     align_pulse_sec: 0.10                 # (legacy, 미사용)
-    align_distractor_confirm_frames: 5    # 동일 비목표 라벨 5프레임 연속 확인 후에만 blacklist
+    align_distractor_confirm_frames: 5    # ALIGN 완료 후 목표 5표 또는 동일 비목표 5표로 최종 판별
     # ★단위-스텝 보정값★ (2026-07-08 실측, 무부스트+브레이크). 각 방향 거의 일정 이동:
     align_step_fwd_duty: 0.27             # 전진/후진 duty. 직전 저속값 대비 1.5배
     align_step_fwd_sec: 0.15              # 한 번 전/후진 보정 거리: 직전값 대비 1.5배
-    align_heading_tolerance_rad: 0.0524   # Wide/Body 방향 펄스 회전 완료 허용오차(3도)
+    align_step_strafe_duty: 0.315         # 좌우 횡이동 미세조정 duty
+    align_step_strafe_sec: 0.30           # 한 번 좌우 횡이동 미세조정 시간
+    align_step_strafe_mid_sec: 0.60       # 좌우 오차가 클 때 쓰는 긴 횡이동 시간
+    align_heading_tolerance_rad: 0.0524   # 재접근 호환값. ALIGN 자체는 회전하지 않음
+    align_wide_match_radius_m: 0.30       # 옥타 최종 분류용 raw Wide 관측 연결 최대 거리
+    align_wide_max_age_sec: 0.80          # 옥타 최종 분류에서 stale Wide 프레임 차단
+    align_body_confirm_frames: 3          # 같은 근거리 물체를 새 Body 프레임 3개에서 확인
     align_body_lost_backoff_enabled: true # ALIGN에서 wide/world에는 있는데 body에 없으면 후진 후 재탐지
     align_body_lost_backoff_speed: 0.189  # body lost 후진 duty: 0.27의 0.7배
     align_body_lost_backoff_sec: 0.54     # 속도 0.7배 기준 약 10cm 후진
     align_body_lost_backoff_settle_sec: 1.0 # 후진 후 카메라 안정화 대기
     align_settle_pulse_sec: 0.6           # 스텝 후 완전정지 대기(브레이크 있어 더 짧게)
-    align_tol_m: 0.03                     # 좌우 허용오차. 이 안이면 잡기(그리퍼가 흡수)
-    align_fwd_tol_m: 0.03                 # 앞뒤 허용오차. 이 안이면 잡기(그리퍼가 흡수)
+    align_tol_m: 0.02                     # Body y 기준 집기 허용 좌우 오차(±2cm)
+    align_fwd_tol_m: 0.02                 # Body x 기준 집기 허용 전후 오차(±2cm)
 
 pick_sequencer_node:
   ros__parameters:
@@ -418,9 +446,13 @@ base_controller_node:
     wheel_slew_per_tick: 0.02             # 가감속 더더 완만(아주 부드럽게)
     align_wheel_boost: 0.63               # ALIGN 미세정렬 킥. 직전 저속값 대비 1.5배
     align_brake_off: false                # ALIGN 단위-스텝은 브레이크 ON(각 스텝 크리스프 정지 → 보정값과 동일·반복성)
+    align_wheel_brake_ms: 120             # ALIGN 전용 역방향 브레이크 시간(ms)
+    align_wheel_brake_scale: 0.315        # ALIGN 전용 역펄스 세기
     wheel_deadband: 0.02
-    wheel_brake_ms: 120                    # 이동→정지 전환마다 역펄스 제동(coast 컷). 0=끔
-    wheel_brake_scale: 0.315               # 역펄스 세기 = 직전 0.45의 0.7배
+    wheel_brake_ms: 120                    # 일반 전후진/횡이동 정지 역펄스 시간. 0=끔
+    wheel_brake_scale: 0.315               # 일반 전후진/횡이동 정지 역펄스 세기
+    rotation_wheel_brake_ms: 120           # 일반 제자리 회전 정지 전용 역펄스 시간
+    rotation_wheel_brake_scale: 0.315      # 일반 제자리 회전 정지 전용 역펄스 세기
 
 explorer_node:
   ros__parameters:
@@ -467,7 +499,7 @@ recognition_viz_node:
     show_zone_regions: true               # FSM이 쓰는 격자 기준 구역을 라이브 맵에 사각형으로 표시
     zone_bounds_m: [-2.0, -0.25, -0.25, 2.0,  -2.0, -0.25, -2.0, -0.25,  -0.25, 2.0, -2.0, -0.25,  -0.25, 2.0, -0.25, 2.0]
     show_zone_anchors: true
-    zone_anchor_xy: [-1.0, 0.5, -1.0, -1.0, 0.75, -1.0, 0.75, 0.5]
+    zone_anchor_xy: [-1.0, 0.5, -1.0, -1.0, 1.25, -1.25, 0.75, 0.5]
     # 맵 FOV 표시(world_model 과 동일값): 본체=부채꼴, 광각=전방 타원
     body_fov_half_deg: 30.0
     body_fov_near_m: 0.25

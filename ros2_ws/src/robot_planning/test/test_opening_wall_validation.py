@@ -56,3 +56,12 @@ def test_disabled_wall_validation_releases_opening_without_wall_debug():
     assert node._opening_wall_heading_valid is False
     assert node._wall_translation_unlocked is True
     assert node.mapping_events[-1] == (True, "opening wall validation disabled")
+
+
+def test_zone_stabilize_reuses_fast_translation_only_wall_correction():
+    node = MissionFsmNode.__new__(MissionFsmNode)
+    node.state = "ZONE_STABILIZE"
+    node._wall_translation_unlocked = True
+
+    assert node._wall_fast_correction_requested()
+    assert node._wall_correction_mode_requested() == "TRANSLATION_ONLY"

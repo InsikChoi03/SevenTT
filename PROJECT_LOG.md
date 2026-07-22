@@ -26,10 +26,10 @@
 
 ## 2. 현재 상태 (Snapshot — 이 섹션만 최신값으로 덮어쓰기)
 
-- **현재 버전:** `v5.1.0` (`new` 브랜치, Git 태그 없음)
-- **최종 업데이트:** 2026-07-22 05:44 (KST)
+- **현재 버전:** `v5.2.0` (`new` 브랜치, Git 태그 없음)
+- **최종 업데이트:** 2026-07-22 11:41 (KST)
 - **최종 작업자:** `@AI`
-- **한 줄 요약:** 위치·분류·팔 집기 안정화와 waypoint 통과 판정을 보강하고, 실제 경기에서 150초 주차장 도달까지 확인한 v5.1.0을 확정했다.
+- **한 줄 요약:** ALIGN 최종 판별과 구역 재선택을 안정화하고, IMU-flow 완화 옵션·독립 브레이크·벽 거리 기반 150초 주차를 통합한 v5.2.0 상태다.
 
 ---
 
@@ -152,12 +152,53 @@
 - [ ] PICK 후 첫 레인 진입점 도착 시 브레이크·정지·다음 구간 heading 정렬을 추가해 연속 과주행을 방지 — `@AI`
 - [x] 150초에 `(1.5,1.5)` 직선 이동→원점 heading 정렬→`(1.8,1.8)` 후진 주차가 실제 경기장에서 완료되는지 검증 — `@insik` (2026-07-22 완료)
 - [ ] 일반 레인과 마지막 stand-off에서 `LANE WAYPOINT/FINAL PASSED` 및 15cm 초과 `MISSED -> REPLAN`이 과주행 없이 동작하는지 실주행 검증 — `@insik`
+- [x] ALIGN 완료 후 정지 상태에서 Set1 최종 라벨을 판정하고, cube/fruit 혼합 물체를 구역 내 재선택하지 않는 로직 구현 — `@AI` (2026-07-22 완료)
+- [x] 150초 주차를 아래 벽 30cm 접근→오른쪽 정렬→왼쪽 벽 방향 후진·벽 거리 종료 흐름으로 교체 — `@AI` (2026-07-22 완료)
+- [ ] 벽 검출 기반 주차가 아래 벽 30cm와 왼쪽 벽 설정값 5cm에서 정지하며, 벽 선분 미검출 시 안전 정지하는지 실주행 확인 — `@insik`
+- [ ] 현재 `GRASP=1.3초` 설정에서 실제 그리퍼가 완전히 닫힌 뒤 LIFT가 시작되는지 확인하고, 물리 중첩이 남으면 그리퍼 실제 이동시간을 재측정 — `@insik`
 
 ---
 
 ## 5. 변경 이력 (Changelog) — ⛔ 삭제 금지 / 최신 항목이 맨 위
 
 <!-- 새 엔트리는 바로 이 줄 아래에 추가하세요. 기존 엔트리는 건드리지 마세요. -->
+
+### `v5.2.0` — 2026-07-22 11:41 (KST) · 작업자: `@AI` · ID: `2026-07-22-02`
+- **변경 요약:** 인식·ALIGN·구역 이동과 제동을 안정화하고, 150초 주차를 벽 거리 기반 직선 주행으로 전환했다.
+- **상세:**
+  - IMU 가속도와 직전 flow 속도를 비교해 급격한 object-flow 병진값을 폐기하지 않고 연속 gain으로 완화하는 선택 기능을 추가했다. 메인 `motion_tuning.yaml`에서는 현재 비활성화해 기존 flow 반영을 유지한다.
+  - cube와 `fruit_photo_cube`는 최근 동일 라벨 5회가 모일 때만 확정하고 혼합 관측은 unknown으로 남기며, APPROACH에서 불확실성이 지속된 물체는 해당 구역에서 ID와 위치 반경으로 재선택하지 않도록 했다.
+  - ALIGN 중 라벨 판정을 제거하고 정지·정렬 완료 후 CLASSIFY에서 최종 투표하도록 분리했다. 옥타는 현재 목표와 공간 연결된 새 Wide 관측 3회, Body는 집기점 존재와 전후 거리 확인에 사용하며 불확실 시 한 번 후진 재확인한다.
+  - ALIGN 제어점을 raw Wide heading과 Body range로 분리하고, Body 3프레임 존재 확인·좌우 2cm 안전 범위·전후 미세조정과 body-lost 후진 재획득을 추가했다.
+  - 오프닝/구역 전환 앵커의 축 횡이동을 거리별 펄스로 나누고, 앵커 50cm 이내에서 0.07 저속을 고정했다. Z3 진입 앵커는 좌상단 한 점으로 통일했다.
+  - 일반 이동·제자리 회전·ALIGN 정밀 이동의 역브레이크 시간과 세기를 독립 파라미터로 분리해 한 프로파일의 튜닝이 다른 동작에 영향을 주지 않도록 했다.
+  - 150초 주차는 좌표 staging 경로를 제거하고 화면 아래 벽을 향해 직진해 30cm에서 정지한 뒤, 오른쪽 heading으로 정렬하고 왼쪽 벽 방향으로 직선 후진하도록 변경했다. 종료 벽 거리는 현재 5cm이며 서로 다른 벽 프레임 3회 확인과 stale 검출 안전 정지를 적용했다.
+  - 최근 그리퍼 닫힘-상승 분리 실험은 사용자 요청으로 전부 롤백했다. 현재 코드는 기존 `GRASP → LIFT` 보간 구조이고 설정은 `grasp_sec=1.3초`, `move_sec=0.5초`, FSM 베이스 잠금은 11초다.
+  - 플래닝 177개, 인식 23개, 제어 11개 테스트와 Python/YAML 파싱을 통과했고 ROS 2 패키지 7개 전체 빌드를 완료했다.
+- **변경 파일:**
+  - `PROJECT_LOG.md` / 수정
+  - `ros2_ws/src/robot_bringup/config/local_anchor_test.yaml` / 수정
+  - `ros2_ws/src/robot_bringup/config/motion_tuning.yaml` / 수정
+  - `ros2_ws/src/robot_bringup/config/perception.yaml` / 수정
+  - `ros2_ws/src/robot_bringup/config/test_field.yaml` / 수정
+  - `ros2_ws/src/robot_control/robot_control/nodes/base_controller_node.py` / 수정
+  - `ros2_ws/src/robot_control/test/test_base_controller_deadband.py` / 수정
+  - `ros2_ws/src/robot_perception/robot_perception/nodes/localizer_node.py` / 수정
+  - `ros2_ws/src/robot_perception/robot_perception/nodes/recognition_viz_node.py` / 수정
+  - `ros2_ws/src/robot_perception/robot_perception/nodes/world_model_node.py` / 수정
+  - `ros2_ws/src/robot_perception/test/test_localizer_imu_flow_consistency.py` / 신규
+  - `ros2_ws/src/robot_perception/test/test_world_model_plain_cube_identity.py` / 신규
+  - `ros2_ws/src/robot_planning/robot_planning/nodes/mission_fsm_node.py` / 수정
+  - `ros2_ws/src/robot_planning/robot_planning/nodes/target_selector_node.py` / 수정
+  - `ros2_ws/src/robot_planning/test/test_align_distractor_confirmation.py` / 수정
+  - `ros2_ws/src/robot_planning/test/test_align_heading_control.py` / 수정
+  - `ros2_ws/src/robot_planning/test/test_lane_heading_lock.py` / 수정
+  - `ros2_ws/src/robot_planning/test/test_opening_wall_validation.py` / 수정
+  - `ros2_ws/src/robot_planning/test/test_plain_cube_target_gate.py` / 신규
+  - `ros2_ws/src/robot_planning/test/test_timed_storage_route.py` / 수정
+  - `ros2_ws/src/robot_planning/test/test_zone_anchor_candidates.py` / 수정
+- **다음 할 일 반영:** ALIGN 후 최종 판별과 벽 거리 주차 구현을 완료 처리했다. 실제 경기장에서 30cm/5cm 벽 정지와 현재 1.3초 GRASP의 물리적 완료 순서를 확인하는 항목을 추가했다.
+- **버전 근거:** 분류 상태기계, IMU-flow 완화 기능, 독립 브레이크 프로파일과 벽 거리 기반 주차라는 새 기능을 추가했으므로 MINOR를 `v5.1.0`에서 `v5.2.0`으로 올렸다.
 
 ### `v5.1.0` — 2026-07-22 05:44 (KST) · 작업자: `@AI` · ID: `2026-07-22-01`
 - **변경 요약:** 위치·분류·팔 집기와 레인 waypoint 도착 판정을 안정화하고, 150초 주차장 도달을 실제 경기에서 확인했다.

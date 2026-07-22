@@ -72,6 +72,32 @@ def limit_planar_delta(
     return float(dx) * scale, float(dy) * scale, True
 
 
+def blend_flow_velocity_with_imu(
+    flow_velocity: np.ndarray,
+    expected_velocity: np.ndarray,
+    min_gain: float,
+    full_trust_error_mps: float,
+    soft_error_mps: float,
+) -> Tuple[np.ndarray, float, float]:
+    """Softly blend a flow velocity toward the IMU-supported velocity prediction."""
+    flow = np.asarray(flow_velocity, dtype=np.float64)
+    expected = np.asarray(expected_velocity, dtype=np.float64)
+    error = float(np.linalg.norm(flow - expected))
+    gain_floor = max(0.0, min(1.0, float(min_gain)))
+    full_trust = max(0.0, float(full_trust_error_mps))
+    soft_error = max(full_trust + 1e-6, float(soft_error_mps))
+    if error <= full_trust:
+        gain = 1.0
+    elif error >= soft_error:
+        gain = gain_floor
+    else:
+        ratio = (error - full_trust) / (soft_error - full_trust)
+        smoothstep = ratio * ratio * (3.0 - 2.0 * ratio)
+        gain = 1.0 - (1.0 - gain_floor) * smoothstep
+    blended = expected + gain * (flow - expected)
+    return blended, float(gain), error
+
+
 class LocalizerNode(Node):
     def __init__(self) -> None:
         super().__init__("localizer_node")
@@ -334,6 +360,43 @@ class LocalizerNode(Node):
         self.object_flow_stale_sec = float(self.get_parameter("object_flow_stale_sec").value)
         self.declare_parameter("object_flow_trans", True)      # also apply flow translation (else yaw only)
         self.object_flow_trans = bool(self.get_parameter("object_flow_trans").value)
+        self.declare_parameter("imu_flow_consistency_enabled", False)
+        self.imu_flow_consistency_enabled = bool(
+            self.get_parameter("imu_flow_consistency_enabled").value
+        )
+        self.declare_parameter("imu_flow_min_gain", 0.10)
+        self.imu_flow_min_gain = self._bounded_gain(
+            float(self.get_parameter("imu_flow_min_gain").value)
+        )
+        self.declare_parameter("imu_flow_full_trust_error_mps", 0.15)
+        self.imu_flow_full_trust_error = max(
+            0.0, float(self.get_parameter("imu_flow_full_trust_error_mps").value)
+        )
+        self.declare_parameter("imu_flow_soft_error_mps", 0.40)
+        self.imu_flow_soft_error = max(
+            self.imu_flow_full_trust_error + 1e-6,
+            float(self.get_parameter("imu_flow_soft_error_mps").value),
+        )
+        self.declare_parameter("imu_flow_accel_deadband_mps2", 0.20)
+        self.imu_flow_accel_deadband = max(
+            0.0, float(self.get_parameter("imu_flow_accel_deadband_mps2").value)
+        )
+        self.declare_parameter("imu_flow_accel_clip_mps2", 1.50)
+        self.imu_flow_accel_clip = max(
+            0.0, float(self.get_parameter("imu_flow_accel_clip_mps2").value)
+        )
+        self.declare_parameter("imu_flow_accel_bias_alpha", 0.01)
+        self.imu_flow_accel_bias_alpha = self._bounded_gain(
+            float(self.get_parameter("imu_flow_accel_bias_alpha").value)
+        )
+        self.declare_parameter("imu_flow_accel_filter_alpha", 0.25)
+        self.imu_flow_accel_filter_alpha = self._bounded_gain(
+            float(self.get_parameter("imu_flow_accel_filter_alpha").value)
+        )
+        self.declare_parameter("imu_flow_max_dt_sec", 0.30)
+        self.imu_flow_max_dt = max(
+            0.0, float(self.get_parameter("imu_flow_max_dt_sec").value)
+        )
         self.last_objflow_time = None
         # IMU (MPU6050 gyro) is the TOP-PRIORITY heading source: the Z gyro rate is low-noise and only
         # drifts slowly (bias, removed at startup + corrected absolutely by landmarks), so integrating
@@ -414,6 +477,11 @@ class LocalizerNode(Node):
         self.imu_accel_norm_var = 0.0
         self._imu_last_accel_norm = None
         self._imu_accel_norm_window = deque(maxlen=self.imu_motion_accel_window)
+        self._imu_flow_accel_bias_xy: Optional[np.ndarray] = None
+        self._imu_flow_accel_xy: Optional[np.ndarray] = None
+        self._imu_flow_velocity_xy: Optional[np.ndarray] = None
+        self._imu_flow_last_time: Optional[float] = None
+        self._imu_flow_last_heading: Optional[float] = None
         self.last_wall_correction_time = None
         self.wall_fast_correction = False
         # Mission-owned gate. Heading correction is enabled only during the post-opening
@@ -518,6 +586,7 @@ class LocalizerNode(Node):
             f"wheel_odom_enabled={self.wheel_odom_enabled} "
             f"encoder_constraint={self.encoder_motion_constraint_enabled} "
             f"imu_smoothing={self.imu_motion_smoothing_enabled} "
+            f"imu_flow_consistency={self.imu_flow_consistency_enabled} "
             f"intrinsics={'set' if self.have_intrinsics else 'unset'} "
             f"fisheye={self.use_fisheye} rate={rate}Hz"
         )
@@ -542,6 +611,7 @@ class LocalizerNode(Node):
         self.theta = wrap_angle(theta)
         self.last_wall_correction_time = None
         self.last_landmark_correction_time = None
+        self._reset_imu_flow_consistency()
         self.get_logger().info(
             f"localization pose reset to ({self.x:.3f},{self.y:.3f},{self.theta:.3f})"
         )
@@ -802,6 +872,102 @@ class LocalizerNode(Node):
         return (self.use_imu and self.last_imu_time is not None
                 and (now - self.last_imu_time) <= self.imu_stale_sec)
 
+    def _reset_imu_flow_consistency(self) -> None:
+        self._imu_flow_velocity_xy = None
+        self._imu_flow_last_time = None
+        self._imu_flow_last_heading = None
+
+    def _update_imu_flow_acceleration(self, msg: Imu) -> None:
+        """Remove slow planar bias and retain only bounded, short-term acceleration."""
+        raw = np.array(
+            [float(msg.linear_acceleration.x), float(msg.linear_acceleration.y)],
+            dtype=np.float64,
+        )
+        if not np.all(np.isfinite(raw)):
+            return
+        if self._imu_flow_accel_bias_xy is None:
+            self._imu_flow_accel_bias_xy = raw.copy()
+            self._imu_flow_accel_xy = np.zeros(2, dtype=np.float64)
+            return
+
+        bias_alpha = self.imu_flow_accel_bias_alpha
+        self._imu_flow_accel_bias_xy += bias_alpha * (
+            raw - self._imu_flow_accel_bias_xy
+        )
+        dynamic = raw - self._imu_flow_accel_bias_xy
+        magnitude = float(np.linalg.norm(dynamic))
+        if magnitude <= self.imu_flow_accel_deadband:
+            dynamic[:] = 0.0
+        elif magnitude > 1e-9:
+            dynamic *= (magnitude - self.imu_flow_accel_deadband) / magnitude
+        clipped_magnitude = float(np.linalg.norm(dynamic))
+        if self.imu_flow_accel_clip > 0.0 and clipped_magnitude > self.imu_flow_accel_clip:
+            dynamic *= self.imu_flow_accel_clip / clipped_magnitude
+
+        filter_alpha = self.imu_flow_accel_filter_alpha
+        if self._imu_flow_accel_xy is None:
+            self._imu_flow_accel_xy = dynamic
+        else:
+            self._imu_flow_accel_xy += filter_alpha * (
+                dynamic - self._imu_flow_accel_xy
+            )
+
+    def _filter_object_flow_translation(
+        self, dfwd: float, dleft: float, now: float
+    ) -> Tuple[float, float, float]:
+        """Softly attenuate implausible flow speed changes without dropping a frame."""
+        if not self.imu_flow_consistency_enabled:
+            return float(dfwd), float(dleft), 1.0
+
+        previous_time = self._imu_flow_last_time
+        previous_heading = self._imu_flow_last_heading
+        self._imu_flow_last_time = float(now)
+        self._imu_flow_last_heading = float(self.theta)
+        if previous_time is None:
+            return float(dfwd), float(dleft), 1.0
+
+        dt = float(now) - float(previous_time)
+        if dt <= 0.0 or (self.imu_flow_max_dt > 0.0 and dt > self.imu_flow_max_dt):
+            self._imu_flow_velocity_xy = None
+            return float(dfwd), float(dleft), 1.0
+
+        flow_velocity = np.array([dfwd / dt, dleft / dt], dtype=np.float64)
+        if (
+            self._imu_flow_velocity_xy is None
+            or self._imu_flow_accel_xy is None
+            or not self._imu_fresh(now)
+        ):
+            self._imu_flow_velocity_xy = flow_velocity
+            return float(dfwd), float(dleft), 1.0
+
+        expected = self._imu_flow_velocity_xy.copy()
+        if previous_heading is not None:
+            heading_delta = wrap_angle(float(self.theta) - float(previous_heading))
+            c, s = math.cos(heading_delta), math.sin(heading_delta)
+            expected = np.array(
+                [c * expected[0] + s * expected[1],
+                 -s * expected[0] + c * expected[1]],
+                dtype=np.float64,
+            )
+        expected += self._imu_flow_accel_xy * dt
+        blended, gain, error = blend_flow_velocity_with_imu(
+            flow_velocity,
+            expected,
+            self.imu_flow_min_gain,
+            self.imu_flow_full_trust_error,
+            self.imu_flow_soft_error,
+        )
+        self._imu_flow_velocity_xy = blended
+        filtered_dfwd, filtered_dleft = (float(value * dt) for value in blended)
+        if gain < 0.999:
+            self.get_logger().info(
+                f"IMU-flow consistency gain={gain:.2f} speed_error={error:.2f}m/s "
+                f"raw=({dfwd*100:+.1f},{dleft*100:+.1f})cm "
+                f"used=({filtered_dfwd*100:+.1f},{filtered_dleft*100:+.1f})cm",
+                throttle_duration_sec=0.5,
+            )
+        return filtered_dfwd, filtered_dleft, gain
+
     def _imu_motion_fresh(self, now: float) -> bool:
         return (
             self.imu_motion_smoothing_enabled
@@ -881,6 +1047,8 @@ class LocalizerNode(Node):
         heading stays steady (no object-flow churn / LK-VO hallucination). When this is fresh the
         object-flow / LK-VO / wheel yaw are all suppressed so nothing double-counts the rotation."""
         now = self.get_clock().now().nanoseconds * 1e-9
+        if self.imu_flow_consistency_enabled:
+            self._update_imu_flow_acceleration(msg)
         if self.imu_motion_smoothing_enabled:
             self._update_imu_motion_state(msg, now)
         wz = float(msg.angular_velocity.z)
@@ -910,7 +1078,11 @@ class LocalizerNode(Node):
         if conf < self.object_flow_min_conf:
             return
         now = self.get_clock().now().nanoseconds * 1e-9
-        if self.suppress_object_flow_when_stationary and self.is_stationary:
+        if (
+            not self.imu_flow_consistency_enabled
+            and self.suppress_object_flow_when_stationary
+            and self.is_stationary
+        ):
             self.last_objflow_time = now
             self.last_vo_time = now
             # Keep a credible rotation measurement even while translation is frozen. IMU has
@@ -922,7 +1094,12 @@ class LocalizerNode(Node):
         self.last_objflow_time = now
         self.last_vo_time = now      # object-flow owns rotation -> keep wheel-yaw AND LK-VO suppressed
         dfwd, dleft, dtheta = self._constrain_robot_delta(dfwd, dleft, dtheta, "object_flow")
-        trans_gain = self._imu_translation_gain("object_flow")
+        dfwd, dleft, _ = self._filter_object_flow_translation(dfwd, dleft, now)
+        trans_gain = (
+            1.0
+            if self.imu_flow_consistency_enabled
+            else self._imu_translation_gain("object_flow")
+        )
         dfwd *= trans_gain
         dleft *= trans_gain
         if not self._imu_fresh(now):  # IMU gyro outranks object-flow for yaw (steadier)

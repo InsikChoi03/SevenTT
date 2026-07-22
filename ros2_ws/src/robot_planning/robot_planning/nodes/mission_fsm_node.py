@@ -10,7 +10,7 @@ States:
     PICK              - arm pickup motion
     STORE_IN_TRAY     - place in body tray, increment counters
     WAIT_FOR_STORAGE  - hold after early mission completion until the timed parking deadline
-    DRIVE_TO_STORAGE  - staging, face-origin, straight-reverse storage route
+    DRIVE_TO_STORAGE  - approach bottom wall, face right, reverse to left wall
     ALIGN_OVER_BIN    - align over storage box
     DUMP_ALL          - tilt/release tray
     END               - terminal
@@ -56,6 +56,23 @@ from robot_planning.relative_anchor_grid import (
 _LABEL_ST = {"cube": 1, "octahedron": 1, "dodecahedron": 1, "icosahedron": 1, "fruit_photo_cube": 2}
 
 
+def plain_cube_approach_invalid(
+    set1_label: str,
+    phase: int,
+    opportunistic_set2_active: bool,
+    target: Object | None,
+) -> bool:
+    """Return whether a latched plain-cube approach became a confirmed other identity."""
+    return bool(
+        set1_label == "cube"
+        and int(phase) == 1
+        and not opportunistic_set2_active
+        and target is not None
+        and int(target.set_type) != 0
+        and (int(target.set_type) != 1 or str(target.class_label) != "cube")
+    )
+
+
 def _parse_zone_anchor_candidates(
     values: list[float], fallback_xy: list[float]
 ) -> dict[int, list[tuple[float, float]]]:
@@ -98,17 +115,106 @@ def _opening_zone_entry_waypoints(
     return waypoints
 
 
+def _axis_strafe_zone_entry_waypoints(
+    robot_xy: tuple[float, float],
+    anchor_xy: tuple[float, float],
+    strafe_axis: str,
+    axis_tolerance_m: float,
+) -> list[tuple[float, float]]:
+    """Correct one field axis by strafing, then approach the anchor straight forward."""
+    rx, ry = float(robot_xy[0]), float(robot_xy[1])
+    ax, ay = float(anchor_xy[0]), float(anchor_xy[1])
+    tolerance = max(0.0, float(axis_tolerance_m))
+    waypoints: list[tuple[float, float]] = []
+    if strafe_axis == "x":
+        if abs(ax - rx) > tolerance:
+            waypoints.append((ax, ry))
+    elif strafe_axis == "y":
+        if abs(ay - ry) > tolerance:
+            waypoints.append((rx, ay))
+    else:
+        raise ValueError(f"unsupported zone-entry strafe axis: {strafe_axis}")
+    if not waypoints or math.hypot(ax - waypoints[-1][0], ay - waypoints[-1][1]) > 1e-9:
+        waypoints.append((ax, ay))
+    return waypoints
+
+
+def _zone_transition_strafe_profile(
+    from_zone: int,
+    to_zone: int,
+) -> tuple[str, float] | None:
+    """Return (strafe axis, forward heading) for the fixed clockwise zone transitions."""
+    return {
+        (1, 2): ("x", -math.pi / 2.0),
+        (2, 3): ("y", 0.0),
+        (3, 4): ("x", math.pi / 2.0),
+    }.get((int(from_zone), int(to_zone)))
+
+
+def _zone_anchor_strafe_velocity(
+    field_axis_error: float,
+    robot_heading: float,
+    strafe_axis: str,
+    duty: float,
+) -> float:
+    """Return body-left velocity whose field projection reduces the selected axis error."""
+    if strafe_axis == "x":
+        body_left_axis = -math.sin(float(robot_heading))
+    elif strafe_axis == "y":
+        body_left_axis = math.cos(float(robot_heading))
+    else:
+        raise ValueError(f"unsupported zone-entry strafe axis: {strafe_axis}")
+    projected_error = float(field_axis_error) * body_left_axis
+    if abs(projected_error) <= 1e-9 or duty <= 0.0:
+        return 0.0
+    return math.copysign(abs(float(duty)), projected_error)
+
+
+def _zone_anchor_strafe_pulse_duration(
+    axis_error_m: float,
+    long_threshold_m: float,
+    medium_threshold_m: float,
+    long_pulse_sec: float,
+    medium_pulse_sec: float,
+    short_pulse_sec: float,
+) -> float:
+    """Choose one fixed pulse duration from the remaining anchor-axis error."""
+    error_m = abs(float(axis_error_m))
+    if error_m >= float(long_threshold_m):
+        return max(0.03, float(long_pulse_sec))
+    if error_m >= float(medium_threshold_m):
+        return max(0.03, float(medium_pulse_sec))
+    return max(0.03, float(short_pulse_sec))
+
+
 def _opening_anchor_strafe_velocity(
     field_x_error: float,
     robot_heading: float,
     duty: float,
 ) -> float:
     """Return a pure body-left command that reduces field-x error."""
-    body_left_field_x = -math.sin(float(robot_heading))
-    projected_error = float(field_x_error) * body_left_field_x
-    if abs(projected_error) <= 1e-9 or duty <= 0.0:
-        return 0.0
-    return math.copysign(abs(float(duty)), projected_error)
+    return _zone_anchor_strafe_velocity(field_x_error, robot_heading, "x", duty)
+
+
+def _zone_anchor_slowdown_state(
+    distance_m: float | None,
+    enabled: bool,
+    slowdown_distance_m: float,
+    slow_speed: float,
+    latched: bool,
+) -> tuple[bool, float | None]:
+    """Latch a low-speed cap near a zone anchor until that anchor visit ends."""
+    active = bool(latched)
+    if (
+        not active
+        and enabled
+        and distance_m is not None
+        and distance_m <= max(0.0, float(slowdown_distance_m))
+    ):
+        active = True
+    if not active:
+        return False, None
+    return True, max(0.0, float(slow_speed))
 
 
 def _cardinal_goal_reached_or_passed(
@@ -202,6 +308,79 @@ def align_heading_error(
     )
 
 
+def nearest_align_wide_point(
+    expected: tuple[float, float] | None,
+    observations: list[tuple[float, float]],
+    match_radius_m: float,
+) -> tuple[float, float] | None:
+    """Associate a raw Wide observation to the latched target geometry.
+
+    ``expected`` may come from the fused world/slot model, but the returned control point is
+    always one of the raw Wide base-frame observations.  This prevents Body homography lateral
+    error from leaking back into ALIGN yaw through a fused world track.
+    """
+    if expected is None:
+        return None
+    ex, ey = float(expected[0]), float(expected[1])
+    best: tuple[float, float] | None = None
+    best_distance = max(0.0, float(match_radius_m))
+    for ox, oy in observations:
+        distance = math.hypot(float(ox) - ex, float(oy) - ey)
+        if distance <= best_distance:
+            best_distance = distance
+            best = (float(ox), float(oy))
+    return best
+
+
+def nearest_align_wide_observation(
+    expected: tuple[float, float] | None,
+    observations: list[RelativeObservation],
+    match_radius_m: float,
+) -> RelativeObservation | None:
+    """Associate one labelled raw-Wide observation with the latched target geometry."""
+    if expected is None:
+        return None
+    ex, ey = float(expected[0]), float(expected[1])
+    best: RelativeObservation | None = None
+    best_distance = max(0.0, float(match_radius_m))
+    for observation in observations:
+        distance = math.hypot(float(observation.x) - ex, float(observation.y) - ey)
+        if distance <= best_distance:
+            best_distance = distance
+            best = observation
+    return best
+
+
+def split_align_control_points(
+    wide_point: tuple[float, float] | None,
+    body_point: tuple[float, float] | None,
+) -> tuple[tuple[float, float] | None, tuple[float, float] | None]:
+    """Return independent ``(yaw_point, range_point)`` for ALIGN.
+
+    Yaw has no Body fallback. Range uses Body once available and otherwise uses Wide only for
+    acquisition. This explicit split makes it impossible for Body y to steer the base.
+    """
+    if wide_point is None:
+        return None, None
+    return wide_point, body_point if body_point is not None else wide_point
+
+
+def align_translation_axis(
+    forward_error_m: float,
+    lateral_error_m: float,
+    forward_tolerance_m: float,
+    lateral_tolerance_m: float,
+) -> str | None:
+    """Select the worst out-of-tolerance Body axis for the next ALIGN translation pulse."""
+    forward_out = abs(float(forward_error_m)) - max(0.0, float(forward_tolerance_m))
+    lateral_out = abs(float(lateral_error_m)) - max(0.0, float(lateral_tolerance_m))
+    if forward_out <= 0.0 and lateral_out <= 0.0:
+        return None
+    if lateral_out > 0.0 and (forward_out <= 0.0 or lateral_out >= forward_out):
+        return "lateral"
+    return "forward"
+
+
 def circular_heading_filter(previous: float | None, raw_heading: float, alpha: float) -> float:
     """Update a wrap-safe heading EMA without averaging across the +/-pi discontinuity."""
     raw = math.atan2(math.sin(float(raw_heading)), math.cos(float(raw_heading)))
@@ -244,6 +423,39 @@ def timed_storage_due(
         and trigger_sec > 0.0
         and float(now_s) - float(run_start_s) >= float(trigger_sec)
     )
+
+
+def directional_wall_distance(
+    segments: list[tuple[float, float, float, float]],
+    robot_x: float,
+    robot_y: float,
+    *,
+    axis: str,
+    direction: int,
+    angle_tolerance_rad: float = math.radians(35.0),
+) -> float | None:
+    """Return the nearest observed axis wall in the requested field direction."""
+    distances: list[float] = []
+    sign = 1.0 if int(direction) >= 0 else -1.0
+    for x0, y0, x1, y1 in segments:
+        dx, dy = float(x1) - float(x0), float(y1) - float(y0)
+        if math.hypot(dx, dy) < 0.12:
+            continue
+        angle = math.atan2(dy, dx) % math.pi
+        horizontal = min(angle, math.pi - angle) <= abs(float(angle_tolerance_rad))
+        if axis == "y":
+            if not horizontal:
+                continue
+            delta = sign * (0.5 * (float(y0) + float(y1)) - float(robot_y))
+        elif axis == "x":
+            if horizontal:
+                continue
+            delta = sign * (0.5 * (float(x0) + float(x1)) - float(robot_x))
+        else:
+            raise ValueError(f"unsupported wall axis: {axis}")
+        if delta >= 0.0:
+            distances.append(delta)
+    return min(distances) if distances else None
 
 
 def parking_face_heading(
@@ -452,14 +664,25 @@ class MissionFsmNode(Node):
         self.declare_parameter("align_settle_sec", 1.0)
         self.declare_parameter("classify_timeout_sec", 2.0)
         self.declare_parameter("classify_body_max_age_sec", 0.60)
-        # ALIGN visual servo: face the Wide/latched target first, then use forward/back pulses only
-        # so the target lands on the arm's fixed grab point.  Body refines the same target when it
-        # becomes visible; no lateral translation or blind +/-10deg body search is used.
+        self.declare_parameter("classify_body_settle_sec", 0.40)
+        self.declare_parameter("classify_body_max_frames", 10)
+        self.declare_parameter("classify_body_retry_backoff_sec", 0.25)
+        self.declare_parameter("classify_body_retry_settle_sec", 0.40)
+        # At very close range the Body model can mistake an octahedron for a cube. Only for an
+        # octahedron target, use the spatially associated raw-Wide label for final identity while
+        # retaining Body solely as the fresh object-at-grab presence/range safety gate.
+        self.declare_parameter("classify_octa_wide_final_enabled", True)
+        self.declare_parameter("classify_wide_confirm_frames", 3)
+        # APPROACH owns target heading. ALIGN keeps that heading fixed and uses Body x/y only for
+        # calibrated forward/back and mecanum lateral translation pulses.
         self.declare_parameter("grab_x", 0.264)
         self.declare_parameter("grab_y", 0.007)
         self.declare_parameter("grab_min_x", 0.255)     # never push the target closer than this
-        self.declare_parameter("align_tol_m", 0.04)     # aligned within this -> grab (gripper absorbs)
-        self.declare_parameter("align_fwd_tol_m", 0.08)  # forward/back tolerance; lateral still uses align_tol_m
+        self.declare_parameter("align_tol_m", 0.02)
+        self.declare_parameter("align_fwd_tol_m", 0.08)  # Body-x forward/back tolerance
+        self.declare_parameter("align_body_confirm_frames", 3)
+        self.declare_parameter("align_wide_match_radius_m", 0.30)
+        self.declare_parameter("align_wide_max_age_sec", 0.80)
         self.declare_parameter("align_kp", 0.6)         # m/s per m of error
         self.declare_parameter("align_vmax", 0.16)      # cap
         # STICTION: the heavy base won't move below ~this speed (motor just buzzes), so any nonzero
@@ -479,10 +702,13 @@ class MissionFsmNode(Node):
         # duty/sec per direction (strafe needs ~1.7x duty & 1.5x time = higher lateral stiction):
         self.declare_parameter("align_step_fwd_duty", 0.18)     # fwd/back: 0.18/0.20s -> ~1.5-2 cm
         self.declare_parameter("align_step_fwd_sec", 0.15)
+        self.declare_parameter("align_step_strafe_duty", 0.315)
+        self.declare_parameter("align_step_strafe_sec", 0.30)
         self.declare_parameter("align_heading_tolerance_rad", math.radians(3.0))
         self.declare_parameter("align_adaptive_steps_enabled", False)
         self.declare_parameter("align_mid_error_m", 0.06)
         self.declare_parameter("align_step_fwd_mid_sec", 0.24)
+        self.declare_parameter("align_step_strafe_mid_sec", 0.60)
         # If the target remains in the wide/world map but drops out of the body cam at ALIGN,
         # back up once so the body cam can reacquire it instead of waiting stationary for timeout.
         self.declare_parameter("align_body_lost_backoff_enabled", True)
@@ -509,6 +735,14 @@ class MissionFsmNode(Node):
         self.declare_parameter("storage_reverse_omega_max", 0.06)
         self.declare_parameter("storage_reverse_realign_rad", 0.1745)
         self.declare_parameter("storage_reach_tol_m", 0.08)
+        self.declare_parameter("storage_down_heading_rad", math.pi / 2.0)
+        self.declare_parameter("storage_right_heading_rad", math.pi)
+        self.declare_parameter("storage_bottom_wall_stop_m", 0.30)
+        self.declare_parameter("storage_left_wall_stop_m", 0.20)
+        self.declare_parameter("storage_wall_approach_speed", 0.08)
+        self.declare_parameter("storage_wall_confirm_frames", 3)
+        self.declare_parameter("storage_wall_max_age_sec", 1.50)
+        self.declare_parameter("storage_wall_detection_required_m", 0.60)
         self.declare_parameter("shape_target_total", 4)   # set1 shape * 4
         self.declare_parameter("fruit_target_total", 0)   # set2 disabled by default: shapes only
         self.declare_parameter("publish_rate_hz", 5.0)
@@ -548,7 +782,11 @@ class MissionFsmNode(Node):
         self.declare_parameter("opening_wall_position_min_confidence", 0.90)
         self.declare_parameter("opening_position_stable_frames", 3)
         self.declare_parameter("opening_anchor_strafe_duty", 0.315)
-        self.declare_parameter("opening_anchor_strafe_pulse_sec", 0.30)
+        self.declare_parameter("opening_anchor_strafe_long_threshold_m", 0.30)
+        self.declare_parameter("opening_anchor_strafe_medium_threshold_m", 0.15)
+        self.declare_parameter("opening_anchor_strafe_long_pulse_sec", 1.0)
+        self.declare_parameter("opening_anchor_strafe_medium_pulse_sec", 0.7)
+        self.declare_parameter("opening_anchor_strafe_short_pulse_sec", 0.4)
         self.declare_parameter("opening_anchor_strafe_settle_sec", 0.60)
         self.declare_parameter("opening_anchor_strafe_max_pulses", 8)
         # SCAN search: the start pose likely sees nothing, so after the opening the robot turns slowly
@@ -653,18 +891,23 @@ class MissionFsmNode(Node):
         )
         self.declare_parameter(
             "zone_anchor_xy",
-            [-1.0, 0.5, -1.0, -1.0, 0.75, -1.0, 0.75, 0.5],
+            [-1.0, 0.5, -1.0, -1.0, 1.25, -1.25, 0.75, 0.5],
         )
         self.declare_parameter(
             "zone_anchor_candidates",
-            [1.0, -1.0, 0.5, 2.0, -1.0, -1.0, 3.0, 0.75, -1.0, 4.0, 0.75, 0.5],
+            [1.0, -1.0, 0.5, 2.0, -1.0, -1.0, 3.0, 1.25, -1.25, 4.0, 0.75, 0.5],
         )
         self.declare_parameter("zone_no_target_advance_sec", 6.0)
         self.declare_parameter("zone_center_reach_tol_m", 0.25)
         self.declare_parameter("zone_anchor_nav_enabled", True)
+        self.declare_parameter("zone_anchor_slowdown_enabled", True)
+        self.declare_parameter("zone_anchor_slowdown_distance_m", 0.50)
+        self.declare_parameter("zone_anchor_slow_speed", 0.07)
         self.declare_parameter("zone_stabilize_enabled", True)
         self.declare_parameter("zone_stabilize_sec", 3.0)
         self.declare_parameter("zone_stabilize_require_fresh_seen", True)
+        self.declare_parameter("plain_cube_ambiguous_observations", 5)
+        self.declare_parameter("zone_ambiguous_exclusion_radius_m", 0.18)
         # Step-wise search: turn a little, STOP to let the cameras identify (clean, blur-free frames),
         # turn again. Continuous spinning motion-blurs the wide cam and churns tracks.
         self.declare_parameter("search_turn_sec", 0.5)    # rotate this long per step (~small angle)
@@ -733,11 +976,38 @@ class MissionFsmNode(Node):
         self.classify_body_max_age_sec = max(
             0.0, float(self.get_parameter("classify_body_max_age_sec").value)
         )
+        self.classify_body_settle_sec = max(
+            0.0, float(self.get_parameter("classify_body_settle_sec").value)
+        )
+        self.classify_body_max_frames = max(
+            1, int(self.get_parameter("classify_body_max_frames").value)
+        )
+        self.classify_body_retry_backoff_sec = max(
+            0.0, float(self.get_parameter("classify_body_retry_backoff_sec").value)
+        )
+        self.classify_body_retry_settle_sec = max(
+            0.0, float(self.get_parameter("classify_body_retry_settle_sec").value)
+        )
+        self.classify_octa_wide_final_enabled = bool(
+            self.get_parameter("classify_octa_wide_final_enabled").value
+        )
+        self.classify_wide_confirm_frames = max(
+            1, int(self.get_parameter("classify_wide_confirm_frames").value)
+        )
         self.grab_x = float(self.get_parameter("grab_x").value)
         self.grab_y = float(self.get_parameter("grab_y").value)
         self.grab_min_x = float(self.get_parameter("grab_min_x").value)
         self.align_tol = float(self.get_parameter("align_tol_m").value)
         self.align_fwd_tol = float(self.get_parameter("align_fwd_tol_m").value)
+        self.align_body_confirm_frames = max(
+            1, int(self.get_parameter("align_body_confirm_frames").value)
+        )
+        self.align_wide_match_radius_m = max(
+            0.0, float(self.get_parameter("align_wide_match_radius_m").value)
+        )
+        self.align_wide_max_age_sec = max(
+            0.05, float(self.get_parameter("align_wide_max_age_sec").value)
+        )
         self.align_kp = float(self.get_parameter("align_kp").value)
         self.align_vmax = float(self.get_parameter("align_vmax").value)
         self.align_vmin = float(self.get_parameter("align_vmin").value)
@@ -747,19 +1017,33 @@ class MissionFsmNode(Node):
             1, int(self.get_parameter("align_distractor_confirm_frames").value)
         )
         self._align_fail_count = 0
-        self._align_distractor_label = ""
-        self._align_distractor_count = 0
-        self._align_distractor_last_seq = -1
+        self._classify_verify_phase = "settle"
+        self._classify_verify_phase_start_s = 0.0
+        self._classify_verify_retry_count = 0
+        self._classify_body_last_seq = -1
+        self._classify_wide_last_seq = -1
+        self._classify_body_frame_count = 0
+        self._classify_body_target_count = 0
+        self._classify_body_other_counts: dict[str, int] = {}
         self.align_pulse_sec = float(self.get_parameter("align_pulse_sec").value)
         self.align_settle_pulse_sec = float(self.get_parameter("align_settle_pulse_sec").value)
         self.align_step_fwd_duty = float(self.get_parameter("align_step_fwd_duty").value)
         self.align_step_fwd_sec = float(self.get_parameter("align_step_fwd_sec").value)
+        self.align_step_strafe_duty = float(
+            self.get_parameter("align_step_strafe_duty").value
+        )
+        self.align_step_strafe_sec = float(
+            self.get_parameter("align_step_strafe_sec").value
+        )
         self.align_heading_tolerance_rad = max(
             0.0, float(self.get_parameter("align_heading_tolerance_rad").value)
         )
         self.align_adaptive_steps_enabled = bool(self.get_parameter("align_adaptive_steps_enabled").value)
         self.align_mid_error_m = float(self.get_parameter("align_mid_error_m").value)
         self.align_step_fwd_mid_sec = float(self.get_parameter("align_step_fwd_mid_sec").value)
+        self.align_step_strafe_mid_sec = float(
+            self.get_parameter("align_step_strafe_mid_sec").value
+        )
         self.align_body_lost_backoff_enabled = bool(self.get_parameter("align_body_lost_backoff_enabled").value)
         self.align_body_lost_backoff_speed = float(self.get_parameter("align_body_lost_backoff_speed").value)
         self.align_body_lost_backoff_sec = float(self.get_parameter("align_body_lost_backoff_sec").value)
@@ -781,10 +1065,14 @@ class MissionFsmNode(Node):
         self._align_phase = "measure"      # measure -> face/pulse/backoff -> settle -> measure
         self._align_phase_start = 0.0
         self._pulse_vx = 0.0
+        self._pulse_vy = 0.0
         self._pulse_sec = self.align_step_fwd_sec   # duration of the current unit step (per direction)
         self._slot_body_lost_retry_counts: dict[int, int] = {}
         self._slot_missing_track_counts: dict[int, int] = {}
         self._align_heading_target: float | None = None
+        self._align_body_presence_last_seq = -1
+        self._align_body_presence_count = 0
+        self._align_body_presence_xy: tuple[float, float] | None = None
         self._require_precise_heading_before_align = False
         self._precise_heading_retry_start_s: float | None = None
         # Body-cam ground homography for POSE-INDEPENDENT servo: project the object's body pixel
@@ -852,6 +1140,32 @@ class MissionFsmNode(Node):
         self.storage_reach_tol_m = max(
             0.02, float(self.get_parameter("storage_reach_tol_m").value)
         )
+        self.storage_down_heading_rad = float(
+            self.get_parameter("storage_down_heading_rad").value
+        )
+        self.storage_right_heading_rad = float(
+            self.get_parameter("storage_right_heading_rad").value
+        )
+        self.storage_bottom_wall_stop_m = max(
+            0.05, float(self.get_parameter("storage_bottom_wall_stop_m").value)
+        )
+        self.storage_left_wall_stop_m = max(
+            0.05, float(self.get_parameter("storage_left_wall_stop_m").value)
+        )
+        self.storage_wall_approach_speed = abs(
+            float(self.get_parameter("storage_wall_approach_speed").value)
+        )
+        self.storage_wall_confirm_frames = max(
+            1, int(self.get_parameter("storage_wall_confirm_frames").value)
+        )
+        self.storage_wall_max_age_sec = max(
+            0.10, float(self.get_parameter("storage_wall_max_age_sec").value)
+        )
+        self.storage_wall_detection_required_m = max(
+            self.storage_bottom_wall_stop_m,
+            self.storage_left_wall_stop_m,
+            float(self.get_parameter("storage_wall_detection_required_m").value),
+        )
         self.shape_target_total = int(self.get_parameter("shape_target_total").value)
         self.fruit_target_total = int(self.get_parameter("fruit_target_total").value)
         self.dry_pick = bool(self.get_parameter("dry_pick").value)
@@ -914,8 +1228,25 @@ class MissionFsmNode(Node):
         self.opening_anchor_strafe_duty = max(
             0.0, float(self.get_parameter("opening_anchor_strafe_duty").value)
         )
-        self.opening_anchor_strafe_pulse_sec = max(
-            0.03, float(self.get_parameter("opening_anchor_strafe_pulse_sec").value)
+        self.opening_anchor_strafe_medium_threshold_m = max(
+            0.0,
+            float(self.get_parameter("opening_anchor_strafe_medium_threshold_m").value),
+        )
+        self.opening_anchor_strafe_long_threshold_m = max(
+            self.opening_anchor_strafe_medium_threshold_m,
+            float(self.get_parameter("opening_anchor_strafe_long_threshold_m").value),
+        )
+        self.opening_anchor_strafe_long_pulse_sec = max(
+            0.03,
+            float(self.get_parameter("opening_anchor_strafe_long_pulse_sec").value),
+        )
+        self.opening_anchor_strafe_medium_pulse_sec = max(
+            0.03,
+            float(self.get_parameter("opening_anchor_strafe_medium_pulse_sec").value),
+        )
+        self.opening_anchor_strafe_short_pulse_sec = max(
+            0.03,
+            float(self.get_parameter("opening_anchor_strafe_short_pulse_sec").value),
         )
         self.opening_anchor_strafe_settle_sec = max(
             0.0, float(self.get_parameter("opening_anchor_strafe_settle_sec").value)
@@ -1117,6 +1448,10 @@ class MissionFsmNode(Node):
         self._relative_acquisition_first_frame_s: float | None = None
         self._relative_last_frame_s: float | None = None
         self._relative_last_observation_s: float | None = None
+        self._wide_relative_observations: list[tuple[float, float]] = []
+        self._wide_relative_labeled_observations: list[RelativeObservation] = []
+        self._wide_relative_last_frame_s: float | None = None
+        self._wide_relative_seq = 0
         self._relative_motion_last_s = self._now_s()
         self._relative_last_command = (0.0, 0.0, 0.0)
         self._relative_entry_edges: dict[int, tuple[int, int]] = {}
@@ -1150,10 +1485,25 @@ class MissionFsmNode(Node):
         self.zone_no_target_advance_sec = float(self.get_parameter("zone_no_target_advance_sec").value)
         self.zone_center_reach_tol_m = float(self.get_parameter("zone_center_reach_tol_m").value)
         self.zone_anchor_nav_enabled = bool(self.get_parameter("zone_anchor_nav_enabled").value)
+        self.zone_anchor_slowdown_enabled = bool(
+            self.get_parameter("zone_anchor_slowdown_enabled").value
+        )
+        self.zone_anchor_slowdown_distance_m = max(
+            0.0, float(self.get_parameter("zone_anchor_slowdown_distance_m").value)
+        )
+        self.zone_anchor_slow_speed = max(
+            0.0, float(self.get_parameter("zone_anchor_slow_speed").value)
+        )
         self.zone_stabilize_enabled = bool(self.get_parameter("zone_stabilize_enabled").value)
         self.zone_stabilize_sec = float(self.get_parameter("zone_stabilize_sec").value)
         self.zone_stabilize_require_fresh_seen = bool(
             self.get_parameter("zone_stabilize_require_fresh_seen").value
+        )
+        self.plain_cube_ambiguous_observations = max(
+            1, int(self.get_parameter("plain_cube_ambiguous_observations").value)
+        )
+        self.zone_ambiguous_exclusion_radius_m = max(
+            0.01, float(self.get_parameter("zone_ambiguous_exclusion_radius_m").value)
         )
         self._zone_idx = 0
         self._zone_no_target_since: float | None = None
@@ -1161,6 +1511,7 @@ class MissionFsmNode(Node):
         self._zone_anchor_reached_idx: int | None = None
         self._zone_entry_anchor_idx: int | None = None
         self._zone_entry_anchor: tuple[float, float] | None = None
+        self._zone_anchor_slowdown_active = False
         self._opening_zone_entry_pending = self.opening_enabled
         self._opening_zone_entry_path: list[tuple[float, float]] | None = None
         self._opening_zone_entry_start: tuple[float, float] | None = None
@@ -1170,8 +1521,13 @@ class MissionFsmNode(Node):
         self._opening_anchor_strafe_phase_start_s = 0.0
         self._opening_anchor_strafe_pulses = 0
         self._opening_anchor_strafe_vy = 0.0
+        self._opening_anchor_strafe_pulse_duration_sec = 0.0
         self._zone_stabilize_start_s = 0.0
         self._zone_stabilized_after_s = 0.0
+        self._zone_ambiguous_excluded_ids: set[int] = set()
+        self._zone_ambiguous_excluded_xy: list[tuple[float, float]] = []
+        self._plain_cube_unknown_count = 0
+        self._plain_cube_unknown_last_stamp: tuple[int, int] | None = None
 
         # ---- LANE-GRAPH waypoint planner (50cm object grid, 40cm robot) ----
         # Travel goals (SCAN sweep, APPROACH stand-off, DRIVE_TO_STORAGE) route through collision-free
@@ -1206,6 +1562,11 @@ class MissionFsmNode(Node):
         self.declare_parameter("front_escape_forward_m", 0.0)
         self.planner_enabled = bool(self.get_parameter("planner_enabled").value)
         fb = [float(v) for v in self.get_parameter("field_bounds_m").value]
+        self._field_bounds = (
+            (fb[0], fb[1], fb[2], fb[3])
+            if len(fb) == 4
+            else (-2.0, 2.0, -2.0, 2.0)
+        )
         self.wp_reach_tol_m = float(self.get_parameter("wp_reach_tol_m").value)
         self.lane_pass_lateral_tol_m = max(
             0.0, float(self.get_parameter("lane_pass_lateral_tol_m").value)
@@ -1228,7 +1589,7 @@ class MissionFsmNode(Node):
         self.direct_fallback_enabled = bool(self.get_parameter("direct_fallback_enabled").value)
         self._planner = LanePlanner(
             spacing=float(self.get_parameter("grid_spacing_m").value),
-            bounds=(fb[0], fb[1], fb[2], fb[3]) if len(fb) == 4 else (-2.0, 2.0, -2.0, 2.0),
+            bounds=self._field_bounds,
             margin=float(self.get_parameter("robot_margin_m").value),
             block_radius=float(self.get_parameter("lane_block_radius_m").value),
             comfort_clear=float(self.get_parameter("comfort_clear_m").value),
@@ -1373,9 +1734,14 @@ class MissionFsmNode(Node):
         self._run_initial_state = "OPENING" if self.opening_enabled else "SCAN"
         self._timed_storage_triggered = False
         self._storage_route_completed = False
-        self._storage_route_phase = "to_staging"
+        self._storage_route_phase = "face_bottom_wall"
         self._storage_staging_heading: float | None = None
         self._storage_reverse_heading: float | None = None
+        self._wall_segments: list[tuple[float, float, float, float]] = []
+        self._wall_segments_s = 0.0
+        self._wall_segments_seq = 0
+        self._storage_wall_confirm_count = 0
+        self._storage_wall_confirm_last_seq = -1
         self._opening_leg = "wait"
         self._opening_turn_target: float | None = None
         self._opening_heading_stable_count = 0
@@ -1426,6 +1792,9 @@ class MissionFsmNode(Node):
         self.create_subscription(Empty, "/state_advance", self.on_advance, 10)
         self.create_subscription(
             Float32MultiArray, "/localization/wall_map_transform", self.on_wall_map_transform, 10
+        )
+        self.create_subscription(
+            Float32MultiArray, "/localization/wall_raw_segments", self.on_wall_segments, 10
         )
         self.create_subscription(
             Float32MultiArray,
@@ -1511,9 +1880,10 @@ class MissionFsmNode(Node):
         self._opportunistic_set2_active = False
         self._timed_storage_triggered = False
         self._storage_route_completed = False
-        self._storage_route_phase = "to_staging"
+        self._storage_route_phase = "face_bottom_wall"
         self._storage_staging_heading = None
-        self._storage_reverse_heading = None
+        self._storage_reverse_heading = self.storage_right_heading_rad
+        self._reset_storage_wall_confirmation()
         self._opening_leg = "wait"
         self._opening_turn_target = None
         self._opening_heading_stable_count = 0
@@ -1533,10 +1903,13 @@ class MissionFsmNode(Node):
         self._opening_zone_entry_path = None
         self._opening_zone_entry_start = None
         self._opening_zone_entry_idx = 0
+        self._zone_anchor_slowdown_active = False
         self._opening_anchor_strafe_phase = "align"
         self._opening_anchor_strafe_phase_start_s = 0.0
         self._opening_anchor_strafe_pulses = 0
         self._opening_anchor_strafe_vy = 0.0
+        self._opening_anchor_strafe_pulse_duration_sec = 0.0
+        self._clear_zone_ambiguous_exclusions()
         self._plan = None
         self._plan_start_xy = None
         self._post_pick_lane_entry_pending = False
@@ -1637,23 +2010,25 @@ class MissionFsmNode(Node):
         self._reset_object_connector_brake()
         self._plan_escape = False
         if new_state == "DRIVE_TO_STORAGE":
-            self._storage_route_phase = "to_staging"
+            self._storage_route_phase = "face_bottom_wall"
             self._storage_staging_heading = None
-            self._storage_reverse_heading = parking_face_heading(
-                self.storage_staging_x,
-                self.storage_staging_y,
-                self.storage_face_x,
-                self.storage_face_y,
-            )
+            self._storage_reverse_heading = self.storage_right_heading_rad
+            self._reset_storage_wall_confirmation()
             self._reset_pulsed_heading()
         if new_state == "ALIGN":
             self._align_phase = "measure"       # start each ALIGN by measuring the settled position
             self._align_heading_target = None
             self._reset_pulsed_heading()
-            self._reset_align_distractor_confirmation()
+            self._reset_align_body_presence()
             if self._current_anchor_slot() is not None:
                 self._reset_anchor_body_confirmation(clear_latched=True)
+        if new_state == "CLASSIFY":
+            self._classify_verify_phase = "settle"
+            self._classify_verify_phase_start_s = self.state_enter_s
+            self._classify_verify_retry_count = 0
+            self._reset_set1_final_classification()
         if new_state == "APPROACH":
+            self._reset_plain_cube_reobservation()
             anchor_slot = self._current_anchor_slot()
             object_slot = self._current_slot()
             self._appr_tgt_xy = (
@@ -2415,6 +2790,8 @@ class MissionFsmNode(Node):
         for o in self.world.objects:
             if o.blacklisted or o.set_type != want_set:
                 continue
+            if self._is_zone_ambiguous_excluded(o):
+                continue
             if (self.zone_mission_enabled
                     and not self._object_in_active_zone(o)
                     and (self.current_target is None or int(o.id) != int(self.current_target.id))):
@@ -2454,6 +2831,8 @@ class MissionFsmNode(Node):
         bestd = 1e9
         for o in self.world.objects:
             if o.blacklisted or int(o.set_type) != 1:
+                continue
+            if self._is_zone_ambiguous_excluded(o):
                 continue
             if str(o.class_label) != self.set1_label:
                 continue
@@ -3149,6 +3528,27 @@ class MissionFsmNode(Node):
             return None
         return label, confidence, ex, ey
 
+    def _fresh_body_set1_pick_presence(self) -> tuple[str, float, float] | None:
+        """Return fresh label-agnostic Body presence at the grab point for Wide verification."""
+        if (
+            self._opportunistic_set2_active
+            or self.phase != 1
+            or self.current_target is None
+            or int(self.current_target.set_type) != 1
+            or str(self.current_target.class_label) != self.set1_label
+            or self._body_dets_stamp_s < self.state_enter_s
+            or self._now_s() - self._body_dets_stamp_s > self.classify_body_max_age_sec
+        ):
+            return None
+        body_object = self._body_nearest_any()
+        if body_object is None:
+            return None
+        label, bx, by = body_object
+        ex, ey = float(bx) - self.grab_x, float(by) - self.grab_y
+        if abs(ex) >= self.align_fwd_tol or abs(ey) >= self.align_tol:
+            return None
+        return str(label), ex, ey
+
     def _body_nearest_any(self) -> tuple[str, float, float] | None:
         """Nearest body detection of ANY label to the grab point -> (label, bx, by). Lets ALIGN spot
         a DISTRACTOR (e.g. a cube) sitting where the target was expected and skip that spot fast."""
@@ -3161,6 +3561,9 @@ class MissionFsmNode(Node):
             if base is None:
                 continue
             bx, by = base
+            if self._set2_slot_mode() and self._current_slot() is not None:
+                if not self._body_base_matches_current_slot(bx, by):
+                    continue
             if self.anchor_mission_enabled and self._current_anchor_slot() is not None:
                 if not self._body_base_matches_current_anchor_slot(bx, by):
                     continue
@@ -3170,28 +3573,116 @@ class MissionFsmNode(Node):
                 best = (label, bx, by)
         return best
 
-    def _reset_align_distractor_confirmation(self) -> None:
-        self._align_distractor_label = ""
-        self._align_distractor_count = 0
-        self._align_distractor_last_seq = int(self._body_dets_seq)
+    def _reset_align_body_presence(self) -> None:
+        """Require a fresh stopped Body streak after every ALIGN motion."""
+        self._align_body_presence_last_seq = int(self._body_dets_seq)
+        self._align_body_presence_count = 0
+        self._align_body_presence_xy = None
 
-    def _update_align_distractor_confirmation(self, label: str | None) -> tuple[int, bool]:
-        """Count one matching distractor per fresh Body frame."""
+    def _update_align_body_presence(
+        self,
+        body_point: tuple[str, float, float, float] | None,
+    ) -> tuple[int, bool]:
+        """Count spatially continuous Body observations, once per fresh camera frame.
+
+        Label flicker is intentionally ignored here: stopped CLASSIFY owns identity.  The spatial
+        continuity gate prevents two nearby detections from being counted as one physical object.
+        """
         seq = int(self._body_dets_seq)
-        if seq == self._align_distractor_last_seq:
-            return self._align_distractor_count, False
-        self._align_distractor_last_seq = seq
+        if seq == self._align_body_presence_last_seq:
+            return self._align_body_presence_count, False
+        self._align_body_presence_last_seq = seq
+        if body_point is None:
+            self._align_body_presence_count = 0
+            self._align_body_presence_xy = None
+            return 0, True
 
-        label = str(label or "")
-        if not label:
-            self._align_distractor_label = ""
-            self._align_distractor_count = 0
-        elif label == self._align_distractor_label:
-            self._align_distractor_count += 1
+        _, bx, by, _ = body_point
+        point = (float(bx), float(by))
+        continuity_radius = max(0.03, float(self.align_tol))
+        if (
+            self._align_body_presence_xy is not None
+            and math.hypot(
+                point[0] - self._align_body_presence_xy[0],
+                point[1] - self._align_body_presence_xy[1],
+            ) <= continuity_radius
+        ):
+            self._align_body_presence_count += 1
         else:
-            self._align_distractor_label = label
-            self._align_distractor_count = 1
-        return self._align_distractor_count, True
+            self._align_body_presence_count = 1
+        self._align_body_presence_xy = point
+        return self._align_body_presence_count, True
+
+    def _reset_set1_final_classification(self) -> None:
+        """Start a fresh, stopped final vote window before moving the arm."""
+        self._classify_body_last_seq = int(self._body_dets_seq)
+        self._classify_wide_last_seq = int(getattr(self, "_wide_relative_seq", 0))
+        self._classify_body_frame_count = 0
+        self._classify_body_target_count = 0
+        self._classify_body_other_counts = {}
+
+    def _set1_final_uses_wide(self) -> bool:
+        """Use Wide identity only for the known close-range octahedron failure mode."""
+        return bool(getattr(self, "classify_octa_wide_final_enabled", True)) and (
+            str(self.set1_label) == "octahedron"
+        )
+
+    def _update_set1_final_classification(self) -> tuple[str, str, bool]:
+        """Consume one fresh source frame and return (decision, observed_label, fresh)."""
+        use_wide = self._set1_final_uses_wide()
+        if use_wide:
+            seq = int(getattr(self, "_wide_relative_seq", 0))
+            if seq == self._classify_wide_last_seq:
+                return "pending", "", False
+            self._classify_wide_last_seq = seq
+        else:
+            seq = int(self._body_dets_seq)
+            if seq == self._classify_body_last_seq:
+                return "pending", "", False
+            self._classify_body_last_seq = seq
+        self._classify_body_frame_count += 1
+
+        observed_label = ""
+        if use_wide:
+            # Wide owns only identity. A fresh Body detection must still prove that some physical
+            # object remains at the aligned grab point; its close-range label is intentionally
+            # ignored for octahedra.
+            observation = self._wide_align_target_observation()
+            if (
+                self._fresh_body_set1_pick_presence() is not None
+                and observation is not None
+                and float(observation.confidence) >= max(
+                    self.pick_track_conf, self.conf_threshold
+                )
+            ):
+                observed_label = str(observation.label)
+        elif self._fresh_body_set1_pick_candidate() is not None:
+            observed_label = str(self.set1_label)
+        else:
+            other = self._body_nearest_any()
+            if other is not None and str(other[0]) != str(self.set1_label):
+                observed_label = str(other[0])
+
+        if observed_label == str(self.set1_label):
+            self._classify_body_target_count += 1
+        elif observed_label:
+            self._classify_body_other_counts[observed_label] = (
+                self._classify_body_other_counts.get(observed_label, 0) + 1
+            )
+
+        required = (
+            int(self.classify_wide_confirm_frames)
+            if use_wide
+            else int(self.align_distractor_confirm_frames)
+        )
+        if self._classify_body_target_count >= required:
+            return "target", observed_label, True
+        for label, count in self._classify_body_other_counts.items():
+            if count >= required:
+                return "distractor", label, True
+        if self._classify_body_frame_count >= int(self.classify_body_max_frames):
+            return "inconclusive", observed_label, True
+        return "pending", observed_label, True
 
     def _body_set1_distractor_in_front(self) -> tuple[str, float, float] | None:
         """Set2 slot guard: any Set1 body detection in the near front view means the slot is wrong."""
@@ -3240,38 +3731,63 @@ class MissionFsmNode(Node):
         ref = (float(self.current_target.x), float(self.current_target.y))
         return self._current_object_for_approach(ref_xy=ref) is not None
 
-    def _wide_align_target_base(self) -> tuple[float, float] | None:
-        """Return the latched Wide/slot target in current ``base_link`` coordinates."""
+    def _wide_align_expected_base(self) -> tuple[float, float] | None:
+        """Return the current expected base-frame point for raw-Wide target association."""
+        expected: tuple[float, float] | None = None
         anchor_slot = self._current_anchor_slot()
         if self._relative_mode() and anchor_slot is not None:
             point = self._relative_slot_point(anchor_slot)
             if point is not None:
-                return float(point[0]), float(point[1])
+                expected = (float(point[0]), float(point[1]))
 
-        if self.current_target is not None and self.world is not None:
+        if expected is None and self.current_target is not None and self.world is not None:
             fresh = self._lookup_object(int(self.current_target.id))
             if fresh is not None and not fresh.blacklisted:
                 self.current_target = fresh
             point = self._to_base(float(self.current_target.x), float(self.current_target.y))
             if point is not None:
-                return float(point[0]), float(point[1])
+                expected = (float(point[0]), float(point[1]))
 
         slot = self._current_slot()
-        if slot is not None:
+        if expected is None and slot is not None:
             point = self._to_base(float(slot.x), float(slot.y))
             if point is not None:
-                return float(point[0]), float(point[1])
+                expected = (float(point[0]), float(point[1]))
 
-        if anchor_slot is not None:
+        if expected is None and anchor_slot is not None:
             point = self._to_base(float(anchor_slot.x), float(anchor_slot.y))
             if point is not None:
-                return float(point[0]), float(point[1])
+                expected = (float(point[0]), float(point[1]))
 
-        if self._appr_tgt_xy is not None:
+        if expected is None and self._appr_tgt_xy is not None:
             point = self._to_base(float(self._appr_tgt_xy[0]), float(self._appr_tgt_xy[1]))
             if point is not None:
-                return float(point[0]), float(point[1])
-        return None
+                expected = (float(point[0]), float(point[1]))
+
+        return expected
+
+    def _wide_align_target_observation(self) -> RelativeObservation | None:
+        """Return the fresh labelled raw-Wide observation associated with the target."""
+        expected = self._wide_align_expected_base()
+
+        last_frame_s = self._wide_relative_last_frame_s
+        if (
+            last_frame_s is None
+            or self._now_s() - last_frame_s > self.align_wide_max_age_sec
+        ):
+            return None
+        return nearest_align_wide_observation(
+            expected,
+            self._wide_relative_labeled_observations,
+            self.align_wide_match_radius_m,
+        )
+
+    def _wide_align_target_base(self) -> tuple[float, float] | None:
+        """Return fresh raw-Wide geometry associated to the latched world/slot target."""
+        observation = self._wide_align_target_observation()
+        if observation is None:
+            return None
+        return float(observation.x), float(observation.y)
 
     def _drive(self, vx: float, vy: float, omega: float = 0.0) -> None:
         now = self._now_s()
@@ -3329,7 +3845,13 @@ class MissionFsmNode(Node):
             )
         return aligned
 
-    def _drive_toward_direct(self, dest_x: float, dest_y: float, yaw: float = 0.0) -> None:
+    def _drive_toward_direct(
+        self,
+        dest_x: float,
+        dest_y: float,
+        yaw: float = 0.0,
+        speed_limit_mps: float | None = None,
+    ) -> None:
         """Drive to a field waypoint by publishing /base_command directly from the FSM.
 
         This follows the same command ownership model as the OPENING routine: rotate in place until
@@ -3364,7 +3886,10 @@ class MissionFsmNode(Node):
             stop_when_aligned=False,
         )
         if aligned:
-            self._drive(max(0.0, self.direct_nav_speed), 0.0, 0.0)
+            speed = max(0.0, self.direct_nav_speed)
+            if speed_limit_mps is not None:
+                speed = min(speed, max(0.0, float(speed_limit_mps)))
+            self._drive(speed, 0.0, 0.0)
 
     def _rotate_to_heading(
         self, target_heading: float, tolerance_rad: float, omega_max: float
@@ -3563,6 +4088,7 @@ class MissionFsmNode(Node):
         force_initial_align: bool = False,
         forward_only: bool = False,
         stop_radius_m: float | None = None,
+        speed_limit_mps: float | None = None,
     ) -> bool:
         """Face a cardinal lane leg in place, then follow it without lateral translation."""
         if not self.lane_heading_lock_enabled or self.world is None:
@@ -3679,6 +4205,8 @@ class MissionFsmNode(Node):
             self._drive(0.0, 0.0, 0.0)
             return True
         speed = max(0.0, self.direct_nav_speed)
+        if speed_limit_mps is not None:
+            speed = min(speed, max(0.0, float(speed_limit_mps)))
         if now < self._lane_heading_realign_armed_at_s:
             speed = min(speed, self.lane_heading_soft_entry_speed)
             # Keep large intentional entry-angle differences translation-only, but correct a
@@ -3747,36 +4275,68 @@ class MissionFsmNode(Node):
     def _clear_zone_entry_anchor(self) -> None:
         self._zone_entry_anchor_idx = None
         self._zone_entry_anchor = None
+        self._zone_anchor_slowdown_active = False
+        self._opening_zone_entry_path = None
+        self._opening_zone_entry_start = None
+        self._opening_zone_entry_idx = 0
+        self._reset_opening_anchor_strafe()
+
+    def _zone_anchor_speed_limit(
+        self, anchor: tuple[float, float]
+    ) -> float | None:
+        distance = self._distance_to(anchor[0], anchor[1])
+        was_active = self._zone_anchor_slowdown_active
+        active, speed_limit = _zone_anchor_slowdown_state(
+            distance,
+            self.zone_anchor_slowdown_enabled,
+            self.zone_anchor_slowdown_distance_m,
+            self.zone_anchor_slow_speed,
+            was_active,
+        )
+        self._zone_anchor_slowdown_active = active
+        if active and not was_active:
+            self._decide(
+                f"ZONE {self._active_zone_id()} ANCHOR SLOW "
+                f"d={distance:.2f}m speed={speed_limit:.2f}"
+            )
+        return speed_limit
 
     def _reset_opening_anchor_strafe(self) -> None:
         self._opening_anchor_strafe_phase = "align"
         self._opening_anchor_strafe_phase_start_s = 0.0
         self._opening_anchor_strafe_pulses = 0
         self._opening_anchor_strafe_vy = 0.0
+        self._opening_anchor_strafe_pulse_duration_sec = 0.0
         self._reset_pulsed_heading()
 
-    def _step_opening_anchor_x_strafe(
+    def _step_zone_anchor_axis_strafe(
         self,
-        goal_x: float,
-        anchor: tuple[float, float],
+        goal_axis: float,
+        target_heading: float,
+        strafe_axis: str,
+        route_label: str,
     ) -> bool:
-        """Align with the anchor's y leg, then pulse sideways until field x matches."""
+        """Face the final travel direction, then pulse sideways onto its perpendicular axis."""
         if self.world is None:
             self._drive(0.0, 0.0, 0.0)
             return False
-        x_error = float(goal_x) - float(self.world.robot_x)
-        if abs(x_error) <= self.lane_heading_axis_tolerance_m:
+        current_axis = (
+            float(self.world.robot_x) if strafe_axis == "x" else float(self.world.robot_y)
+        )
+        axis_error = float(goal_axis) - current_axis
+        if abs(axis_error) <= self.lane_heading_axis_tolerance_m:
             self._drive(0.0, 0.0, 0.0)
             self._reset_opening_anchor_strafe()
             return True
 
-        dy = float(anchor[1]) - float(self.world.robot_y)
-        target_heading = math.pi / 2.0 if dy >= 0.0 else -math.pi / 2.0
         heading_error = self._wrap_pi(target_heading - float(self.world.robot_theta))
         phase = self._opening_anchor_strafe_phase
         now = self._now_s()
 
-        if phase not in {"align", "heading_settle"} and abs(heading_error) > self.lane_heading_align_tolerance_rad:
+        if (
+            phase not in {"align", "heading_settle"}
+            and abs(heading_error) > self.lane_heading_align_tolerance_rad
+        ):
             self._opening_anchor_strafe_phase = "align"
             self._opening_anchor_strafe_phase_start_s = 0.0
             self._reset_pulsed_heading()
@@ -3786,12 +4346,13 @@ class MissionFsmNode(Node):
             if self._opening_anchor_strafe_phase_start_s <= 0.0:
                 self._opening_anchor_strafe_phase_start_s = now
                 self._decide(
-                    f"OPENING Z1 STRAFE-X HEADING {math.degrees(target_heading):+.0f}deg"
+                    f"{route_label} STRAFE-{strafe_axis.upper()} HEADING "
+                    f"{math.degrees(target_heading):+.0f}deg"
                 )
             aligned = self._turn_in_place_pulsed(
                 target_heading,
                 self.lane_heading_align_tolerance_rad,
-                ("opening_anchor_strafe", self._opening_zone_entry_generation),
+                ("zone_anchor_strafe", self._opening_zone_entry_generation),
                 self.lane_heading_omega_max,
             )
             if aligned:
@@ -3807,7 +4368,10 @@ class MissionFsmNode(Node):
             return False
 
         if phase == "pulse":
-            if now - self._opening_anchor_strafe_phase_start_s < self.opening_anchor_strafe_pulse_sec:
+            if (
+                now - self._opening_anchor_strafe_phase_start_s
+                < self._opening_anchor_strafe_pulse_duration_sec
+            ):
                 self._drive(0.0, self._opening_anchor_strafe_vy, 0.0)
                 return False
             self._drive(0.0, 0.0, 0.0)
@@ -3817,7 +4381,10 @@ class MissionFsmNode(Node):
 
         if phase == "pulse_settle":
             self._drive(0.0, 0.0, 0.0)
-            if now - self._opening_anchor_strafe_phase_start_s >= self.opening_anchor_strafe_settle_sec:
+            if (
+                now - self._opening_anchor_strafe_phase_start_s
+                >= self.opening_anchor_strafe_settle_sec
+            ):
                 self._opening_anchor_strafe_phase = "align"
                 self._opening_anchor_strafe_phase_start_s = 0.0
                 self._reset_pulsed_heading()
@@ -3826,35 +4393,58 @@ class MissionFsmNode(Node):
         if self._opening_anchor_strafe_pulses >= self.opening_anchor_strafe_max_pulses:
             self._drive(0.0, 0.0, 0.0)
             self.get_logger().error(
-                "opening Z1 x-strafe reached its pulse limit; holding stopped",
+                f"{route_label} {strafe_axis}-strafe reached its pulse limit; holding stopped",
                 throttle_duration_sec=2.0,
             )
             return False
 
-        vy = _opening_anchor_strafe_velocity(
-            x_error, target_heading, self.opening_anchor_strafe_duty
+        vy = _zone_anchor_strafe_velocity(
+            axis_error,
+            target_heading,
+            strafe_axis,
+            self.opening_anchor_strafe_duty,
+        )
+        pulse_duration_sec = _zone_anchor_strafe_pulse_duration(
+            axis_error,
+            self.opening_anchor_strafe_long_threshold_m,
+            self.opening_anchor_strafe_medium_threshold_m,
+            self.opening_anchor_strafe_long_pulse_sec,
+            self.opening_anchor_strafe_medium_pulse_sec,
+            self.opening_anchor_strafe_short_pulse_sec,
         )
         self._opening_anchor_strafe_pulses += 1
         self._opening_anchor_strafe_vy = vy
+        self._opening_anchor_strafe_pulse_duration_sec = pulse_duration_sec
         self._opening_anchor_strafe_phase = "pulse"
         self._opening_anchor_strafe_phase_start_s = now
         self._decide(
-            f"OPENING Z1 STRAFE-X PULSE {self._opening_anchor_strafe_pulses}/"
-            f"{self.opening_anchor_strafe_max_pulses} error={x_error:+.2f}m vy={vy:+.3f}"
+            f"{route_label} STRAFE-{strafe_axis.upper()} PULSE "
+            f"{self._opening_anchor_strafe_pulses}/"
+            f"{self.opening_anchor_strafe_max_pulses} error={axis_error:+.2f}m "
+            f"duration={pulse_duration_sec:.2f}s vy={vy:+.3f}"
         )
         self._drive(0.0, vy, 0.0)
         return False
 
-    def _step_opening_zone_entry(self, anchor: tuple[float, float]) -> bool:
-        """Strafe onto the anchor x coordinate, then drive forward along field y."""
+    def _step_axis_strafe_zone_entry(
+        self,
+        anchor: tuple[float, float],
+        strafe_axis: str,
+        target_heading: float,
+        route_label: str,
+    ) -> bool:
+        """Align, strafe onto the anchor's cross-axis coordinate, then drive forward."""
         robot_xy = self._robot_xy()
         if robot_xy is None:
             self._drive(0.0, 0.0, 0.0)
             return False
         if self._opening_zone_entry_path is None:
             self._opening_zone_entry_start = robot_xy
-            self._opening_zone_entry_path = _opening_zone_entry_waypoints(
-                robot_xy, anchor, self.lane_heading_axis_tolerance_m
+            self._opening_zone_entry_path = _axis_strafe_zone_entry_waypoints(
+                robot_xy,
+                anchor,
+                strafe_axis,
+                self.lane_heading_axis_tolerance_m,
             )
             self._opening_zone_entry_idx = 0
             self._opening_zone_entry_generation += 1
@@ -3862,7 +4452,11 @@ class MissionFsmNode(Node):
                 f"({x:.2f},{y:.2f})" for x, y in self._opening_zone_entry_path
             )
             self._reset_opening_anchor_strafe()
-            self._decide(f"OPENING Z1 STRAFE-X-THEN-FORWARD-Y ROUTE {route}")
+            forward_axis = "Y" if strafe_axis == "x" else "X"
+            self._decide(
+                f"{route_label} STRAFE-{strafe_axis.upper()}-THEN-FORWARD-"
+                f"{forward_axis} ROUTE {route}"
+            )
 
         path = self._opening_zone_entry_path
         if not path or self._opening_zone_entry_start is None:
@@ -3874,15 +4468,33 @@ class MissionFsmNode(Node):
             return True
         start = self._opening_zone_entry_start if idx == 0 else path[idx - 1]
         goal = path[idx]
-        x_strafe_leg = (
-            idx == 0
-            and len(path) > 1
-            and abs(goal[0] - start[0]) > self.lane_heading_axis_tolerance_m
-            and abs(goal[1] - start[1]) <= self.lane_heading_axis_tolerance_m
-        )
-        if x_strafe_leg:
-            if self._step_opening_anchor_x_strafe(goal[0], anchor):
-                self._decide(f"OPENING Z1 STRAFE-X REACHED x={goal[0]:+.2f}")
+        if strafe_axis == "x":
+            axis_strafe_leg = (
+                idx == 0
+                and len(path) > 1
+                and abs(goal[0] - start[0]) > self.lane_heading_axis_tolerance_m
+                and abs(goal[1] - start[1]) <= self.lane_heading_axis_tolerance_m
+            )
+            goal_axis = goal[0]
+        else:
+            axis_strafe_leg = (
+                idx == 0
+                and len(path) > 1
+                and abs(goal[1] - start[1]) > self.lane_heading_axis_tolerance_m
+                and abs(goal[0] - start[0]) <= self.lane_heading_axis_tolerance_m
+            )
+            goal_axis = goal[1]
+        if axis_strafe_leg:
+            if self._step_zone_anchor_axis_strafe(
+                goal_axis,
+                target_heading,
+                strafe_axis,
+                route_label,
+            ):
+                self._decide(
+                    f"{route_label} STRAFE-{strafe_axis.upper()} REACHED "
+                    f"{strafe_axis}={goal_axis:+.2f}"
+                )
                 self._opening_zone_entry_idx += 1
                 self._lane_heading_segment_key = None
                 self._lane_heading_phase = "align"
@@ -3896,23 +4508,62 @@ class MissionFsmNode(Node):
         if reached:
             self._drive(0.0, 0.0, 0.0)
             label = "PASSED" if passed else "REACHED"
-            self._decide(f"OPENING Z1 LEG {idx + 1}/{len(path)} {label}")
+            self._decide(f"{route_label} LEG {idx + 1}/{len(path)} {label}")
             self._opening_zone_entry_idx += 1
             self._lane_heading_segment_key = None
             self._lane_heading_phase = "align"
             return self._opening_zone_entry_idx >= len(path)
 
         segment_key = (-self._opening_zone_entry_generation, idx)
+        speed_limit = (
+            self._zone_anchor_speed_limit(anchor)
+            if idx == len(path) - 1
+            else None
+        )
         handled = self._drive_cardinal_lane_segment(
-            start, goal, segment_key, stop_radius_m=0.0
+            start,
+            goal,
+            segment_key,
+            stop_radius_m=0.0,
+            speed_limit_mps=speed_limit,
         )
         if not handled:
             self._drive(0.0, 0.0, 0.0)
             self.get_logger().error(
-                "post-opening Z1 entry produced a non-cardinal segment",
+                f"{route_label} entry produced a non-cardinal forward segment",
                 throttle_duration_sec=2.0,
             )
         return False
+
+    def _step_opening_zone_entry(self, anchor: tuple[float, float]) -> bool:
+        """Strafe onto Z1 anchor x, then drive forward along field y."""
+        robot_xy = self._robot_xy()
+        target_heading = -math.pi / 2.0
+        if robot_xy is not None and float(anchor[1]) >= float(robot_xy[1]):
+            target_heading = math.pi / 2.0
+        return self._step_axis_strafe_zone_entry(
+            anchor,
+            "x",
+            target_heading,
+            "OPENING Z1",
+        )
+
+    def _step_zone_transition_entry(self, anchor: tuple[float, float]) -> bool | None:
+        """Run the configured strafe-then-forward entry between consecutive zones."""
+        if self._zone_idx <= 0 or self._zone_idx >= len(self.zone_order):
+            return None
+        from_zone = int(self.zone_order[self._zone_idx - 1])
+        to_zone = int(self.zone_order[self._zone_idx])
+        profile = _zone_transition_strafe_profile(from_zone, to_zone)
+        if profile is None:
+            return None
+        strafe_axis, target_heading = profile
+        return self._step_axis_strafe_zone_entry(
+            anchor,
+            strafe_axis,
+            target_heading,
+            f"ZONE {from_zone}->{to_zone}",
+        )
 
     def _zone_entry_anchor_point(self) -> tuple[float, float] | None:
         """Latch the closest candidate once when the active zone is entered."""
@@ -3940,6 +4591,95 @@ class MissionFsmNode(Node):
             return True
         xmin, xmax, ymin, ymax = self.zone_bounds.get(self._active_zone_id(), (-2.0, 2.0, -2.0, 2.0))
         return xmin <= float(obj.x) <= xmax and ymin <= float(obj.y) <= ymax
+
+    @staticmethod
+    def _object_last_seen_key(obj: Object) -> tuple[int, int] | None:
+        stamp = getattr(obj, "last_seen", None)
+        if stamp is None:
+            return None
+        return int(stamp.sec), int(stamp.nanosec)
+
+    def _reset_plain_cube_reobservation(self) -> None:
+        self._plain_cube_unknown_count = 0
+        self._plain_cube_unknown_last_stamp = None
+
+    def _plain_cube_approach_identity_action(self, target: Object | None) -> str:
+        """Return continue, hold, or exclude for a latched Set1 plain-cube target."""
+        active = (
+            self.set1_label == "cube"
+            and int(self.phase) == 1
+            and not self._opportunistic_set2_active
+        )
+        if not active or target is None:
+            return "continue"
+        if int(target.set_type) == 1 and str(target.class_label) == "cube":
+            self._reset_plain_cube_reobservation()
+            return "continue"
+        if int(target.set_type) != 0:
+            return "exclude"
+
+        stamp_key = self._object_last_seen_key(target)
+        if stamp_key is not None and stamp_key != self._plain_cube_unknown_last_stamp:
+            self._plain_cube_unknown_last_stamp = stamp_key
+            self._plain_cube_unknown_count += 1
+        if self._plain_cube_unknown_count >= self.plain_cube_ambiguous_observations:
+            return "exclude"
+        return "hold"
+
+    def _nearest_object_at(
+        self, point: tuple[float, float] | None, radius_m: float
+    ) -> Object | None:
+        if self.world is None or point is None:
+            return None
+        candidates = [
+            obj for obj in self.world.objects
+            if not bool(obj.blacklisted)
+            and math.hypot(float(obj.x) - point[0], float(obj.y) - point[1]) <= radius_m
+        ]
+        if not candidates:
+            return None
+        return min(
+            candidates,
+            key=lambda obj: math.hypot(float(obj.x) - point[0], float(obj.y) - point[1]),
+        )
+
+    def _is_zone_ambiguous_excluded(self, obj: Object) -> bool:
+        if not self.zone_mission_enabled:
+            return False
+        if int(obj.id) in self._zone_ambiguous_excluded_ids:
+            return True
+        return any(
+            math.hypot(float(obj.x) - x, float(obj.y) - y)
+            <= self.zone_ambiguous_exclusion_radius_m
+            for x, y in self._zone_ambiguous_excluded_xy
+        )
+
+    def _exclude_ambiguous_for_active_zone(
+        self,
+        obj: Object,
+        fallback_xy: tuple[float, float] | None,
+        reason: str,
+    ) -> None:
+        obj_id = int(obj.id)
+        point = fallback_xy or (float(obj.x), float(obj.y))
+        if self.zone_mission_enabled:
+            if obj_id > 0:
+                self._zone_ambiguous_excluded_ids.add(obj_id)
+            if not any(
+                math.hypot(point[0] - x, point[1] - y)
+                <= self.zone_ambiguous_exclusion_radius_m * 0.5
+                for x, y in self._zone_ambiguous_excluded_xy
+            ):
+                self._zone_ambiguous_excluded_xy.append(point)
+        self._decide(
+            f"ZONE {self._active_zone_id()} AMBIGUOUS EXCLUDE #{obj_id} "
+            f"({point[0]:.2f},{point[1]:.2f}) {reason}"
+        )
+
+    def _clear_zone_ambiguous_exclusions(self) -> None:
+        self._zone_ambiguous_excluded_ids.clear()
+        self._zone_ambiguous_excluded_xy.clear()
+        self._reset_plain_cube_reobservation()
 
     def _reset_zone_scan_timer(self) -> None:
         self._zone_no_target_since = None
@@ -3984,6 +4724,7 @@ class MissionFsmNode(Node):
         prev = self._active_zone_id()
         if self._zone_idx + 1 < len(self.zone_order):
             self._zone_idx += 1
+            self._clear_zone_ambiguous_exclusions()
             self._plan = None
             self._coverage = None
             self.current_target = None
@@ -3999,6 +4740,7 @@ class MissionFsmNode(Node):
             self._enter("SCAN")
             return
         self._zone_idx = 0
+        self._clear_zone_ambiguous_exclusions()
         self._clear_current_slot()
         self._opportunistic_set2_active = False
         self._zone_stabilized_idx = None
@@ -4107,13 +4849,16 @@ class MissionFsmNode(Node):
         yaw: float = 0.0,
         exclude_id: int = 0,
         route_mode: str = "grid_only",
+        speed_limit_mps: float | None = None,
     ) -> bool:
         """Drive the active lane route and report when its final waypoint is reached."""
         dest = (float(dest_x), float(dest_y))
         obstacles = self._obstacles_snapshot(exclude_id, dest)
         self._publish_planning_obstacles(obstacles)
         if not self.planner_enabled:
-            self._drive_toward_direct(dest_x, dest_y, yaw)
+            self._drive_toward_direct(
+                dest_x, dest_y, yaw, speed_limit_mps=speed_limit_mps
+            )
             distance = self._distance_to(dest_x, dest_y)
             return distance is not None and distance <= self.wp_reach_tol_m
         rxy = self._robot_xy()
@@ -4298,6 +5043,7 @@ class MissionFsmNode(Node):
             segment_key,
             force_initial_align=post_pick_plan,
             forward_only=post_pick_plan,
+            speed_limit_mps=speed_limit_mps,
         )
         if not cardinal_handled:
             self._lane_heading_segment_key = None
@@ -4312,7 +5058,9 @@ class MissionFsmNode(Node):
             if self._plan_route_mode == "post_pick_entry" and self._plan_idx == 0:
                 self._drive_to_post_pick_lane_entry(wx, wy)
             elif self._plan_route_mode == "object_approach" and last:
-                self._drive_toward_direct(wx, wy, via_yaw)
+                self._drive_toward_direct(
+                    wx, wy, via_yaw, speed_limit_mps=speed_limit_mps
+                )
             else:
                 self._drive(0.0, 0.0, 0.0)
                 self.get_logger().error(
@@ -4416,9 +5164,7 @@ class MissionFsmNode(Node):
         self._opening_position_debug_seq += 1
 
     def on_relative_wide(self, msg: WorldModel) -> None:
-        """Feed raw base_link WIDE points to the pose-free anchor lattice."""
-        if not self._relative_mode() or self._relative_acquisition_started_s is None:
-            return
+        """Cache raw base-link Wide points for ALIGN and feed the optional anchor lattice."""
         now = self._now_s()
         if str(msg.header.frame_id) != "base_link":
             self.get_logger().warn(
@@ -4445,6 +5191,15 @@ class MissionFsmNode(Node):
             for obj in msg.objects
             if not bool(obj.blacklisted) and int(obj.set_type) in {1, 2}
         ]
+        self._wide_relative_observations = [
+            (float(observation.x), float(observation.y)) for observation in observations
+        ]
+        self._wide_relative_labeled_observations = list(observations)
+        self._wide_relative_last_frame_s = now
+        self._wide_relative_seq += 1
+
+        if not self._relative_mode() or self._relative_acquisition_started_s is None:
+            return
         self._sync_relative_landmark_exclusions()
         self._relative_anchor_tracker.observe(observations, now_s=now)
         if self._relative_acquisition_first_frame_s is None:
@@ -4464,6 +5219,18 @@ class MissionFsmNode(Node):
             float(msg.data[0]), float(msg.data[1]), float(msg.data[2]),
             include_grid_locked=self.set2_slot_follow_map_transform,
         )
+
+    def on_wall_segments(self, msg: Float32MultiArray) -> None:
+        """Cache raw wall segments in field coordinates for the timed parking route."""
+        values = [float(value) for value in msg.data]
+        segments: list[tuple[float, float, float, float]] = []
+        for idx in range(0, len(values) - 3, 4):
+            segment = tuple(values[idx:idx + 4])
+            if all(math.isfinite(value) for value in segment):
+                segments.append(segment)
+        self._wall_segments = segments
+        self._wall_segments_s = self._now_s()
+        self._wall_segments_seq += 1
 
     def on_target(self, msg: Object) -> None:
         self.selected = msg
@@ -5110,160 +5877,175 @@ class MissionFsmNode(Node):
         self._post_pick_lane_entry_pending = False
         self._decide(
             f"TIMED STORAGE t={self._now_s() - self._node_start_s:.1f}s "
-            f"-> STAGING ({self.storage_staging_x:.2f},{self.storage_staging_y:.2f})"
+            f"-> BOTTOM WALL {self.storage_bottom_wall_stop_m:.2f}m"
         )
         self._enter("DRIVE_TO_STORAGE")
+
+    def _reset_storage_wall_confirmation(self) -> None:
+        self._storage_wall_confirm_count = 0
+        self._storage_wall_confirm_last_seq = -1
+
+    def _storage_wall_distance(self, *, axis: str, direction: int) -> float | None:
+        if self._now_s() - self._wall_segments_s > self.storage_wall_max_age_sec:
+            return None
+        return directional_wall_distance(
+            self._wall_segments,
+            float(self.world.robot_x),
+            float(self.world.robot_y),
+            axis=axis,
+            direction=direction,
+        )
+
+    def _storage_wall_stop_confirmed(self, distance: float | None, threshold: float) -> bool:
+        """Require distinct wall-localizer frames before accepting a wall stop distance."""
+        if self._wall_segments_seq == self._storage_wall_confirm_last_seq:
+            return self._storage_wall_confirm_count >= self.storage_wall_confirm_frames
+        self._storage_wall_confirm_last_seq = self._wall_segments_seq
+        if distance is not None and distance <= threshold:
+            self._storage_wall_confirm_count += 1
+        else:
+            self._storage_wall_confirm_count = 0
+        return self._storage_wall_confirm_count >= self.storage_wall_confirm_frames
+
+    def _storage_pose_wall_distance(self, *, axis: str, direction: int) -> float:
+        xmin, xmax, ymin, ymax = self._field_bounds
+        if axis == "y":
+            wall = ymax if direction >= 0 else ymin
+            position = float(self.world.robot_y)
+        else:
+            wall = xmax if direction >= 0 else xmin
+            position = float(self.world.robot_x)
+        return max(0.0, (wall - position) if direction >= 0 else (position - wall))
 
     def _finish_storage_reverse(self, reason: str) -> None:
         self._drive(0.0, 0.0, 0.0)
         self._storage_route_completed = True
-        self._decide(
-            f"STORAGE REACHED ({self.storage_x:.2f},{self.storage_y:.2f}) {reason}"
-        )
+        self._decide(f"STORAGE LEFT WALL PARKED {reason}")
         self._enter("ALIGN_OVER_BIN")
 
     def _step_drive_to_storage(self) -> None:
-        """Drive to staging, face the origin, then reverse straight into the storage point."""
+        """Approach the bottom wall, face right, then reverse toward the left wall."""
         if self.world is None:
             self._drive(0.0, 0.0, 0.0)
             return
 
-        if self._storage_route_phase == "to_staging":
-            distance = self._distance_to(self.storage_staging_x, self.storage_staging_y)
-            if distance is not None and distance <= self.storage_staging_reach_tol_m:
-                self._drive(0.0, 0.0, 0.0)
-                self._storage_route_phase = "face_origin"
-                self._reset_pulsed_heading()
-                self._decide(
-                    f"STORAGE STAGING REACHED ({self.storage_staging_x:.2f},"
-                    f"{self.storage_staging_y:.2f}) -> FACE "
-                    f"({self.storage_face_x:.2f},{self.storage_face_y:.2f})"
-                )
-                return
-            if distance is None:
-                self._drive(0.0, 0.0, 0.0)
-                return
-            if self._storage_staging_heading is None:
-                self._storage_staging_heading = math.atan2(
-                    self.storage_staging_y - float(self.world.robot_y),
-                    self.storage_staging_x - float(self.world.robot_x),
-                )
-                self._reset_pulsed_heading()
-                self._decide(
-                    f"STORAGE DIRECT HEADING "
-                    f"{math.degrees(self._storage_staging_heading):+.1f}deg"
-                )
+        if self._storage_route_phase == "face_bottom_wall":
             aligned = self._turn_in_place_pulsed(
-                self._storage_staging_heading,
+                self.storage_down_heading_rad,
                 self.storage_heading_tolerance_rad,
-                key=("storage_face_staging", round(self._storage_staging_heading, 6)),
+                key=("storage_face_bottom_wall", round(self.storage_down_heading_rad, 6)),
             )
             if aligned:
-                self._storage_route_phase = "straight_to_staging"
+                self._storage_route_phase = "approach_bottom_wall"
+                self._reset_storage_wall_confirmation()
                 self._decide(
-                    f"STORAGE DIRECT -> ({self.storage_staging_x:.2f},"
-                    f"{self.storage_staging_y:.2f})"
+                    f"STORAGE FACE DOWN {math.degrees(self.storage_down_heading_rad):+.1f}deg "
+                    f"-> BOTTOM WALL {self.storage_bottom_wall_stop_m:.2f}m"
                 )
             return
 
-        if self._storage_route_phase == "straight_to_staging":
-            distance = self._distance_to(self.storage_staging_x, self.storage_staging_y)
-            if distance is None:
+        if self._storage_route_phase == "approach_bottom_wall":
+            observed = self._storage_wall_distance(axis="y", direction=1)
+            pose_distance = self._storage_pose_wall_distance(axis="y", direction=1)
+            if observed is not None and observed <= self.storage_bottom_wall_stop_m:
                 self._drive(0.0, 0.0, 0.0)
+                if self._storage_wall_stop_confirmed(
+                    observed, self.storage_bottom_wall_stop_m
+                ):
+                    self._storage_route_phase = "face_right"
+                    self._reset_storage_wall_confirmation()
+                    self._reset_pulsed_heading()
+                    self._decide(
+                        f"STORAGE BOTTOM WALL {observed:.2f}m CONFIRMED -> FACE RIGHT"
+                    )
                 return
-            if distance <= self.storage_staging_reach_tol_m:
+            self._storage_wall_stop_confirmed(observed, self.storage_bottom_wall_stop_m)
+            if observed is None and pose_distance <= self.storage_wall_detection_required_m:
                 self._drive(0.0, 0.0, 0.0)
-                self._storage_route_phase = "face_origin"
-                self._reset_pulsed_heading()
-                self._decide(
-                    f"STORAGE STAGING REACHED ({self.storage_staging_x:.2f},"
-                    f"{self.storage_staging_y:.2f}) -> FACE "
-                    f"({self.storage_face_x:.2f},{self.storage_face_y:.2f})"
+                self.get_logger().warn(
+                    "storage bottom wall is near by pose but has no fresh wall detection; holding",
+                    throttle_duration_sec=2.0,
                 )
                 return
-            heading = self._storage_staging_heading
-            if heading is None:
-                self._storage_route_phase = "to_staging"
-                return
-            heading_error = self._wrap_pi(heading - float(self.world.robot_theta))
+            heading_error = self._wrap_pi(
+                self.storage_down_heading_rad - float(self.world.robot_theta)
+            )
             if abs(heading_error) >= self.storage_reverse_realign_rad:
                 self._drive(0.0, 0.0, 0.0)
-                self._storage_route_phase = "to_staging"
-                self._storage_staging_heading = None
+                self._storage_route_phase = "face_bottom_wall"
                 self._reset_pulsed_heading()
                 self._decide(
-                    f"STORAGE DIRECT RE-ALIGN error="
-                    f"{math.degrees(heading_error):+.1f}deg"
+                    f"STORAGE BOTTOM RE-ALIGN error={math.degrees(heading_error):+.1f}deg"
                 )
                 return
+            distance = observed if observed is not None else pose_distance
             vx, vy, omega = straight_forward_command(
                 current_heading=float(self.world.robot_theta),
-                target_heading=heading,
-                distance_m=distance,
-                max_speed=self.direct_nav_speed,
+                target_heading=self.storage_down_heading_rad,
+                distance_m=max(0.0, distance - self.storage_bottom_wall_stop_m),
+                max_speed=self.storage_wall_approach_speed,
                 heading_kp=self.storage_reverse_heading_kp,
                 omega_max=self.storage_reverse_omega_max,
             )
             self._drive(vx, vy, omega)
             return
 
-        heading = self._storage_reverse_heading
-        if heading is None:
-            heading = parking_face_heading(
-                self.storage_staging_x,
-                self.storage_staging_y,
-                self.storage_face_x,
-                self.storage_face_y,
-            )
-            self._storage_reverse_heading = heading
-
-        if self._storage_route_phase == "face_origin":
+        if self._storage_route_phase == "face_right":
             aligned = self._turn_in_place_pulsed(
-                heading,
+                self.storage_right_heading_rad,
                 self.storage_heading_tolerance_rad,
-                key=("storage_face_origin", round(heading, 6)),
+                key=("storage_face_right", round(self.storage_right_heading_rad, 6)),
             )
             if aligned:
-                self._storage_route_phase = "reverse"
+                self._storage_route_phase = "reverse_to_left_wall"
+                self._reset_storage_wall_confirmation()
                 self._decide(
-                    f"STORAGE HEADING {math.degrees(heading):+.1f}deg -> REVERSE"
+                    f"STORAGE FACE RIGHT {math.degrees(self.storage_right_heading_rad):+.1f}deg "
+                    f"-> REVERSE TO LEFT WALL {self.storage_left_wall_stop_m:.2f}m"
                 )
             return
 
-        distance = self._distance_to(self.storage_x, self.storage_y)
-        if distance is None:
+        if self._storage_route_phase != "reverse_to_left_wall":
             self._drive(0.0, 0.0, 0.0)
-            return
-        if distance <= self.storage_reach_tol_m:
-            self._finish_storage_reverse("within tolerance")
+            self.get_logger().error(
+                f"unknown storage route phase '{self._storage_route_phase}'; holding stopped",
+                throttle_duration_sec=2.0,
+            )
             return
 
-        heading_error = self._wrap_pi(heading - float(self.world.robot_theta))
+        observed = self._storage_wall_distance(axis="x", direction=1)
+        pose_distance = self._storage_pose_wall_distance(axis="x", direction=1)
+        if observed is not None and observed <= self.storage_left_wall_stop_m:
+            self._drive(0.0, 0.0, 0.0)
+            if self._storage_wall_stop_confirmed(observed, self.storage_left_wall_stop_m):
+                self._finish_storage_reverse(f"left wall={observed:.2f}m")
+            return
+        self._storage_wall_stop_confirmed(observed, self.storage_left_wall_stop_m)
+        if observed is None and pose_distance <= self.storage_wall_detection_required_m:
+            self._drive(0.0, 0.0, 0.0)
+            self.get_logger().warn(
+                "storage left wall is near by pose but has no fresh wall detection; holding",
+                throttle_duration_sec=2.0,
+            )
+            return
+
+        heading_error = self._wrap_pi(
+            self.storage_right_heading_rad - float(self.world.robot_theta)
+        )
         if abs(heading_error) >= self.storage_reverse_realign_rad:
             self._drive(0.0, 0.0, 0.0)
-            self._storage_route_phase = "face_origin"
+            self._storage_route_phase = "face_right"
             self._reset_pulsed_heading()
             self._decide(
                 f"STORAGE REVERSE RE-ALIGN error={math.degrees(heading_error):+.1f}deg"
             )
             return
 
-        base_target = self._to_base(self.storage_x, self.storage_y)
-        if base_target is not None and base_target[0] >= 0.0:
-            if distance <= max(0.20, 2.0 * self.storage_reach_tol_m):
-                self._finish_storage_reverse("target passed")
-            else:
-                self._drive(0.0, 0.0, 0.0)
-                self.get_logger().error(
-                    "storage target is no longer behind the robot; holding stopped",
-                    throttle_duration_sec=2.0,
-                )
-            return
-
+        distance = observed if observed is not None else pose_distance
         vx, vy, omega = straight_reverse_command(
             current_heading=float(self.world.robot_theta),
-            target_heading=heading,
-            distance_m=distance,
+            target_heading=self.storage_right_heading_rad,
+            distance_m=max(0.0, distance - self.storage_left_wall_stop_m),
             max_speed=self.storage_reverse_speed,
             heading_kp=self.storage_reverse_heading_kp,
             omega_max=self.storage_reverse_omega_max,
@@ -5294,14 +6076,19 @@ class MissionFsmNode(Node):
                         if self._opening_zone_entry_pending and self._zone_idx == 0:
                             anchor_reached = self._step_opening_zone_entry(entry_anchor)
                         else:
-                            th = self.world.robot_theta if self.world is not None else 0.0
-                            self._drive_toward(
-                                zx,
-                                zy,
-                                th,
-                                exclude_id=0,
-                                route_mode=self._next_travel_route_mode(),
-                            )
+                            transition_reached = self._step_zone_transition_entry(entry_anchor)
+                            if transition_reached is None:
+                                th = self.world.robot_theta if self.world is not None else 0.0
+                                self._drive_toward(
+                                    zx,
+                                    zy,
+                                    th,
+                                    exclude_id=0,
+                                    route_mode=self._next_travel_route_mode(),
+                                    speed_limit_mps=self._zone_anchor_speed_limit(entry_anchor),
+                                )
+                            else:
+                                anchor_reached = transition_reached
                         if not anchor_reached:
                             return
                     self._opening_zone_entry_pending = False
@@ -5411,6 +6198,36 @@ class MissionFsmNode(Node):
                     self.get_logger().info(
                         f"APPROACH interrupt: opportunistic Set2 target #{opp.id} '{opp.fruit_label}'")
                     self._decide(f"OPP SET2 INTERRUPT {opp.fruit_label} #{opp.id}")
+            if self.current_target is not None:
+                fresh_latched = self._lookup_object(int(self.current_target.id))
+                if fresh_latched is None and self.set1_label == "cube":
+                    fresh_latched = self._nearest_object_at(
+                        self._appr_tgt_xy,
+                        self.zone_ambiguous_exclusion_radius_m,
+                    )
+                previous_unknown_count = self._plain_cube_unknown_count
+                identity_action = self._plain_cube_approach_identity_action(fresh_latched)
+                if identity_action == "hold":
+                    self._drive(0.0, 0.0, 0.0)
+                    if self._plain_cube_unknown_count != previous_unknown_count:
+                        self._decide(
+                            f"PLAIN CUBE AMBIGUOUS #{fresh_latched.id} "
+                            f"{self._plain_cube_unknown_count}/"
+                            f"{self.plain_cube_ambiguous_observations}; HOLD"
+                        )
+                    return
+                if identity_action == "exclude" and fresh_latched is not None:
+                    self._drive(0.0, 0.0, 0.0)
+                    reason = fresh_latched.class_label or "unknown"
+                    self._exclude_ambiguous_for_active_zone(
+                        fresh_latched,
+                        self._appr_tgt_xy,
+                        reason,
+                    )
+                    self.current_target = None
+                    self._appr_tgt_xy = None
+                    self._enter("SCAN")
+                    return
             # Stay COMMITTED to the latched object: pick the phase object nearest the LATCHED xy (not
             # the globally nearest), so we don't shuttle to whichever cube is momentarily closest.
             slot = self._current_slot() if self._set2_slot_mode() else None
@@ -5801,13 +6618,7 @@ class MissionFsmNode(Node):
                 self._search_t0 = now
 
     def _step_align(self) -> None:
-        """Wide-first stop/turn/forward ALIGN with no mecanum lateral translation.
-
-        Wide or the immutable anchor slot supplies the initial bearing even when the close Body
-        camera cannot see the object.  The local-anchor pulsed heading controller faces that exact
-        bearing, then calibrated forward/back pulses change range.  Once Body sees the target it
-        refines the same geometry; a blind fixed-angle yaw scan is never used.
-        """
+        """Align with Body x/y translation pulses while preserving the APPROACH heading."""
         now = self._now_s()
         if self._time_in_state() > self.align_timeout_sec:
             self._drive(0.0, 0.0)
@@ -5835,7 +6646,7 @@ class MissionFsmNode(Node):
 
         if self._align_phase == "pulse":
             if now - self._align_phase_start < self._pulse_sec:  # calibrated per-direction duration
-                self._drive(self._pulse_vx, 0.0)                 # forward/back only
+                self._drive(self._pulse_vx, self._pulse_vy)
             else:
                 self._drive(0.0, 0.0)
                 if self.anchor_mission_enabled and self._current_anchor_slot() is not None:
@@ -5849,21 +6660,6 @@ class MissionFsmNode(Node):
             self._drive(0.0, 0.0)                                # let the heavy base fully stop
             if now - self._align_phase_start >= self.align_settle_pulse_sec:
                 self._align_phase = "measure"
-            return
-        if self._align_phase == "face_target":
-            if self._align_heading_target is None or self.world is None:
-                self._drive(0.0, 0.0, 0.0)
-                self._align_phase = "measure"
-                return
-            if self._turn_in_place_pulsed(
-                self._align_heading_target,
-                self.align_heading_tolerance_rad,
-                ("align_face", round(float(self._align_heading_target), 3)),
-                self.direct_nav_omega_max,
-            ):
-                self._align_heading_target = None
-                self._align_phase = "settle"
-                self._align_phase_start = now
             return
         if self._align_phase == "body_lost_backoff":
             if now - self._align_phase_start < self.align_body_lost_backoff_sec:
@@ -5891,104 +6687,38 @@ class MissionFsmNode(Node):
                 self._enter("SELECT_TARGET")
             return
 
-        # Measure only while stopped. Wide/slot geometry is the acquisition authority; Body becomes
-        # the precision authority after the latched target is visible in its close-range image.
-        wide_point = self._wide_align_target_base()
+        # Measure only while stopped. APPROACH already established heading; Body geometry owns
+        # both translation axes here, and ALIGN never emits an angular command.
         candidate = self._body_target_base(self._body_label())
-        body_confirmed = candidate is not None
         if self.anchor_mission_enabled and self._current_anchor_slot() is not None:
-            body_confirmed = self._anchor_note_body_candidate(candidate)
-            if not body_confirmed:
+            if not self._anchor_note_body_candidate(candidate):
                 candidate = None
-        if candidate is None:
-            if self._set2_slot_mode() and self._current_slot() is not None:
-                set1_front = self._body_set1_distractor_in_front()
-                if set1_front is not None:
-                    self.get_logger().info(
-                        f"ALIGN: Set2 slot sees Set1 '{set1_front[0]}' in front -> skip this slot")
-                    self._retry_current_slot(f"body distractor {set1_front[0]}")
-                    self._align_fail_count = 0
-                    self._enter("SELECT_TARGET")
-                    return
-            # The target label isn't in front. If a DIFFERENT object (e.g. a body 'cube' on a set1 run)
-            # is sitting at the grab point, this spot is wrong -> blacklist it and go elsewhere.
+        # ALIGN is geometry-only. A moving/turning close-range view may temporarily call the
+        # intended shape a cube, so label acceptance/rejection is deferred until the base has
+        # fully stopped in CLASSIFY. Keep using the nearest slot-compatible Body point
+        # for servoing.
+        body_point = candidate
+        if body_point is None:
             other = self._body_nearest_any()
-            if other is not None and other[0] not in self._body_align_labels():
-                distractor_count, fresh_frame = self._update_align_distractor_confirmation(other[0])
-                want = "/".join(sorted(self._body_align_labels()))
-                if fresh_frame:
-                    self.get_logger().info(
-                        f"ALIGN: body sees '{other[0]}' (not '{want}') at grab "
-                        f"{distractor_count}/{self.align_distractor_confirm_frames} frames"
-                    )
-                if distractor_count < self.align_distractor_confirm_frames:
-                    self._drive(0.0, 0.0, 0.0)
-                    return
-                self.get_logger().info(
-                    f"ALIGN: body sees '{other[0]}' (not '{want}') at grab for "
-                    f"{distractor_count} consecutive frames -> skip this spot")
-                if self._set2_slot_mode() and self._current_slot() is not None:
-                    self._retry_current_slot(f"body distractor {other[0]}")
-                    self._align_fail_count = 0
-                    self._enter("SELECT_TARGET")
-                    return
-                if self.current_target is not None:
-                    self._blacklist(self.current_target.id)
-                self.current_target = None
-                self._align_fail_count = 0
-                self._enter("SELECT_TARGET")
-                return
-            self._update_align_distractor_confirmation(None)
-        else:
-            self._update_align_distractor_confirmation(None)
+            if other is not None:
+                body_point = (str(other[0]), float(other[1]), float(other[2]), 0.0)
 
-        if candidate is not None:
-            _, obj_x, obj_y, _ = candidate
-        elif wide_point is not None:
-            obj_x, obj_y = wide_point
-        else:
+        presence_count, fresh_presence = self._update_align_body_presence(body_point)
+
+        if body_point is None:
             self._drive(0.0, 0.0, 0.0)
-            self._align_phase = "settle"
-            self._align_phase_start = now
-            return
-
-        heading_error = align_heading_error(obj_x, obj_y, self.grab_y)
-        if abs(heading_error) > self.align_heading_tolerance_rad and self.world is not None:
-            self._align_heading_target = self._wrap_pi(
-                float(self.world.robot_theta) + heading_error
-            )
-            self._reset_pulsed_heading()
-            self._align_phase = "face_target"
-            source = "Body" if candidate is not None else "Wide"
-            self._decide(
-                f"ALIGN {source.upper()} FACE error={math.degrees(heading_error):+.1f}deg"
-            )
-            self._drive(0.0, 0.0, 0.0)
-            return
-
-        ex = obj_x - self.grab_x
-        ey = obj_y - self.grab_y
-        ex_tol = self.align_fwd_tol
-        if candidate is not None and abs(ex) < ex_tol and abs(ey) < self.align_tol:
-            self._drive(0.0, 0.0)
-            self.get_logger().info(
-                f"ALIGN ok (cam): fwd_err={ex * 100:+.1f}cm lat_err={ey * 100:+.1f}cm -> grab")
-            self._align_fail_count = 0
-            self.siglip_stamp_s = None
-            self.shape_stamp_s = None
-            self._enter("CLASSIFY")
-            return
-
-        if candidate is None and abs(ex) <= ex_tol:
-            self._drive(0.0, 0.0, 0.0)
-            if (self.anchor_mission_enabled
-                    and self._current_anchor_slot() is not None
-                    and self._anchor_body_missing_count >= self.body_slot_confirm_frames):
+            if (
+                self.anchor_mission_enabled
+                and self._current_anchor_slot() is not None
+                and self._anchor_body_missing_count >= self.body_slot_confirm_frames
+            ):
                 self._anchor_start_body_backoff_or_defer(now, "current slot absent in Body")
                 return
             if self.align_body_lost_backoff_enabled and self._align_target_still_in_world():
                 self.get_logger().info(
-                    "ALIGN: Wide is at grab range but Body is absent -> straight backoff")
+                    "ALIGN: target remains in world/wide but Body is absent -> straight backoff"
+                )
+                self._reset_align_body_presence()
                 self._align_phase = "body_lost_backoff"
                 self._align_phase_start = now
                 return
@@ -5996,18 +6726,49 @@ class MissionFsmNode(Node):
             self._align_phase_start = now
             return
 
-        # Heading is settled. Change only range, preserving the lateral line established above.
-        vx = math.copysign(self.align_step_fwd_duty, ex)
-        if self.align_adaptive_steps_enabled and abs(ex) >= self.align_mid_error_m:
-            self._pulse_sec = self.align_step_fwd_mid_sec
+        _, obj_x, obj_y, _ = body_point
+        ex = obj_x - self.grab_x
+        ey = obj_y - self.grab_y
+        ex_tol = self.align_fwd_tol
+        aligned_axis = align_translation_axis(ex, ey, ex_tol, self.align_tol)
+        if aligned_axis is None:
+            self._drive(0.0, 0.0, 0.0)
+            if fresh_presence:
+                self.get_logger().info(
+                    f"ALIGN BODY PRESENCE {presence_count}/{self.align_body_confirm_frames} "
+                    f"fwd_err={ex * 100:+.1f}cm lat_err={ey * 100:+.1f}cm"
+                )
+            if presence_count < self.align_body_confirm_frames:
+                return
+            self.get_logger().info(
+                f"ALIGN ok: Body x/y translation + presence "
+                f"fwd_err={ex * 100:+.1f}cm lat_err={ey * 100:+.1f}cm -> classify"
+            )
+            self._align_fail_count = 0
+            self.siglip_stamp_s = None
+            self.shape_stamp_s = None
+            self._enter("CLASSIFY")
+            return
+
+        if aligned_axis == "lateral":
+            vx, vy = 0.0, math.copysign(self.align_step_strafe_duty, ey)
+            if self.align_adaptive_steps_enabled and abs(ey) >= self.align_mid_error_m:
+                self._pulse_sec = self.align_step_strafe_mid_sec
+            else:
+                self._pulse_sec = self.align_step_strafe_sec
         else:
-            self._pulse_sec = self.align_step_fwd_sec
-        if obj_x <= self.grab_min_x and vx > 0.0:
-            vx = 0.0
-        self._pulse_vx = vx
+            vx, vy = math.copysign(self.align_step_fwd_duty, ex), 0.0
+            if self.align_adaptive_steps_enabled and abs(ex) >= self.align_mid_error_m:
+                self._pulse_sec = self.align_step_fwd_mid_sec
+            else:
+                self._pulse_sec = self.align_step_fwd_sec
+            if obj_x <= self.grab_min_x and vx > 0.0:
+                vx = 0.0
+        self._reset_align_body_presence()
+        self._pulse_vx, self._pulse_vy = vx, vy
         self._align_phase = "pulse"
         self._align_phase_start = now
-        self._drive(vx, 0.0)
+        self._drive(vx, vy)
 
     def _step_classify_set2_slot(self) -> None:
         """Classify and pick only the latched Set2 slot; uncertain results are retried."""
@@ -6060,6 +6821,124 @@ class MissionFsmNode(Node):
             self._retry_current_slot("classification uncertain")
             self._enter("SELECT_TARGET")
 
+    def _step_classify_set1_final(self) -> None:
+        """Verify a stopped, aligned Set1 object before allowing any arm motion."""
+        now = self._now_s()
+        phase_elapsed = now - self._classify_verify_phase_start_s
+        use_wide = self._set1_final_uses_wide()
+        source = "Wide" if use_wide else "Body"
+        required = (
+            int(self.classify_wide_confirm_frames)
+            if use_wide
+            else int(self.align_distractor_confirm_frames)
+        )
+
+        if self._classify_verify_phase == "settle":
+            self._drive(0.0, 0.0, 0.0)
+            if phase_elapsed >= self.classify_body_settle_sec:
+                self._classify_verify_phase = "verify"
+                self._classify_verify_phase_start_s = now
+                self._reset_set1_final_classification()
+                self.get_logger().info(
+                    f"CLASSIFY: base settled -> start final {source} verification"
+                )
+            return
+
+        if self._classify_verify_phase == "backoff":
+            if phase_elapsed < self.classify_body_retry_backoff_sec:
+                self._drive(-abs(self.align_body_lost_backoff_speed), 0.0, 0.0)
+            else:
+                self._drive(0.0, 0.0, 0.0)
+                self._classify_verify_phase = "backoff_settle"
+                self._classify_verify_phase_start_s = now
+            return
+
+        if self._classify_verify_phase == "backoff_settle":
+            self._drive(0.0, 0.0, 0.0)
+            if phase_elapsed >= self.classify_body_retry_settle_sec:
+                self._classify_verify_phase = "verify"
+                self._classify_verify_phase_start_s = now
+                self._reset_set1_final_classification()
+                self.get_logger().info(
+                    f"CLASSIFY: retry backoff settled -> restart final {source} verification"
+                )
+            return
+
+        self._drive(0.0, 0.0, 0.0)
+        decision, observed_label, fresh_frame = self._update_set1_final_classification()
+        if fresh_frame:
+            other_best = max(self._classify_body_other_counts.values(), default=0)
+            shown = observed_label or "none"
+            self.get_logger().info(
+                f"CLASSIFY FINAL: {source.lower()}='{shown}' target="
+                f"{self._classify_body_target_count}/{required} "
+                f"other_best={other_best}/{required} "
+                f"frame={self._classify_body_frame_count}/{self.classify_body_max_frames}"
+            )
+
+        if decision == "target":
+            if use_wide:
+                wide_pick = self._wide_align_target_observation()
+                confidence = float(wide_pick.confidence) if wide_pick is not None else 0.0
+                evidence = (
+                    f"final stopped Wide vote {self._classify_body_target_count}/"
+                    f"{self._classify_body_frame_count} with Body grab presence "
+                    f"conf={confidence:.2f}"
+                )
+            else:
+                body_pick = self._fresh_body_set1_pick_candidate()
+                confidence = float(body_pick[1]) if body_pick is not None else 0.0
+                evidence = (
+                    f"final stopped Body vote {self._classify_body_target_count}/"
+                    f"{self._classify_body_frame_count} conf={confidence:.2f}"
+                )
+            self._commit_pick(
+                1,
+                self.set1_label,
+                evidence,
+            )
+            return
+
+        if decision == "distractor":
+            obj_id = self.current_target.id if self.current_target is not None else 0
+            self.get_logger().info(
+                f"CLASSIFY FINAL: '{observed_label}' confirmed at grab -> skip target #{obj_id}"
+            )
+            self._decide(
+                f"FINAL NON-TARGET {observed_label} {required}/"
+                f"{self._classify_body_frame_count} -> SKIP #{obj_id}"
+            )
+            self._blacklist(obj_id)
+            self.current_target = None
+            self.set_type = 0
+            self._align_fail_count = 0
+            self._enter("SELECT_TARGET")
+            return
+
+        verify_timed_out = phase_elapsed >= self.classify_timeout_sec
+        if decision != "inconclusive" and not verify_timed_out:
+            return
+
+        if self._classify_verify_retry_count == 0:
+            self._classify_verify_retry_count = 1
+            self._classify_verify_phase = "backoff"
+            self._classify_verify_phase_start_s = now
+            self.get_logger().info(
+                "CLASSIFY FINAL: inconclusive -> short backoff and one stopped retry"
+            )
+            self._decide("FINAL VERIFY UNCERTAIN -> BACKOFF RETRY")
+            return
+
+        obj_id = self.current_target.id if self.current_target is not None else 0
+        self.get_logger().warn(
+            f"CLASSIFY FINAL: still inconclusive for target #{obj_id} -> "
+            "reselect without blacklist"
+        )
+        self._decide(f"FINAL VERIFY UNCERTAIN -> RESELECT #{obj_id} (no blacklist)")
+        self.current_target = None
+        self.set_type = 0
+        self._enter("SELECT_TARGET")
+
     def _step_classify(self) -> None:
         """Phase-aware pick gate from fresh siglip + shape classifications.
 
@@ -6069,6 +6948,9 @@ class MissionFsmNode(Node):
         """
         if self._set2_slot_mode() and self._current_slot() is not None:
             self._step_classify_set2_slot()
+            return
+        if self.phase == 1 and not self._opportunistic_set2_active:
+            self._step_classify_set1_final()
             return
         # ALIGN already established that this exact Set1 target was centred at the grab point. Near
         # grab_x the world-model track can temporarily disappear because its calibrated Body map

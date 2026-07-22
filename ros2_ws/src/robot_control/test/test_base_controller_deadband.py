@@ -1,6 +1,7 @@
 from robot_control.nodes.base_controller_node import (
     below_motion_deadband,
     is_precision_strafe_command,
+    select_brake_pulse_parameters,
     select_wheel_scales,
 )
 
@@ -73,3 +74,59 @@ def test_calibrated_lateral_pulse_uses_precision_profile_in_both_directions():
 
 def test_other_strafe_speed_does_not_use_precision_profile():
     assert not is_precision_strafe_command(0.0, 0.20, 0.0, 0.315, 0.005)
+
+
+def test_normal_stop_uses_normal_brake_profile():
+    assert select_brake_pulse_parameters(
+        align_profile=False,
+        rotation_profile=False,
+        align_brake_off=False,
+        wheel_brake_ms=180,
+        wheel_brake_scale=0.5,
+        rotation_wheel_brake_ms=90,
+        rotation_wheel_brake_scale=0.2,
+        align_wheel_brake_ms=120,
+        align_wheel_brake_scale=0.315,
+    ) == (180.0, 0.5)
+
+
+def test_rotation_stop_uses_independent_rotation_brake_profile():
+    assert select_brake_pulse_parameters(
+        align_profile=False,
+        rotation_profile=True,
+        align_brake_off=False,
+        wheel_brake_ms=180,
+        wheel_brake_scale=0.5,
+        rotation_wheel_brake_ms=90,
+        rotation_wheel_brake_scale=0.2,
+        align_wheel_brake_ms=120,
+        align_wheel_brake_scale=0.315,
+    ) == (90.0, 0.2)
+
+
+def test_align_stop_uses_independent_align_brake_profile():
+    assert select_brake_pulse_parameters(
+        align_profile=True,
+        rotation_profile=True,
+        align_brake_off=False,
+        wheel_brake_ms=180,
+        wheel_brake_scale=0.5,
+        rotation_wheel_brake_ms=90,
+        rotation_wheel_brake_scale=0.2,
+        align_wheel_brake_ms=120,
+        align_wheel_brake_scale=0.315,
+    ) == (120.0, 0.315)
+
+
+def test_align_brake_off_disables_only_align_profile():
+    assert select_brake_pulse_parameters(
+        align_profile=True,
+        rotation_profile=True,
+        align_brake_off=True,
+        wheel_brake_ms=180,
+        wheel_brake_scale=0.5,
+        rotation_wheel_brake_ms=90,
+        rotation_wheel_brake_scale=0.2,
+        align_wheel_brake_ms=120,
+        align_wheel_brake_scale=0.315,
+    ) == (0.0, 0.0)

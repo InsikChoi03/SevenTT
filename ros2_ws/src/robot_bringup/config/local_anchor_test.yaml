@@ -107,8 +107,12 @@ base_controller_node:
     wheel_min_rot: 0.07          # 테스트 초기값으로 원복(0.04 적용 전 값).
     wheel_boost_rot: 0.35        # 오프닝에서 검증된 정지마찰 탈출 출력.
     wheel_boost_ms: 100          # 출발만 보조하고 이후 0.14 floor로 낮춘다.
-    wheel_brake_ms: 120          # Reverse stop pulse.  Lower if the robot rebounds after stopping.
+    align_wheel_brake_ms: 120    # ALIGN/정밀 펄스 전용 reverse stop pulse.
+    align_wheel_brake_scale: 0.315
+    wheel_brake_ms: 120          # Translation reverse stop pulse.
     wheel_brake_scale: 0.315
+    rotation_wheel_brake_ms: 120 # In-place rotation reverse stop pulse.
+    rotation_wheel_brake_scale: 0.315
     wheel_slew_per_tick: 0.06    # 100ms boost 안에 실제 시동 출력까지 도달.
 
 # This override is consumed only by local_anchor_test.launch.py.

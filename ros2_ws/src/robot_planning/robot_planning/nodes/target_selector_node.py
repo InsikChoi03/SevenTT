@@ -123,6 +123,11 @@ class TargetSelectorNode(Node):
                 return None
             base = self.set2_base
         elif st == 0:
+            # A cube mission only approaches positively confirmed plain cubes.  Unknown tracks may
+            # be fruit-photo cubes whose detector label is flickering, so investigating them would
+            # recreate the exact false approach this gate is meant to prevent.
+            if self.set1_label == "cube" and self.phase in (0, 1):
+                return None
             # Unknown candidate: investigate it. Lower base than a confirmed target so
             # known targets outrank unexplored ones.
             base = self.explore_base
