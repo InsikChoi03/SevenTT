@@ -415,7 +415,7 @@ def test_failed_visual_verify_uses_short_correction_pulse_only_after_timeout():
     assert fsm.tick(1.07, math.radians(-43.0)).omega < 0.0
 
 
-def test_first_target_classification_cancels_remaining_route_and_starts_align():
+def test_single_upstream_target_gate_cancels_remaining_route_and_starts_align():
     cfg = LocalAnchorConfig(
         enable_align=True,
         classify_stable_frames=2,
@@ -427,8 +427,7 @@ def test_first_target_classification_cancels_remaining_route_and_starts_align():
     fsm.route_index = 0
     fsm._enter("CLASSIFY", 1.0, "test")
 
-    fsm.note_classification("banana", 0.2, True, 1.1)
-    fsm.note_classification("banana", 0.2, True, 1.2)
+    fsm.note_classification("banana", 0.8, True, 1.1, is_target=True)
 
     assert fsm.state == "ALIGN_SETTLE_INITIAL"
     assert fsm.route == [1]
@@ -456,6 +455,21 @@ def test_aligned_target_triggers_one_real_pick_then_completes():
     assert not fsm.tick(9.1, 0.0).request_pick
     assert fsm.state == "PICK_WAIT"
     fsm.tick(9.21, 0.0)
+    assert fsm.state == "COMPLETE"
+    assert target.status == "PICKED"
+
+
+def test_external_lift_phase_completes_pick_wait_immediately():
+    cfg = LocalAnchorConfig(enable_align=True, enable_pick=True, pick_duration_sec=9.0)
+    fsm = LocalAnchorFruitFsm(cfg)
+    target = candidate(1, 0)
+    target.status = "PICKING"
+    fsm.candidates = [target]
+    fsm.route = [1]
+    fsm._align_target_id = 1
+    fsm._enter("PICK_WAIT", 1.0, "arm running")
+
+    assert fsm.complete_pick_on_lift(2.0)
     assert fsm.state == "COMPLETE"
     assert target.status == "PICKED"
 

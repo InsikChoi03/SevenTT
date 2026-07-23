@@ -12,6 +12,12 @@ into one nearest-neighbour tracker in field-frame metres:
   • `/classification/siglip` — attaches the concrete fruit type to the most recent
     body-observed Set2 (fruit_photo_cube) track (SigLIP does fruit-type only; YOLO already
     established it is a fruit box).
+  • `/classification/siglip_wide_hint` (JSON String, see robot_perception.wide_fruit_hint)
+    — WIDE-cam SigLIP pre-reads with the wide pixel that produced the crop. Projected via
+    the existing wide projection and attached to the nearest Set2 track as a ROUTING HINT
+    only: a body-cam fruit label is never overwritten (source priority body > wide), and a
+    hint touches none of the pick-gate evidence fields (confidence / n_obs /
+    fruit_confidence / fruit_votes), so it can never satisfy the FSM's pick conditions.
 Also honours `/localization/pose` (robot pose) and `/world_model/blacklist_add`.
 
 Publishes `/world_model` (robot_interfaces/WorldModel) at a fixed rate. Uses no heavy ML;
@@ -30,8 +36,17 @@ from rclpy.node import Node
 from rcl_interfaces.msg import SetParametersResult
 
 from geometry_msgs.msg import PoseArray, PoseStamped, Vector3
-from std_msgs.msg import Bool, Float32MultiArray, UInt64
-from robot_interfaces.msg import BaseCommand, Classification, DetectionArray, Object, WorldModel
+from std_msgs.msg import Bool, Float32MultiArray, String, UInt64
+from robot_interfaces.msg import (
+    BaseCommand,
+    Classification,
+    DetectionArray,
+    MissionState,
+    Object,
+    WorldModel,
+)
+from robot_perception.spatial_siglip import parse_body_siglip_source
+from robot_perception.wide_fruit_hint import WIDE_FRUIT_HINT_TOPIC, parse_wide_hint
 
 # cv2/numpy only needed for the fisheye ray (top cam is a ~150 deg fisheye). Guarded so the
 # node still runs (pinhole path) if they are missing.
@@ -59,6 +74,48 @@ _LABEL_TO_SET_TYPE: dict[str, int] = {
 # The set of SigLIP-identified fruit names count as Set2 too (once a track's class_label is
 # promoted from fruit_photo_cube to the concrete fruit, keep it typed Set2).
 _FRUIT_LABELS = frozenset({"apple", "orange", "banana", "pineapple"})
+_LOCAL_ANCHOR_MISSION_STATES = frozenset(
+    {"LOCAL_ANCHOR_INSPECTION", "LOCAL_ANCHOR_ALIGN"}
+)
+
+
+def point_inside_axis_aligned_rect(
+    x: float,
+    y: float,
+    rect: list[float] | tuple[float, float, float, float],
+) -> bool:
+    """Return whether a base-frame point lies in an axis-aligned exclusion rectangle."""
+    if len(rect) != 4:
+        return False
+    x0, x1, y0, y1 = (float(value) for value in rect)
+    return min(x0, x1) <= float(x) <= max(x0, x1) and min(y0, y1) <= float(y) <= max(y0, y1)
+
+
+def point_inside_field_bounds(
+    x: float,
+    y: float,
+    bounds: list[float] | tuple[float, float, float, float],
+) -> bool:
+    """Return whether a finite field point lies inside [xmin, xmax, ymin, ymax]."""
+    if len(bounds) != 4 or not math.isfinite(x) or not math.isfinite(y):
+        return False
+    xmin, xmax, ymin, ymax = (float(value) for value in bounds)
+    return xmin <= x <= xmax and ymin <= y <= ymax
+
+
+def object_flow_min_pairs_for_state(
+    mission_state: str,
+    normal_min_pairs: int,
+    local_anchor_min_pairs: int,
+) -> int:
+    """Select the relaxed object-flow gate only during local-anchor inspection."""
+    state = str(mission_state).strip().upper()
+    selected = (
+        local_anchor_min_pairs
+        if state in _LOCAL_ANCHOR_MISSION_STATES
+        else normal_min_pairs
+    )
+    return max(1, int(selected))
 
 
 def resolve_recent_yolo_identity(
@@ -91,6 +148,26 @@ def resolve_recent_yolo_identity(
         best = max(shapes, key=shapes.get)
         return best, _LABEL_TO_SET_TYPE.get(best, 0)
     return "", 0
+
+
+def resolve_fruit_label_with_hint(
+    body_fruit_votes: dict,
+    wide_fruit_votes: dict,
+    set_type: int,
+) -> tuple[str, str]:
+    """
+    Best fruit label + its source with strict body-over-wide priority.
+
+    Body-cam SigLIP votes always win ("body"). Wide-cam hints fill the label ONLY for a
+    Set2 track with no body evidence ("wide"), and any track that is not (or no longer)
+    Set2 gets no hint at all — so a stale hint can never survive a re-classification.
+    """
+    if body_fruit_votes:
+        return max(body_fruit_votes, key=body_fruit_votes.get), "body"
+    if int(set_type) == 2 and wide_fruit_votes:
+        return max(wide_fruit_votes, key=wide_fruit_votes.get), "wide"
+    return "", ""
+
 
 # Identity is decided PER SOURCE (see Track.body_votes/wide_votes): the body cam is the close,
 # reliable camera, so when it has classified an object its confidence-summed vote wins outright;
@@ -154,6 +231,12 @@ class Track:
     seen_body: bool = False       # a body-cam (reliable) detection has updated this track
     fruit_label: str = ""         # concrete fruit from SigLIP once a face was read
     fruit_confidence: float = 0.0
+    # Where fruit_label came from: "body" (SigLIP on the body cam, pick-grade evidence) or
+    # "wide" (advisory routing hint from the wide cam — NEVER pick-grade). Wide-hint
+    # evidence lives in its own vote pool/confidence so it can never touch the body-side
+    # fruit_votes/fruit_confidence that feed the mission FSM's pick decision.
+    fruit_label_source: str = ""
+    wide_fruit_confidence: float = 0.0
     fruit_cube_seen: bool = False  # sticky Set2 evidence from a confident fruit_photo_cube box
     fruit_cube_confidence: float = 0.0
     fruit_cube_wide_hits: int = 0
@@ -170,6 +253,7 @@ class Track:
     # Recent confident YOLO labels in cross-camera arrival order.
     label_history: list[str] = field(default_factory=list)
     fruit_votes: dict = field(default_factory=dict)   # SigLIP fruit -> summed conf
+    wide_fruit_votes: dict = field(default_factory=dict)  # wide-hint fruit -> summed margin
     # Landmark anchoring: once a track is stable it LOCKS to a frozen world position, and
     # further re-observations are used to correct the ROBOT pose (not to move the track).
     locked: bool = False
@@ -202,6 +286,8 @@ class WorldModelNode(Node):
         self.declare_parameter("track_birth_enabled_initially", True)
         self.declare_parameter("track_birth_slot_radius_m", 0.22)
         self.declare_parameter("track_birth_require_slots", False)
+        # Reject projection glitches before they can become persistent off-field obstacles/tracks.
+        self.declare_parameter("track_field_bounds_m", [-2.0, 2.0, -2.0, 2.0])
 
         # Top-cam intrinsics (pixels). Any zero -> cannot project (warn, pose only).
         self.declare_parameter("top_fx", 0.0)
@@ -230,6 +316,13 @@ class WorldModelNode(Node):
         # only with yaw=180). Independent of image_rotated_180 (that is the optical-axis flip).
         self.declare_parameter("cam_yaw_deg", 0.0)
         self.declare_parameter("object_center_height_m", 0.04)  # ~8cm tall -> center 0.04
+        # Second-line defence for the camera/chassis/tray region.  The detector normally removes
+        # this fixed image ROI first; rejecting its projected base footprint here also protects
+        # relative observations and object-flow if detections arrive from another producer.
+        self.declare_parameter("wide_self_exclusion_enabled", False)
+        self.declare_parameter(
+            "wide_self_exclusion_rect_m", [-0.30, 0.08, -0.28, 0.28]
+        )
         # HEIGHT-PARALLAX correction: a ground homography assumes z=0, but the box-centre pixel of a
         # standing object is at object_center_height. Both cams anchor on the box CENTRE and correct
         # to the object's true ground centre: P = G - (h/H)(G - C_nadir). The low body cam (H≈0.145,
@@ -290,6 +383,7 @@ class WorldModelNode(Node):
         # Object-flow odometry (frame-to-frame wide-point scan matching).
         self.declare_parameter("object_flow", True)
         self.declare_parameter("object_flow_min_pairs", 4)       # need this many matched points to trust it
+        self.declare_parameter("local_anchor_object_flow_min_pairs", 3)
         self.declare_parameter("object_flow_assoc_m", 0.30)      # frame-to-frame NN gate (points barely move)
         self.declare_parameter("object_flow_max_dtheta", 0.5)    # reject a per-frame yaw jump beyond this (rad)
         self.declare_parameter("object_flow_trans_deadband_m", 0.008)  # sub-cm per-frame shift = noise -> 0 (no drift)
@@ -356,10 +450,21 @@ class WorldModelNode(Node):
         # identity, gets no protection, and is swallowed by a neighbouring high-conf cube track.
         self.declare_parameter("class_conf_threshold_body", 0.50)
         self.declare_parameter("plain_cube_confirm_observations", 5)
+        self.declare_parameter("body_siglip_assoc_radius_m", 0.18)
         self.declare_parameter("fruit_cube_sticky_enabled", False)
         self.declare_parameter("fruit_cube_sticky_conf_wide", 0.75)
         self.declare_parameter("fruit_cube_sticky_conf_body", 0.50)
         self.declare_parameter("fruit_cube_sticky_min_wide_hits", 3)
+        # --- Wide-cam SigLIP fruit HINTS (JSON String from siglip_gate_node's wide path).
+        # Advisory routing labels only: attached to the nearest Set2 track's fruit_label
+        # when no body-cam SigLIP evidence exists, touching NO pick-gate evidence field.
+        # The producer default is off (siglip wide_classify_enabled=false), so this
+        # consumer-side switch defaults on and the whole chain stays inert until the
+        # producer is enabled.
+        self.declare_parameter("wide_fruit_hint_enabled", True)
+        self.declare_parameter("wide_fruit_hint_assoc_radius_m", 0.35)
+        self.declare_parameter("wide_fruit_hint_min_margin", 0.10)
+        self.declare_parameter("wide_fruit_hint_max_age_sec", 1.5)
         # --- Negative evidence: an in-FOV object that is NOT seen loses presence ---
         # Camera coverage SHAPES (base_link, used for BOTH the negative-evidence "should be visible"
         # test and the map drawing): body = forward SECTOR (부채꼴) apex at the body cam; wide =
@@ -388,6 +493,24 @@ class WorldModelNode(Node):
         self.cam_offset_y = float(self.get_parameter("cam_offset_y").value)
         self.cam_yaw_deg = float(self.get_parameter("cam_yaw_deg").value)
         self.object_center_height = float(self.get_parameter("object_center_height_m").value)
+        self.wide_self_exclusion_enabled = bool(
+            self.get_parameter("wide_self_exclusion_enabled").value
+        )
+        self.wide_self_exclusion_rect = [
+            float(value)
+            for value in self.get_parameter("wide_self_exclusion_rect_m").value
+        ]
+        if (
+            len(self.wide_self_exclusion_rect) != 4
+            or not all(math.isfinite(value) for value in self.wide_self_exclusion_rect)
+            or self.wide_self_exclusion_rect[0] == self.wide_self_exclusion_rect[1]
+            or self.wide_self_exclusion_rect[2] == self.wide_self_exclusion_rect[3]
+        ):
+            self.get_logger().warn(
+                "wide_self_exclusion_rect_m must be a finite, non-empty "
+                "[xmin,xmax,ymin,ymax]; disabling"
+            )
+            self.wide_self_exclusion_enabled = False
         self.height_correct = bool(self.get_parameter("height_correct").value)
         self.body_cam_nadir_x = float(self.get_parameter("body_cam_nadir_x").value)
         self.body_cam_nadir_y = float(self.get_parameter("body_cam_nadir_y").value)
@@ -431,11 +554,26 @@ class WorldModelNode(Node):
         self.plain_cube_confirm_observations = min(
             32, max(1, int(self.get_parameter("plain_cube_confirm_observations").value))
         )
+        self.body_siglip_assoc_radius = max(
+            0.0, float(self.get_parameter("body_siglip_assoc_radius_m").value)
+        )
         self.fruit_cube_sticky_enabled = bool(self.get_parameter("fruit_cube_sticky_enabled").value)
         self.fruit_cube_sticky_conf_wide = float(self.get_parameter("fruit_cube_sticky_conf_wide").value)
         self.fruit_cube_sticky_conf_body = float(self.get_parameter("fruit_cube_sticky_conf_body").value)
         self.fruit_cube_sticky_min_wide_hits = int(
             self.get_parameter("fruit_cube_sticky_min_wide_hits").value
+        )
+        self.wide_fruit_hint_enabled = bool(
+            self.get_parameter("wide_fruit_hint_enabled").value
+        )
+        self.wide_fruit_hint_assoc_radius = max(
+            0.0, float(self.get_parameter("wide_fruit_hint_assoc_radius_m").value)
+        )
+        self.wide_fruit_hint_min_margin = float(
+            self.get_parameter("wide_fruit_hint_min_margin").value
+        )
+        self.wide_fruit_hint_max_age = max(
+            0.0, float(self.get_parameter("wide_fruit_hint_max_age_sec").value)
         )
         self.body_fov_half = math.radians(float(self.get_parameter("body_fov_half_deg").value))
         self.body_fov_near = float(self.get_parameter("body_fov_near_m").value)
@@ -467,6 +605,9 @@ class WorldModelNode(Node):
         self.landmark_heading_min_spread = float(self.get_parameter("landmark_heading_min_spread_m").value)
         self.object_flow = bool(self.get_parameter("object_flow").value)
         self.object_flow_min_pairs = int(self.get_parameter("object_flow_min_pairs").value)
+        self.local_anchor_object_flow_min_pairs = int(
+            self.get_parameter("local_anchor_object_flow_min_pairs").value
+        )
         self.object_flow_assoc = float(self.get_parameter("object_flow_assoc_m").value)
         self.object_flow_max_dtheta = float(self.get_parameter("object_flow_max_dtheta").value)
         self.object_flow_trans_deadband = float(self.get_parameter("object_flow_trans_deadband_m").value)
@@ -567,6 +708,20 @@ class WorldModelNode(Node):
         self.track_birth_require_slots = bool(
             self.get_parameter("track_birth_require_slots").value
         )
+        track_bounds = [
+            float(value) for value in self.get_parameter("track_field_bounds_m").value
+        ]
+        if (
+            len(track_bounds) != 4
+            or not all(math.isfinite(value) for value in track_bounds)
+            or track_bounds[0] > track_bounds[1]
+            or track_bounds[2] > track_bounds[3]
+        ):
+            self.get_logger().warn(
+                "track_field_bounds_m must be [xmin,xmax,ymin,ymax]; using [-2,2,-2,2]"
+            )
+            track_bounds = [-2.0, 2.0, -2.0, 2.0]
+        self.track_field_bounds = tuple(track_bounds)
         # Replaced atomically by the PoseArray callback. Slots are fixed field-frame xy positions.
         self._track_birth_slots: tuple[tuple[float, float], ...] = ()
         # Short robot-pose history (t, x, y, theta) so a detection can be projected at the ROBOT POSE
@@ -597,6 +752,9 @@ class WorldModelNode(Node):
         self.create_subscription(DetectionArray, "/camera_top/detections", self.on_detections, 10)
         self.create_subscription(DetectionArray, "/camera_body/detections", self.on_body_detections, 10)
         self.create_subscription(Classification, "/classification/siglip", self.on_siglip, 10)
+        self.create_subscription(
+            String, WIDE_FRUIT_HINT_TOPIC, self.on_wide_fruit_hint, 10
+        )
         self.create_subscription(PoseStamped, "/localization/pose", self.on_pose, 10)
         self.create_subscription(BaseCommand, "/base_command", self.on_base_command, 10)
         self.create_subscription(Bool, "/world_model/mapping_enabled", self.on_mapping_enabled, 10)
@@ -637,6 +795,10 @@ class WorldModelNode(Node):
         self._prev_wide_base_sec: float | None = None
         self._object_flow_samples: deque[ObjectFlowSample] = deque(maxlen=3)
         self._object_flow_drive_mode = "STOP"
+        self._mission_state = ""
+        self.create_subscription(
+            MissionState, "/mission_state", self.on_mission_state, 10
+        )
         self.timer = self.create_timer(1.0 / rate, self.tick)
 
         if not self.can_project:
@@ -653,6 +815,8 @@ class WorldModelNode(Node):
             f"mapping_enabled={self.mapping_enabled} "
             f"track_birth_enabled={self.track_birth_enabled} "
             f"track_birth_slot_radius={self.track_birth_slot_radius}m "
+            f"wide_self_exclusion={self.wide_self_exclusion_enabled}:"
+            f"{self.wide_self_exclusion_rect} "
             f"cam_h={self.cam_height}m pitch={self.cam_pitch_deg}deg yaw={self.cam_yaw_deg}deg "
             f"offset=({self.cam_offset_x},{self.cam_offset_y}) "
             f"arm_base_off=({self.arm_base_off_x},{self.arm_base_off_y}) body_ws={self.body_ws} "
@@ -922,6 +1086,10 @@ class WorldModelNode(Node):
             self._object_flow_drive_mode = mode
             self._object_flow_samples.clear()
 
+    def on_mission_state(self, msg: MissionState) -> None:
+        """Track the mission mode used by the state-scoped object-flow pair gate."""
+        self._mission_state = str(msg.state).strip().upper()
+
     def on_mapping_enabled(self, msg: Bool) -> None:
         enabled = bool(msg.data)
         if enabled == self.mapping_enabled:
@@ -1041,6 +1209,8 @@ class WorldModelNode(Node):
             )
             if not (math.isfinite(bx) and math.isfinite(by)):
                 continue
+            if self._wide_base_is_self(bx, by):
+                continue
 
             label = str(det.label)
             obj = Object()
@@ -1063,6 +1233,15 @@ class WorldModelNode(Node):
 
         relative.objects = objects
         self.pub_relative_wide.publish(relative)
+
+    def _wide_base_is_self(self, bx: float, by: float) -> bool:
+        """Whether a height-corrected wide observation is on the chassis/carry tray."""
+        return bool(
+            self.wide_self_exclusion_enabled
+            and point_inside_axis_aligned_rect(
+                float(bx), float(by), self.wide_self_exclusion_rect
+            )
+        )
 
     def on_detections(self, msg: DetectionArray) -> None:
         # Relative navigation consumes every camera frame independently of field-map gating.
@@ -1103,6 +1282,15 @@ class WorldModelNode(Node):
                 # the object's ground xy. (Body, being oblique/low, correctly uses the box bottom.)
                 base = self._wide_pixel_to_base(u_center, v_center)
                 if base is not None:
+                    corrected_base = self._height_correct(
+                        base[0],
+                        base[1],
+                        self.cam_offset_x,
+                        self.cam_offset_y,
+                        self.cam_height,
+                    )
+                    if self._wide_base_is_self(*corrected_base):
+                        continue
                     wide_base.append((base[0], base[1], label))
                 xy = self._project_wide_H(u_center, v_center, rpose)
             else:
@@ -1170,25 +1358,53 @@ class WorldModelNode(Node):
         self._maybe_publish_correction()
 
     def on_siglip(self, msg: Classification) -> None:
-        """Attach the concrete fruit (SigLIP argmax) to the most-recent body fruit track.
+        """Attach the concrete fruit to the Body track that produced the crop.
 
         SigLIP does fruit-TYPE only; YOLO already established the box is a fruit_photo_cube.
         msg.confidence is the softmax MARGIN over the runner-up fruit (bigger = more reliable) and
         is used directly as the vote weight, so a clear winner dominates and a near-tie barely
-        counts. Only record when a fruit FACE is actually visible (else it's a blank/edge face).
+        counts. New producers encode the source pixel in ``msg.source``; legacy untagged messages
+        retain the former recent-primary-track fallback.
         """
         fruit = str(msg.label)
         if fruit not in _FRUIT_LABELS:
             return
         if not msg.image_face_visible:      # no printed fruit face in view -> don't guess a type
             return
-        # Only attach if a body fruit-cube was detected RECENTLY: SigLIP runs a few frames behind the
-        # body detector, but a result arriving long after any fruit box left view would otherwise bind
-        # to a minutes-old _last_body_fruit_id (a different, possibly wrong, track). Stale -> drop.
-        if (self._last_body_fruit_id is None
-                or (self._now_sec() - self._last_body_fruit_sec) > self._fruit_attach_window):
+        now = self._now_sec()
+        capture_sec = self._stamp_to_sec(msg.header.stamp)
+        if capture_sec > 0.0 and now - capture_sec > self._fruit_attach_window:
             return
-        tid = self._last_body_fruit_id
+
+        tid: int | None = None
+        source_pixel = parse_body_siglip_source(msg.source)
+        if source_pixel is not None:
+            pose = self._pose_at(msg.header.stamp)
+            xy = self._project_body_pixel(source_pixel[0], source_pixel[1], pose)
+            if xy is None:
+                return
+            best_distance = self.body_siglip_assoc_radius
+            for candidate_id, candidate in self.tracks.items():
+                fruit_cube_evidence = bool(
+                    candidate.set_type == 2
+                    or candidate.body_votes.get("fruit_photo_cube", 0.0) > 0.0
+                    or candidate.wide_votes.get("fruit_photo_cube", 0.0) > 0.0
+                )
+                if candidate.blacklisted or not fruit_cube_evidence:
+                    continue
+                distance = math.hypot(candidate.x - xy[0], candidate.y - xy[1])
+                if distance <= best_distance:
+                    best_distance = distance
+                    tid = candidate_id
+        else:
+            # Compatibility for an older SigLIP producer without pixel provenance.
+            if (
+                self._last_body_fruit_id is None
+                or now - self._last_body_fruit_sec > self._fruit_attach_window
+            ):
+                return
+            tid = self._last_body_fruit_id
+
         tr = self.tracks.get(tid) if tid is not None else None
         if tr is None:
             return
@@ -1198,6 +1414,69 @@ class WorldModelNode(Node):
         tr.fruit_confidence = max(tr.fruit_confidence, float(msg.confidence))
         tr.set_type = 2
         self._refresh_identity(tr)
+
+    def _project_wide_hint_pixel(
+        self, u: float, v: float, stamp_sec: float
+    ) -> tuple[float, float] | None:
+        """Field xy for a wide-hint pixel at its capture-time pose (None = unusable/near)."""
+        pose = self._pose_at(self._sec_to_time_msg(stamp_sec))
+        if self._wide_H is not None:
+            base = self._wide_pixel_to_base(u, v)
+            if base is not None and self._in_body_fov_base(base[0], base[1]):
+                # Near field: the body cam owns identity there (wide is position-inaccurate
+                # and the body SigLIP path will read the face directly) -> no hint.
+                return None
+            return self._project_wide_H(u, v, pose)
+        return self._project_pixel(u, v, pose)
+
+    def on_wide_fruit_hint(self, msg: String) -> None:
+        """
+        Attach a wide-cam SigLIP pre-read to the nearest Set2 track as a ROUTING HINT.
+
+        GUARANTEES (mispick defence; the CLASSIFY body gate must stay the only pick
+        authority): a hint only ever touches wide_fruit_votes / wide_fruit_confidence /
+        fruit_label(+source). It never updates fruit_votes, fruit_confidence, confidence,
+        n_obs, n_body, seen_body or set_type, so the FSM conditions that guard picking
+        (track confidence / n_obs thresholds and the /classification/siglip CLASSIFY gate)
+        are unreachable from this path. A body-labelled track is left untouched entirely.
+        """
+        if not self.wide_fruit_hint_enabled or not self.mapping_enabled:
+            return
+        hint = parse_wide_hint(msg.data)
+        if hint is None or hint.label not in _FRUIT_LABELS:
+            return
+        if hint.confidence < self.wide_fruit_hint_min_margin:
+            return
+        now = self._now_sec()
+        if hint.stamp_sec > 0.0 and (now - hint.stamp_sec) > self.wide_fruit_hint_max_age:
+            return   # stale hint: the robot has moved on, the projection would mis-bind
+        xy = self._project_wide_hint_pixel(hint.u_px, hint.v_px, hint.stamp_sec)
+        if xy is None:
+            return
+        best_id: int | None = None
+        best_d = self.wide_fruit_hint_assoc_radius
+        for tid, tr in self.tracks.items():
+            if tr.blacklisted or tr.set_type != 2:
+                continue
+            if tr.fruit_votes:
+                continue   # body SigLIP already read this cube; a hint adds nothing
+            d = math.hypot(tr.x - xy[0], tr.y - xy[1])
+            if d <= best_d:
+                best_d = d
+                best_id = tid
+        if best_id is None:
+            return
+        tr = self.tracks[best_id]
+        tr.wide_fruit_votes[hint.label] = (
+            tr.wide_fruit_votes.get(hint.label, 0.0) + hint.confidence
+        )
+        tr.wide_fruit_confidence = max(tr.wide_fruit_confidence, hint.confidence)
+        self._refresh_identity(tr)
+        self.get_logger().info(
+            f"wide fruit hint: track={best_id} {hint.label} "
+            f"margin={hint.confidence:.2f} d={best_d:.2f}m",
+            throttle_duration_sec=2.0,
+        )
 
     def _project_body_pixel(self, u: float, v: float, pose=None) -> tuple[float, float] | None:
         """Body-cam pixel -> field xy. Prefers the base_link-metres ground H (aruco_calib);
@@ -1368,6 +1647,8 @@ class WorldModelNode(Node):
     def _track_birth_allowed(self, x: float, y: float) -> bool:
         """Return whether an unmatched field point may enter the new-track candidate pool."""
         if not self.track_birth_enabled:
+            return False
+        if not point_inside_field_bounds(x, y, self.track_field_bounds):
             return False
         slots = self._track_birth_slots
         if not slots:
@@ -1649,18 +1930,21 @@ class WorldModelNode(Node):
         if tr.fruit_votes:
             tr.class_label = max(tr.fruit_votes, key=tr.fruit_votes.get)
             tr.fruit_label = tr.class_label
+            tr.fruit_label_source = "body"
             tr.set_type = 2
             return
         arrival = tr.body_votes.get("arrival", 0.0) + tr.wide_votes.get("arrival", 0.0)
         if arrival > 0.0:
             tr.class_label = "arrival"
             tr.set_type = 3
+            self._apply_wide_fruit_hint(tr)
             return
         # Fruit-photo evidence is sticky: once a track has one sufficiently confident
         # fruit_photo_cube box, later plain cube votes must not demote it back to Set1.
         if tr.fruit_cube_seen:
             tr.class_label = "fruit_photo_cube"
             tr.set_type = 2
+            self._apply_wide_fruit_hint(tr)
             return
         label, set_type = resolve_recent_yolo_identity(
             tr.body_votes,
@@ -1670,6 +1954,23 @@ class WorldModelNode(Node):
         )
         tr.class_label = label
         tr.set_type = set_type
+        self._apply_wide_fruit_hint(tr)
+
+    def _apply_wide_fruit_hint(self, tr: Track) -> None:
+        """Fill/clear the advisory wide fruit hint on fruit_label (body evidence wins).
+
+        Only fruit_label/fruit_label_source are written — class_label stays whatever the
+        YOLO vote logic decided (a hint must not fake a body-grade identity), and none of
+        the pick-gate evidence fields (confidence, n_obs, fruit_confidence, fruit_votes)
+        are touched here.
+        """
+        label, source = resolve_fruit_label_with_hint(
+            tr.fruit_votes, tr.wide_fruit_votes, tr.set_type
+        )
+        if source == "body":
+            return   # unreachable from _refresh_identity's hint paths; defensive only
+        tr.fruit_label = label
+        tr.fruit_label_source = source
 
     # -------------------------------------------------------- landmark correction
     def _maybe_publish_correction(self) -> None:
@@ -1784,6 +2085,11 @@ class WorldModelNode(Node):
         vibration as rotation). Published [dtheta, dfwd, dleft, conf] in the robot frame.
         """
         now = self._now_sec()
+        min_pairs = object_flow_min_pairs_for_state(
+            self._mission_state,
+            self.object_flow_min_pairs,
+            self.local_anchor_object_flow_min_pairs,
+        )
         prev = self._prev_wide_base
         prev_sec = self._prev_wide_base_sec
         self._prev_wide_base = curr_base
@@ -1799,7 +2105,7 @@ class WorldModelNode(Node):
                 throttle_duration_sec=1.0,
             )
             return
-        if not self.object_flow or len(prev) < self.object_flow_min_pairs or len(curr_base) < self.object_flow_min_pairs:
+        if not self.object_flow or len(prev) < min_pairs or len(curr_base) < min_pairs:
             self._object_flow_samples.clear()
             return
         gate = self.object_flow_assoc
@@ -1821,7 +2127,7 @@ class WorldModelNode(Node):
                 used[best] = True
                 px, py, _ = prev[best]
                 pairs.append((px, py, qx, qy))
-        if len(pairs) < self.object_flow_min_pairs:
+        if len(pairs) < min_pairs:
             self._object_flow_samples.clear()
             return
         # Solve prev->curr, trim mismatches once by residual, re-solve.
@@ -1832,7 +2138,7 @@ class WorldModelNode(Node):
             c, s = math.cos(phi), math.sin(phi)
             resid = [math.hypot((c * p[0] - s * p[1] + tx) - p[2], (s * p[0] + c * p[1] + ty) - p[3]) for p in pairs]
             kept = [p for p, r in zip(pairs, resid) if r <= gate * 0.5]
-            if len(kept) < self.object_flow_min_pairs or len(kept) == len(pairs):
+            if len(kept) < min_pairs or len(kept) == len(pairs):
                 break
             pairs = kept
             phi, tx, ty = self._umeyama_2d(pairs)
@@ -1996,7 +2302,8 @@ class WorldModelNode(Node):
                     continue   # two confirmed, differently-classified anchors -> keep distinct
                 for pa, pb in ((ta.wide_votes, tb.wide_votes),
                                (ta.body_votes, tb.body_votes),
-                               (ta.fruit_votes, tb.fruit_votes)):
+                               (ta.fruit_votes, tb.fruit_votes),
+                               (ta.wide_fruit_votes, tb.wide_fruit_votes)):
                     for k, v in pb.items():
                         pa[k] = pa.get(k, 0.0) + v
                 history_limit = self.plain_cube_confirm_observations
@@ -2004,6 +2311,9 @@ class WorldModelNode(Node):
                 ta.label_history = merged_history[-history_limit:]
                 ta.confidence = max(ta.confidence, tb.confidence)
                 ta.fruit_confidence = max(ta.fruit_confidence, tb.fruit_confidence)
+                ta.wide_fruit_confidence = max(
+                    ta.wide_fruit_confidence, tb.wide_fruit_confidence
+                )
                 ta.fruit_cube_wide_hits += tb.fruit_cube_wide_hits
                 ta.fruit_cube_body_hits += tb.fruit_cube_body_hits
                 ta.fruit_cube_seen = ta.fruit_cube_seen or tb.fruit_cube_seen
@@ -2064,6 +2374,12 @@ class WorldModelNode(Node):
             obj.n_obs = int(tr.n_obs)
             obj.source = tr.source
             obj.fruit_label = tr.fruit_label
+            obj.fruit_confidence = float(
+                tr.fruit_confidence
+                if tr.fruit_label_source == "body"
+                else tr.wide_fruit_confidence
+            )
+            obj.fruit_label_source = tr.fruit_label_source
             obj.locked = bool(tr.locked)
             objects.append(obj)
         msg.objects = objects

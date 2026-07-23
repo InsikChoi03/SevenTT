@@ -241,6 +241,16 @@ class LocalAnchorFruitFsm:
         if detail:
             self.detail = detail
 
+    def complete_pick_on_lift(self, now: float) -> bool:
+        """Release the base as soon as the external arm sequencer reaches LIFT."""
+        if self.state != "PICK_WAIT":
+            return False
+        target = self._candidate_by_id(self._align_target_id)
+        if target is not None:
+            target.status = "PICKED"
+        self._enter("COMPLETE", now, "arm reached LIFT; base released while arm finishes")
+        return True
+
     def start(self, now: float, current_yaw: float = 0.0) -> None:
         """Reset all per-run state and begin the local inventory run."""
         self.candidates = []
@@ -513,8 +523,16 @@ class LocalAnchorFruitFsm:
         confidence: float,
         face_visible: bool,
         now: float,
+        *,
+        is_target: bool = False,
     ) -> None:
-        """Accumulate stable SigLIP results for the currently faced candidate."""
+        """Consume a fresh SigLIP result for the currently faced candidate.
+
+        The upstream ``is_target`` gate already requires today's fruit label, a
+        sufficient score margin, and a visible fruit face.  One such result is
+        enough to begin the reversible ALIGN motion; ordinary target-label and
+        non-target results retain the configured stable-frame accumulation.
+        """
         if self.state != "CLASSIFY" or not face_visible:
             return
         if float(confidence) < float(self.config.classify_min_confidence):
@@ -530,12 +548,23 @@ class LocalAnchorFruitFsm:
         candidate = self.active_candidate
         if candidate is not None:
             candidate.classification_hits = self._class_hits
+        target_label = self.config.target_fruit_label.strip().lower()
+        if (
+            bool(is_target)
+            and clean == target_label
+            and candidate is not None
+            and self.config.enable_align
+        ):
+            candidate.fruit_label = clean
+            candidate.status = "TARGET_FRUIT"
+            self._begin_target_align(candidate, now)
+            return
         if self._class_hits >= max(1, int(self.config.classify_stable_frames)):
             if candidate is not None:
                 candidate.fruit_label = clean
                 candidate.status = (
                     "TARGET_FRUIT"
-                    if clean == self.config.target_fruit_label.strip().lower()
+                    if clean == target_label
                     else "NON_TARGET_FRUIT"
                 )
                 if candidate.status == "TARGET_FRUIT" and self.config.enable_align:

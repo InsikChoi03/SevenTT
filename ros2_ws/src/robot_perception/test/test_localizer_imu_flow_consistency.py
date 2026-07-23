@@ -1,10 +1,12 @@
 import math
+from types import SimpleNamespace
 
 import numpy as np
 
 from robot_perception.nodes.localizer_node import (
     LocalizerNode,
     blend_flow_velocity_with_imu,
+    object_flow_min_conf_for_state,
 )
 
 
@@ -88,3 +90,24 @@ def test_toggle_off_returns_the_original_flow_exactly():
         -0.12,
         1.0,
     )
+
+
+def test_object_flow_confidence_gate_stays_strict_in_general_states():
+    for state in ("", "SCAN", "APPROACH", "ALIGN", "CLASSIFY"):
+        assert object_flow_min_conf_for_state(state, 0.25, 0.15) == 0.25
+
+
+def test_local_anchor_accepts_valid_three_point_flow_confidence():
+    for state in ("LOCAL_ANCHOR_INSPECTION", "LOCAL_ANCHOR_ALIGN"):
+        assert object_flow_min_conf_for_state(state, 0.25, 0.15) == 0.15
+
+
+def test_mission_state_callback_normalizes_localizer_profile_state():
+    node = SimpleNamespace(_mission_state="")
+
+    LocalizerNode.on_mission_state(
+        node,
+        SimpleNamespace(state=" local_anchor_align "),
+    )
+
+    assert node._mission_state == "LOCAL_ANCHOR_ALIGN"

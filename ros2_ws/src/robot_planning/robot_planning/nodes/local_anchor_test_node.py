@@ -379,6 +379,7 @@ class LocalAnchorTestNode(Node):
             float(msg.confidence),
             bool(msg.image_face_visible),
             self._now(),
+            is_target=bool(msg.is_target),
         )
 
     def _body_pixel_base(self, u: float, v: float) -> tuple[float, float] | None:

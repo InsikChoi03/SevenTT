@@ -218,6 +218,69 @@ _ANCHOR_SLOT_CODES = {
     "CHECKED": "C",
     "PICKED": "P",
 }
+
+
+def action_summary(
+    mission_state: str,
+    target_label: str = "",
+    target_id: int = 0,
+    target_set_type: int = 0,
+    arm_phase: str = "",
+) -> str:
+    """Translate internal FSM/arm states into one operator-facing current action."""
+    state = str(mission_state).strip().upper()
+    label = str(target_label).strip() or "target"
+    target = f"{label} #{int(target_id)}" if int(target_id) > 0 else label
+    arm = str(arm_phase).strip().upper()
+    if state in {"", "?", "STANDBY"}:
+        return "WAITING FOR START"
+    if state == "OPENING":
+        return "STARTUP MOVE / INITIALIZING MAP"
+    if state == "SCAN":
+        return "SEARCHING FIELD FOR TARGETS"
+    if state == "SELECT_TARGET":
+        return "CHOOSING NEXT TARGET"
+    if state == "APPROACH":
+        return f"DRIVING TO {target}"
+    if state == "ALIGN":
+        return f"FINE ALIGNMENT: {target}"
+    if state == "CLASSIFY":
+        if int(target_set_type) == 2:
+            return f"VERIFYING FRUIT WITH BODY SIGLIP: {target}"
+        if int(target_set_type) == 1:
+            return f"VERIFYING SHAPE AT GRIPPER: {target}"
+        return f"VERIFYING TARGET AT GRIPPER: {target}"
+    if state == "WAIT_FOR_ARM":
+        return "TARGET READY / WAITING FOR ARM"
+    if state == "PICK":
+        if arm and arm not in {"IDLE", "COMPLETE", "UNKNOWN"}:
+            return f"ARM {arm}: {target}"
+        return f"PICKING UP {target}"
+    if state == "STORE_IN_TRAY":
+        return "OBJECT SECURED / UPDATING INVENTORY"
+    if state == "LOCAL_ANCHOR_INSPECTION":
+        return "LOCAL 360 SEARCH / FRUIT INSPECTION"
+    if state == "ANCHOR_OBSERVE":
+        return "STOPPED / MAPPING ANCHOR OBJECTS"
+    if state == "ANCHOR_FACE_TARGET":
+        return "TURNING TOWARD ANCHOR TARGET"
+    if state == "ANCHOR_RETURN":
+        return "RETURNING TO ANCHOR CENTER"
+    if state == "ANCHOR_FACE_NEXT":
+        return "TURNING TOWARD NEXT ANCHOR"
+    if state == "ZONE_STABILIZE":
+        return "STOPPED / STABILIZING POSITION"
+    if state in {"WAIT_FOR_STORAGE", "DRIVE_TO_STORAGE"}:
+        return "DRIVING TO STORAGE AREA"
+    if state == "ALIGN_OVER_BIN":
+        return "ALIGNING OVER STORAGE BIN"
+    if state == "DUMP_ALL":
+        return "RELEASING STORED OBJECTS"
+    if state == "END":
+        return "MISSION COMPLETE"
+    return f"ACTIVE: {state.replace('_', ' ')}"
+
+
 _ZONE_COLORS = {
     1: (70, 120, 220),
     2: (60, 170, 120),
@@ -410,6 +473,32 @@ class RecognitionVizNode(Node):
         self.checkpoint_headings = [
             float(v) for v in self.get_parameter("checkpoint_route_heading_rad").value
         ]
+        self.declare_parameter("show_global_zigzag_route", False)
+        self.declare_parameter("global_zigzag_start_xy", [-1.80, 1.80])
+        self.declare_parameter(
+            "global_zigzag_waypoints_xy",
+            [-1.75, -1.25, -0.75, -1.25, -0.75, 1.25,
+             0.25, 1.25, 0.25, -1.25, 1.25, -1.25, 1.25, 1.25],
+        )
+        self.show_global_zigzag_route = bool(
+            self.get_parameter("show_global_zigzag_route").value
+        )
+        zigzag_start = [
+            float(v) for v in self.get_parameter("global_zigzag_start_xy").value
+        ]
+        self.global_zigzag_start = (
+            (zigzag_start[0], zigzag_start[1])
+            if len(zigzag_start) >= 2
+            else (-1.80, 1.80)
+        )
+        zigzag_xy = [
+            float(v) for v in self.get_parameter("global_zigzag_waypoints_xy").value
+        ]
+        self.global_zigzag_route = [
+            (zigzag_xy[i], zigzag_xy[i + 1])
+            for i in range(0, len(zigzag_xy) - 1, 2)
+        ]
+        self.global_zigzag_index = 0
         self.add_on_set_parameters_callback(self._on_parameters_changed)
         self.bridge = CvBridge() if _BRIDGE_AVAILABLE else None
 
@@ -464,6 +553,8 @@ class RecognitionVizNode(Node):
         self.current_anchor_id = 0
         self.siglip: Classification | None = None
         self.shape: Classification | None = None
+        self.arm_pick_phase = "IDLE"
+        self.latest_decision = ""
         # Latest raw camera image msgs + their detections (converted at draw time, ~redraw rate).
         self.top_img: Image | None = None
         self.body_img: Image | None = None
@@ -523,6 +614,7 @@ class RecognitionVizNode(Node):
         self.create_subscription(Int8, "/planning/phase", self.on_phase, 10)
         self.create_subscription(Int8, "/planning/zone", self.on_zone, 10)
         self.create_subscription(String, "/planning/decision", self.on_decision, 10)
+        self.create_subscription(String, "/arm/pick_sequence_phase", self.on_arm_phase, 10)
         self.create_subscription(String, "/planning/object_slots", self.on_object_slots, 10)
         self.create_subscription(Float32MultiArray, "/world_model/projected_dets", self.on_proj, 10)
         self.create_subscription(Float32MultiArray, "/localization/wall_segments",
@@ -653,10 +745,19 @@ class RecognitionVizNode(Node):
         self.zone = int(msg.data)
 
     def on_decision(self, msg: String) -> None:
-        self.decisions.append(f"[{time.time() - self._t0:5.0f}s] {msg.data}")
+        self.latest_decision = str(msg.data)
+        self.decisions.append(f"[{time.time() - self._t0:5.0f}s] {self.latest_decision}")
+        zigzag_match = re.match(
+            r"^GLOBAL\s+ZIGZAG\s+Z2-FIRST\s+(\d+)/(\d+)\b", msg.data
+        )
+        if zigzag_match:
+            self.global_zigzag_index = max(0, int(zigzag_match.group(1)) - 1)
         match = re.match(r"^ZONE\s+(\d+)\s+ENTRY\s+ANCHOR\s+A(\d+)/\d+\b", msg.data)
         if match:
             self.zone_entry_anchor_indices[int(match.group(1))] = int(match.group(2))
+
+    def on_arm_phase(self, msg: String) -> None:
+        self.arm_pick_phase = str(msg.data).strip().upper() or "UNKNOWN"
 
     def on_object_slots(self, msg: String) -> None:
         try:
@@ -949,6 +1050,7 @@ class RecognitionVizNode(Node):
         self._draw_object_grid_points(canvas)
         self._draw_zone_anchors(canvas)
         self._draw_checkpoint_route(canvas)
+        self._draw_global_zigzag_route(canvas)
         self._draw_wall_raw_segments(canvas)
         self._draw_wall_segments(canvas)
         self._draw_fov(canvas)                       # camera coverage under the objects
@@ -961,6 +1063,7 @@ class RecognitionVizNode(Node):
         else:
             self._draw_slots(canvas)
         self._draw_proj(canvas)   # raw per-camera homography projections on top
+        self._draw_action_banner(canvas)
         self._draw_hud(canvas)
         self._draw_decisions(canvas)
         self._draw_legend(canvas)
@@ -1178,6 +1281,33 @@ class RecognitionVizNode(Node):
             cv2.putText(canvas, f"P{i}", (px + 11, py - 9),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.42, _COL_ROUTE, 1, cv2.LINE_AA)
 
+    def _draw_global_zigzag_route(self, canvas) -> None:
+        """Draw the configured Z2-first sweep, highlighting the next required waypoint."""
+        if not self.show_global_zigzag_route or not self.global_zigzag_route:
+            return
+        route = [self.global_zigzag_start] + self.global_zigzag_route
+        pts = [self._w2p(x, y) for x, y in route]
+        active = max(0, min(self.global_zigzag_index, len(self.global_zigzag_route) - 1))
+        for segment in range(len(pts) - 1):
+            if segment < active:
+                color, thickness = (105, 105, 105), 2
+            elif segment == active:
+                color, thickness = (0, 230, 255), 4
+            else:
+                color, thickness = (255, 180, 30), 2
+            cv2.arrowedLine(
+                canvas, pts[segment], pts[segment + 1], color, thickness,
+                cv2.LINE_AA, tipLength=0.08,
+            )
+        for index, (px, py) in enumerate(pts[1:]):
+            color = (0, 230, 255) if index == active else (255, 180, 30)
+            cv2.circle(canvas, (px, py), 7, color, 2, cv2.LINE_AA)
+            label = "Z2" if index == 0 else f"G{index + 1}"
+            cv2.putText(
+                canvas, label, (px + 9, py - 7), cv2.FONT_HERSHEY_SIMPLEX,
+                0.38, color, 1, cv2.LINE_AA,
+            )
+
     def _draw_trail(self, canvas) -> None:
         pts = [self._w2p(x, y) for (x, y) in self.trail]
         for i in range(1, len(pts)):
@@ -1360,6 +1490,82 @@ class RecognitionVizNode(Node):
         cv2.circle(canvas, (px, py), 7, _COL_ROBOT, -1)
         cv2.arrowedLine(canvas, (px, py), (hx, hy), _COL_ROBOT, 2, tipLength=0.35)
 
+    @staticmethod
+    def _fit_overlay_text(text: str, width_px: int, scale: float, thickness: int) -> str:
+        """Ellipsize an overlay string to a pixel width instead of a brittle char count."""
+        clean = " ".join(str(text).split())
+        if cv2.getTextSize(clean, cv2.FONT_HERSHEY_SIMPLEX, scale, thickness)[0][0] <= width_px:
+            return clean
+        suffix = "..."
+        while clean and cv2.getTextSize(
+            clean + suffix, cv2.FONT_HERSHEY_SIMPLEX, scale, thickness
+        )[0][0] > width_px:
+            clean = clean[:-1]
+        return clean.rstrip() + suffix
+
+    def _current_action_target(self) -> tuple[str, int, int]:
+        """Return the current/selected target label, id, and set for the operator banner."""
+        obj = self._lookup(self.current_target_id) or self._lookup(self.selected_id)
+        if obj is None:
+            return "", 0, 0
+        label = str(obj.fruit_label or obj.class_label or "target")
+        return label, int(obj.id), int(obj.set_type)
+
+    def _draw_action_banner(self, canvas) -> None:
+        """Large, stable HUD line answering the operator's question: what is it doing now?"""
+        label, target_id, set_type = self._current_action_target()
+        headline = action_summary(
+            self.mission_state,
+            label,
+            target_id,
+            set_type,
+            self.arm_pick_phase,
+        )
+        headline = self._fit_overlay_text(headline, self.canvas_px - 28, 0.68, 2)
+        detail_source = (
+            f"DETAIL: {self.latest_decision}"
+            if self.latest_decision
+            else "DETAIL: waiting for FSM update"
+        )
+        detail = self._fit_overlay_text(
+            detail_source,
+            self.canvas_px - 28,
+            0.40,
+            1,
+        )
+        state = str(self.mission_state).strip().upper()
+        accent = (80, 220, 80)
+        if state in {"STANDBY", "ZONE_STABILIZE", "ANCHOR_OBSERVE"}:
+            accent = (255, 200, 80)
+        elif state in {"CLASSIFY", "ALIGN"}:
+            accent = (0, 220, 255)
+        elif state in {"PICK", "STORE_IN_TRAY", "DUMP_ALL"}:
+            accent = (255, 80, 255)
+        elif state == "END":
+            accent = (180, 180, 180)
+        cv2.rectangle(canvas, (0, 0), (self.canvas_px, 62), (8, 8, 8), -1)
+        cv2.rectangle(canvas, (0, 0), (6, 62), accent, -1)
+        cv2.putText(
+            canvas,
+            f"NOW: {headline}",
+            (14, 27),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.68,
+            accent,
+            2,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            canvas,
+            detail,
+            (14, 51),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.40,
+            _COL_TEXT,
+            1,
+            cv2.LINE_AA,
+        )
+
     def _draw_hud(self, canvas) -> None:
         n_obj = len(self.world.objects) if self.world is not None else 0
         n_bl = sum(1 for o in self.world.objects if o.blacklisted) if self.world is not None else 0
@@ -1434,7 +1640,7 @@ class RecognitionVizNode(Node):
                 f"siglip: {self.siglip.label} {self.siglip.confidence:.2f} "
                 f"face={int(bool(self.siglip.image_face_visible))}"
             )
-        y = 18
+        y = 82
         for ln in lines:
             cv2.putText(canvas, ln, (8, y), cv2.FONT_HERSHEY_SIMPLEX, 0.45, _COL_TEXT, 1,
                         cv2.LINE_AA)

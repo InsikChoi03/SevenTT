@@ -24,9 +24,26 @@ WS=/home/seventt/seventt/workspace
 RUN_ROOT="$WS/data/mock_field_test"
 PID_FILE="$RUN_ROOT/.main_run.pid"
 mkdir -p "$RUN_ROOT"
+
+# Keep this launcher isolated from stale shells.  A previous accidental top-level
+# build created "$WS/install"; if that prefix remains in AMENT/PYTHON paths, ROS 2
+# can launch old nodes/configs even after rebuilding ros2_ws/install.
+unset AMENT_PREFIX_PATH CMAKE_PREFIX_PATH COLCON_PREFIX_PATH PYTHONPATH LD_LIBRARY_PATH
 source /opt/ros/humble/setup.bash
 source "$WS/ros2_ws/install/setup.bash"
 set -u
+
+for REQUIRED_PKG in robot_bringup robot_hardware robot_control robot_perception robot_planning; do
+  PKG_PREFIX="$(ros2 pkg prefix "$REQUIRED_PKG")"
+  case "$PKG_PREFIX" in
+    "$WS/ros2_ws/install/"*) ;;
+    *)
+      echo "ERROR: $REQUIRED_PKG resolved to stale prefix: $PKG_PREFIX" >&2
+      echo "       expected under: $WS/ros2_ws/install" >&2
+      exit 1
+      ;;
+  esac
+done
 
 echo "== preflight =="
 # Stop the prior detached launch process first. Killing only its camera children lets ros2 launch

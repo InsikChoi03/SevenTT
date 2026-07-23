@@ -19,6 +19,7 @@ advertises all topics, logs one error, and the image callbacks early-return.
 """
 from __future__ import annotations
 
+import math
 import threading
 from typing import Any
 
@@ -30,7 +31,6 @@ from rclpy.qos import (
     HistoryPolicy,
     QoSProfile,
     ReliabilityPolicy,
-    qos_profile_sensor_data,
 )
 from sensor_msgs.msg import Image
 from std_msgs.msg import Header, String
@@ -54,6 +54,59 @@ COMPETITION_QOS = QoSProfile(
     reliability=ReliabilityPolicy.RELIABLE,
     durability=DurabilityPolicy.TRANSIENT_LOCAL,
 )
+
+# Inference is intentionally slower than the 30 fps CSI publishers.  A normal
+# sensor-data subscription retains five unread images, which makes the detector
+# spend GPU time on old frames after each prediction.  Keep only the newest
+# unread image for each camera instead.
+LATEST_IMAGE_QOS = QoSProfile(
+    history=HistoryPolicy.KEEP_LAST,
+    depth=1,
+    reliability=ReliabilityPolicy.BEST_EFFORT,
+    durability=DurabilityPolicy.VOLATILE,
+)
+
+
+def image_capture_age_sec(
+    now_s: float, stamp_sec: int, stamp_nanosec: int
+) -> float | None:
+    """Return capture age, or None when a source did not provide a timestamp."""
+    capture_s = float(stamp_sec) + float(stamp_nanosec) * 1e-9
+    if capture_s <= 0.0:
+        return None
+    return float(now_s) - capture_s
+
+
+def image_is_fresh_for_inference(
+    now_s: float,
+    stamp_sec: int,
+    stamp_nanosec: int,
+    max_age_sec: float,
+    future_tolerance_sec: float = 0.25,
+) -> bool:
+    """Reject queued/clock-invalid images before they consume an inference slot."""
+    age = image_capture_age_sec(now_s, stamp_sec, stamp_nanosec)
+    if age is None:
+        return True
+    return -max(0.0, float(future_tolerance_sec)) <= age <= max(
+        0.0, float(max_age_sec)
+    )
+
+
+def center_inside_normalized_rect(
+    x_center: float,
+    y_center: float,
+    image_width: int,
+    image_height: int,
+    rect: list[float] | tuple[float, float, float, float],
+) -> bool:
+    """Return whether a detection centre lies inside a normalized image rectangle."""
+    if image_width <= 0 or image_height <= 0 or len(rect) != 4:
+        return False
+    x0, y0, x1, y1 = (float(value) for value in rect)
+    u = float(x_center) / float(image_width)
+    v = float(y_center) / float(image_height)
+    return min(x0, x1) <= u <= max(x0, x1) and min(y0, y1) <= v <= max(y0, y1)
 
 
 class YoloDetectorNode(Node):
@@ -79,6 +132,16 @@ class YoloDetectorNode(Node):
         self.declare_parameter("device", "auto")
         self.declare_parameter("top_min_interval_sec", 0.12)    # ~8 Hz
         self.declare_parameter("body_min_interval_sec", 0.06)   # ~16 Hz
+        # A stale frame is worse than a dropped frame while the robot is rotating:
+        # its object coordinates describe an old heading.  Run this guard before
+        # cv_bridge/YOLO so the next depth-1 sample can replace it immediately.
+        self.declare_parameter("max_input_age_sec", 0.25)
+        # The down-looking wide camera sees the robot chassis and its carry tray at a fixed
+        # image location.  Detections there move with the camera, so publishing them as floor
+        # objects creates a trail of impossible targets while the robot drives.  Filter results
+        # (not pixels before inference) so objects outside the self region keep their full image.
+        self.declare_parameter("top_self_mask_enabled", False)
+        self.declare_parameter("top_self_mask_rect", [0.34, 0.25, 0.66, 0.88])
         # Republish the best body detection as /classification/shape (replaces shape_heuristic).
         self.declare_parameter("publish_shape_classification", True)
         self.declare_parameter("shape_topic", "/classification/shape")
@@ -97,6 +160,27 @@ class YoloDetectorNode(Node):
         self.half = bool(self.get_parameter("half").value)
         self.top_min_interval = float(self.get_parameter("top_min_interval_sec").value)
         self.body_min_interval = float(self.get_parameter("body_min_interval_sec").value)
+        self.max_input_age_sec = max(
+            0.0, float(self.get_parameter("max_input_age_sec").value)
+        )
+        self.top_self_mask_enabled = bool(
+            self.get_parameter("top_self_mask_enabled").value
+        )
+        self.top_self_mask_rect = [
+            float(value) for value in self.get_parameter("top_self_mask_rect").value
+        ]
+        if (
+            len(self.top_self_mask_rect) != 4
+            or not all(math.isfinite(value) for value in self.top_self_mask_rect)
+            or not all(0.0 <= value <= 1.0 for value in self.top_self_mask_rect)
+            or self.top_self_mask_rect[0] == self.top_self_mask_rect[2]
+            or self.top_self_mask_rect[1] == self.top_self_mask_rect[3]
+        ):
+            self.get_logger().warn(
+                "top_self_mask_rect must be a finite, non-empty normalized "
+                "[x0,y0,x1,y1]; disabling self mask"
+            )
+            self.top_self_mask_enabled = False
         self.publish_shape = bool(self.get_parameter("publish_shape_classification").value)
         cam = str(self.get_parameter("camera").value).lower()
         self._want_top = cam in ("top", "both")
@@ -133,10 +217,10 @@ class YoloDetectorNode(Node):
         # SENSOR_DATA QoS must match the camera publisher (BEST_EFFORT) or no frames arrive.
         if self._want_top:
             self.create_subscription(Image, "/camera_top/image_raw", self.on_top_image,
-                                     qos_profile_sensor_data)
+                                     LATEST_IMAGE_QOS)
         if self._want_body:
             self.create_subscription(Image, "/camera_body/image_raw", self.on_body_image,
-                                     qos_profile_sensor_data)
+                                     LATEST_IMAGE_QOS)
         self.create_subscription(
             String, "/competition/state", self.on_competition_state, COMPETITION_QOS
         )
@@ -148,7 +232,8 @@ class YoloDetectorNode(Node):
             f"body_model='{self.body_model_path if self._want_body else '-'}' "
             f"device={self.device} conf={self.conf_threshold} "
             f"imgsz(top={self.top_imgsz},body={self.body_imgsz}) "
-            f"shape_pub={self.publish_shape}"
+            f"shape_pub={self.publish_shape} "
+            f"top_self_mask={self.top_self_mask_enabled}:{self.top_self_mask_rect}"
         )
 
     # ------------------------------------------------------------------ setup
@@ -202,6 +287,8 @@ class YoloDetectorNode(Node):
         now = self._now_sec()
         if (now - self._last_top) < self.top_min_interval:
             return
+        if not self._image_is_fresh(msg, now, "top"):
+            return
         self._last_top = now
         self._process(msg, "camera_top", self.pub_top, self.top_model, self.top_imgsz)
 
@@ -211,10 +298,31 @@ class YoloDetectorNode(Node):
         now = self._now_sec()
         if (now - self._last_body) < self.body_min_interval:
             return
+        if not self._image_is_fresh(msg, now, "body"):
+            return
         self._last_body = now
         arr = self._process(msg, "camera_body", self.pub_body, self.body_model, self.body_imgsz)
         if arr is not None and self.pub_shape is not None:
             self._publish_shape(arr)
+
+    def _image_is_fresh(self, msg: Image, now: float, stream: str) -> bool:
+        """Drop an old queued image before conversion or GPU inference."""
+        stamp = msg.header.stamp
+        if image_is_fresh_for_inference(
+            now,
+            int(stamp.sec),
+            int(stamp.nanosec),
+            self.max_input_age_sec,
+        ):
+            return True
+        age = image_capture_age_sec(now, int(stamp.sec), int(stamp.nanosec))
+        assert age is not None
+        self.get_logger().warn(
+            f"dropping stale {stream} image before inference age={age:.2f}s "
+            f"limit={self.max_input_age_sec:.2f}s",
+            throttle_duration_sec=2.0,
+        )
+        return False
 
     def _process(self, msg: Image, frame_id: str, pub, model: Any | None,
                  imgsz: int) -> DetectionArray | None:
@@ -239,6 +347,25 @@ class YoloDetectorNode(Node):
             return None
 
         arr = self._build_array(results, frame_id, msg.header.stamp)
+        if frame_id == "camera_top" and self.top_self_mask_enabled:
+            before = len(arr.detections)
+            arr.detections = [
+                det
+                for det in arr.detections
+                if not center_inside_normalized_rect(
+                    det.x_center,
+                    det.y_center,
+                    frame.shape[1],
+                    frame.shape[0],
+                    self.top_self_mask_rect,
+                )
+            ]
+            dropped = before - len(arr.detections)
+            if dropped:
+                self.get_logger().info(
+                    f"top self-mask dropped {dropped} chassis/tray detection(s)",
+                    throttle_duration_sec=2.0,
+                )
         pub.publish(arr)
         return arr
 

@@ -62,7 +62,10 @@ unsigned long lastOdom = 0, lastEncDebug = 0;
 
 // ---- 팔 (2R: ch0 어깨, ch1 손목, ch2 그리퍼) ----
 const int US_MIN = 500, US_MAX = 2500;
-const float MAX_STEP = 2.0;          // deg/update(30ms) ≈ 67 deg/s 속도제한
+// MG996R @ measured 6.05V is rated about 400deg/s no-load.  Keep the loaded
+// shoulder slower while allowing the wrist and gripper to close at about 30%.
+// ch0 shoulder=80deg/s(~20%), ch1 wrist=120deg/s(~30%), ch2 grip=120deg/s(~30%).
+const float MAX_STEP[3] = { 2.4, 3.6, 3.6 };  // deg/update(30ms)
 const unsigned long UPDATE_MS = 30;
 float curA[3], tgtA[3];
 int lastWritten[3] = { -1, -1, -1 };
@@ -471,8 +474,8 @@ void loop() {
     lastUpd = now;
     for (int i = 0; i < 3; i++) {
       float d = tgtA[i] - curA[i];
-      if (d > MAX_STEP) d = MAX_STEP;
-      if (d < -MAX_STEP) d = -MAX_STEP;
+      if (d > MAX_STEP[i]) d = MAX_STEP[i];
+      if (d < -MAX_STEP[i]) d = -MAX_STEP[i];
       curA[i] += d;
       int deg = (int)(curA[i] + 0.5);
       if (deg != lastWritten[i]) { writeServo(i, curA[i]); lastWritten[i] = deg; }

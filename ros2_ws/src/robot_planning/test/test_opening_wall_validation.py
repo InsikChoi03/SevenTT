@@ -9,6 +9,8 @@ class _Logger:
 class _OpeningStub:
     _opening_leg = "heading_observe"
     opening_wall_validation_enabled = False
+    opening_explore_while_moving = False
+    global_target_mode = True
     opening_heading_observe_sec = 1.2
     _opening_wall_heading_valid = True
     _wall_translation_unlocked = False
@@ -56,6 +58,45 @@ def test_disabled_wall_validation_releases_opening_without_wall_debug():
     assert node._opening_wall_heading_valid is False
     assert node._wall_translation_unlocked is True
     assert node.mapping_events[-1] == (True, "opening wall validation disabled")
+
+
+class _MovingOpeningStub(_OpeningStub):
+    _opening_leg = "turn_cw"
+    opening_explore_while_moving = True
+    opening_turn_tolerance_rad = 0.06
+    opening_turn_deg = 90.0
+    opening_turn_omega = -0.30
+    opening_turn_timeout_sec = 7.0
+    _opening_turn_target = 0.0
+    _opening_wall_heading_valid = True
+    _wall_translation_unlocked = False
+
+    def __init__(self):
+        super().__init__(elapsed=0.5)
+        self.world = type("World", (), {"robot_theta": 0.0})()
+        self.decisions = []
+        self.entered = []
+
+    def _decide(self, text):
+        self.decisions.append(text)
+
+    def _enter(self, state):
+        self.entered.append(state)
+
+    def _wrap_pi(self, angle):
+        return MissionFsmNode._wrap_pi(angle)
+
+
+def test_moving_opening_maps_during_motion_and_skips_stationary_scan():
+    node = _MovingOpeningStub()
+
+    MissionFsmNode._step_opening(node)
+
+    assert node.mapping_events[0] == (True, "opening moving exploration")
+    assert node.entered == ["SCAN"]
+    assert node._opening_wall_heading_valid is False
+    assert node._wall_translation_unlocked is True
+    assert node.decisions == ["OPENING ENTRY COMPLETE -> SELECT LIVE TARGETS"]
 
 
 def test_zone_stabilize_reuses_fast_translation_only_wall_correction():

@@ -27,7 +27,7 @@ from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription
 from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
-from launch.substitutions import LaunchConfiguration
+from launch.substitutions import LaunchConfiguration, OrSubstitution
 from launch_ros.actions import Node
 from launch_ros.descriptions import ParameterValue
 
@@ -60,12 +60,44 @@ def _checkpoint_route_overrides(path: str) -> dict:
     return out
 
 
+def _yaml_bool_parameter(
+    path: str,
+    node_name: str,
+    parameter_name: str,
+    default: bool = False,
+) -> bool:
+    """Read one boolean used to decide which optional nodes the launch must start."""
+    if yaml is None or not path or not os.path.exists(path):
+        return bool(default)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+        value = data[node_name]["ros__parameters"][parameter_name]
+    except (OSError, TypeError, KeyError, yaml.YAMLError):
+        return bool(default)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "1", "yes", "on"}:
+            return True
+        if normalized in {"false", "0", "no", "off"}:
+            return False
+    return bool(default)
+
+
 def generate_launch_description() -> LaunchDescription:
     bringup_share = get_package_share_directory("robot_bringup")
     launch_dir = os.path.join(bringup_share, "launch")
     default_params = os.path.join(bringup_share, "config", "test_field.yaml")
     default_tuning = os.path.join(bringup_share, "config", "motion_tuning.yaml")
     route_overlay = _checkpoint_route_overrides(default_tuning)
+    storage_wall_guided_default = _yaml_bool_parameter(
+        default_tuning,
+        "mission_fsm_node",
+        "storage_wall_guided_enabled",
+        False,
+    )
     params = LaunchConfiguration("params_file")
     motion_tuning = LaunchConfiguration("motion_tuning_file")
 
@@ -74,6 +106,9 @@ def generate_launch_description() -> LaunchDescription:
     with_siglip = LaunchConfiguration("with_siglip")
     with_arm = LaunchConfiguration("with_arm")     # 2R pick_sequencer (real grasp via combined board)
     with_wall_localizer = LaunchConfiguration("with_wall_localizer")
+    storage_wall_guided_enabled = LaunchConfiguration(
+        "storage_wall_guided_enabled"
+    )
     grid_prior_enabled = LaunchConfiguration("grid_prior_enabled")
     grid_track_lock_enabled = LaunchConfiguration("grid_track_lock_enabled")
     localizer_initial_theta = LaunchConfiguration("localizer_initial_theta")
@@ -102,14 +137,25 @@ def generate_launch_description() -> LaunchDescription:
                               description="start siglip_gate (fruit type); false saves VRAM"),
         DeclareLaunchArgument("with_arm", default_value="true",
                               description="start 2R pick_sequencer (real grasp); needs with_base (shares ttyUSB0)"),
-        DeclareLaunchArgument("with_wall_localizer", default_value="true",
+        DeclareLaunchArgument("with_wall_localizer", default_value="false",
                               description="use arena wall/floor lines as absolute pose correction"),
+        DeclareLaunchArgument(
+            "storage_wall_guided_enabled",
+            default_value="true" if storage_wall_guided_default else "false",
+            description=(
+                "single storage-mode switch: start wall perception and use measured wall "
+                "distances for the final storage return"
+            ),
+        ),
         DeclareLaunchArgument("grid_prior_enabled", default_value="true",
                               description="enable 7x6 object grid soft-prior in world_model"),
         DeclareLaunchArgument("grid_track_lock_enabled", default_value="true",
                               description="lock confirmed game-object tracks to field grid points"),
-        DeclareLaunchArgument("localizer_initial_theta", default_value="0.0",
-                              description="initial robot heading override for localizer_node"),
+        DeclareLaunchArgument(
+            "localizer_initial_theta",
+            default_value="0.0",
+            description="initial robot heading: 0 rad points toward waypoint 1 along field +x",
+        ),
         DeclareLaunchArgument("params_file", default_value=default_params,
                               description="YAML parameter file for stationary field testing"),
         DeclareLaunchArgument("motion_tuning_file", default_value=default_tuning,
@@ -138,7 +184,9 @@ def generate_launch_description() -> LaunchDescription:
                         grid_track_lock_enabled, value_type=bool
                     )}),
         node("robot_perception", "wall_localizer_node", "wall_localizer_node",
-             condition=IfCondition(with_wall_localizer),
+             condition=IfCondition(
+                 OrSubstitution(with_wall_localizer, storage_wall_guided_enabled)
+             ),
              extra={"image_rotated_180": ParameterValue(rot180, value_type=bool)}),
         node("robot_perception", "recognition_viz_node", "recognition_viz_node",
              extra={"output_dir": output_dir, **route_overlay}),
@@ -146,7 +194,12 @@ def generate_launch_description() -> LaunchDescription:
         node("robot_planning", "target_selector_node", "target_selector_node",
              condition=IfCondition(with_fsm)),
         node("robot_planning", "mission_fsm_node", "mission_fsm_node",
-             condition=IfCondition(with_fsm)),
+             condition=IfCondition(with_fsm),
+             extra={
+                 "storage_wall_guided_enabled": ParameterValue(
+                     storage_wall_guided_enabled, value_type=bool
+                 )
+             }),
         # SigLIP fruit-type gate (optional, VRAM-heavy)
         node("robot_perception", "siglip_gate_node", "siglip_gate_node",
              condition=IfCondition(with_siglip)),

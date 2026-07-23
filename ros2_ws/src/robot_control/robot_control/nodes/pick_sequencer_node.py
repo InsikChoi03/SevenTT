@@ -19,7 +19,31 @@ from __future__ import annotations
 
 import rclpy
 from rclpy.node import Node
-from std_msgs.msg import Bool, Float32MultiArray
+from std_msgs.msg import Bool, Float32MultiArray, String
+
+
+def required_joint_move_sec(
+    start: tuple[float, float, float],
+    target: tuple[float, float, float],
+    speed_dps: tuple[float, float, float],
+) -> float:
+    """Return the minimum command-ramp time for per-channel firmware limits."""
+    if len(speed_dps) != 3 or any(speed <= 0.0 for speed in speed_dps):
+        raise ValueError("servo_speed_dps_by_channel must contain three positive values")
+    return max(abs(target[i] - start[i]) / speed_dps[i] for i in range(3))
+
+
+def step_command_pose(
+    name: str,
+    start: tuple[float, float, float],
+    target: tuple[float, float, float],
+    progress: float,
+) -> tuple[float, float, float]:
+    """Return an immediate GRASP target or a normal host-ramped move target."""
+    if name == "GRASP":
+        return target
+    u = max(0.0, min(1.0, progress))
+    return tuple(start[i] + (target[i] - start[i]) * u for i in range(3))
 
 
 class PickSequencerNode(Node):
@@ -27,16 +51,20 @@ class PickSequencerNode(Node):
         super().__init__("pick_sequencer_node")
 
         # 2R verified poses (re-taught 2026-07-08). Servo degrees.
-        self.declare_parameter("init_pose", [110.0, 10.0, 100.0])   # shoulder, wrist, gripper (verified idle)
+        self.declare_parameter("init_pose", [120.0, 5.0, 100.0])
         self.declare_parameter("pick_shoulder_wrist", [25.0, 150.0])
         self.declare_parameter("place_shoulder_wrist", [110.0, 30.0])
-        self.declare_parameter("grip_open", 115.0)
-        self.declare_parameter("grip_closed", 50.0)
-        self.declare_parameter("move_sec", 2.5)     # dwell for an arm move (>= firmware smooth time)
-        self.declare_parameter("grasp_sec", 0.7)    # dwell for a gripper open/close
-        self.declare_parameter("preopen_sec", 0.25)  # open gripper before lowering so it won't snag
-        self.declare_parameter("pick_settle_sec", 0.25)  # hold PICK fully open before closing
-        self.declare_parameter("servo_speed_dps", 60.0)  # conservative firmware speed estimate
+        self.declare_parameter("grip_open", 118.0)
+        self.declare_parameter("grip_closed", 40.0)
+        self.declare_parameter("move_sec", 1.3)  # accepted for legacy parameter files
+        self.declare_parameter("reach_lift_sec", 1.3)
+        self.declare_parameter("to_place_sec", 1.25)
+        self.declare_parameter("stow_sec", 1.0)
+        self.declare_parameter("grasp_sec", 0.75)
+        self.declare_parameter("preopen_sec", 0.20)
+        self.declare_parameter("pick_settle_sec", 0.0)
+        self.declare_parameter("servo_speed_dps", 60.0)  # legacy scalar; kept for old configs
+        self.declare_parameter("servo_speed_dps_by_channel", [80.0, 120.0, 120.0])
         self.declare_parameter("rate_hz", 20.0)
 
         self.init_pose = [float(v) for v in self.get_parameter("init_pose").value]
@@ -47,14 +75,22 @@ class PickSequencerNode(Node):
         self.grip_open = float(self.get_parameter("grip_open").value)
         self.grip_closed = float(self.get_parameter("grip_closed").value)
         self.stow_pose = tuple(self.init_pose)
-        self.move_sec = float(self.get_parameter("move_sec").value)
+        self.reach_lift_sec = float(self.get_parameter("reach_lift_sec").value)
+        self.to_place_sec = float(self.get_parameter("to_place_sec").value)
+        self.stow_sec = float(self.get_parameter("stow_sec").value)
         self.grasp_sec = float(self.get_parameter("grasp_sec").value)
         self.preopen_sec = float(self.get_parameter("preopen_sec").value)
         self.pick_settle_sec = float(self.get_parameter("pick_settle_sec").value)
-        self.servo_speed_dps = float(self.get_parameter("servo_speed_dps").value)
+        speeds = [float(v) for v in self.get_parameter("servo_speed_dps_by_channel").value]
+        if len(speeds) != 3 or any(speed <= 0.0 for speed in speeds):
+            raise ValueError("servo_speed_dps_by_channel must contain three positive values")
+        self.servo_speed_dps_by_channel = (speeds[0], speeds[1], speeds[2])
         rate = float(self.get_parameter("rate_hz").value)
 
         self.pub = self.create_publisher(Float32MultiArray, "/arm2r/target", 10)
+        # The mission uses this real sequencer phase instead of a blind fixed wait.  Publishing
+        # continuously also lets a restarted mission learn whether the arm is currently busy.
+        self.pub_phase = self.create_publisher(String, "/arm/pick_sequence_phase", 10)
         self.create_subscription(Bool, "/arm/pick_trigger", self.on_trigger, 10)
 
         # sequence state
@@ -76,8 +112,10 @@ class PickSequencerNode(Node):
         self.get_logger().info(
             f"pick_sequencer(2R) ready: init={self.init_pose} pick={self.pick_sw} "
             f"place={self.place_sw} grip(open={self.grip_open}/closed={self.grip_closed}) "
-            f"move>={self.move_sec}s grasp={self.grasp_sec}s preopen={self.preopen_sec}s "
-            f"pick_settle={self.pick_settle_sec}s servo_speed={self.servo_speed_dps}deg/s "
+            f"reach/lift={self.reach_lift_sec}s to_place={self.to_place_sec}s "
+            f"stow={self.stow_sec}s grasp={self.grasp_sec}s preopen={self.preopen_sec}s "
+            f"pick_settle={self.pick_settle_sec}s "
+            f"servo_speed_by_channel={self.servo_speed_dps_by_channel}deg/s "
             "-> /arm2r/target"
         )
 
@@ -90,18 +128,8 @@ class PickSequencerNode(Node):
         m.data = [self.current_pose[0], self.current_pose[1], self.current_pose[2]]
         self.pub.publish(m)
 
-    @staticmethod
-    def _lerp_pose(
-        start: tuple[float, float, float],
-        target: tuple[float, float, float],
-        progress: float,
-    ) -> tuple[float, float, float]:
-        u = max(0.0, min(1.0, progress))
-        return (
-            start[0] + (target[0] - start[0]) * u,
-            start[1] + (target[1] - start[1]) * u,
-            start[2] + (target[2] - start[2]) * u,
-        )
+    def _publish_phase(self, phase: str) -> None:
+        self.pub_phase.publish(String(data=str(phase)))
 
     # -------------------------------------------------------------- callbacks
     def on_trigger(self, msg: Bool) -> None:
@@ -123,22 +151,27 @@ class PickSequencerNode(Node):
         plsh, plwr = self.place_sw
         self.seq = [
             ("PREOPEN",  self.preopen_sec, (ish, iwr, self.grip_open)),      # open before lowering
-            ("REACH",    self.move_sec,  (psh, pwr, self.grip_open)),      # move only shoulder/wrist
-            ("PICK_SETTLE", self.pick_settle_sec, (psh, pwr, self.grip_open)),  # finish, still open
-            ("GRASP",    self.grasp_sec, (psh, pwr, self.grip_closed)),    # close (grab)
-            ("LIFT",     self.move_sec,  (ish, iwr, self.grip_closed)),    # lift to init, holding
-            ("TO_PLACE", self.move_sec,  (plsh, plwr, self.grip_closed)),  # move to place, holding
-            ("PLACE",    self.grasp_sec, (plsh, plwr, self.grip_open)),    # open at place pose
-            ("STOW",     self.grasp_sec, self.stow_pose),                  # return to driving pose
+            ("REACH",    self.reach_lift_sec, (psh, pwr, self.grip_open)),
         ]
+        if self.pick_settle_sec > 0.0:
+            self.seq.append(
+                ("PICK_SETTLE", self.pick_settle_sec, (psh, pwr, self.grip_open))
+            )
+        self.seq.extend([
+            ("GRASP",    self.grasp_sec, (psh, pwr, self.grip_closed)),    # close (grab)
+            ("LIFT",     self.reach_lift_sec, (ish, iwr, self.grip_closed)),
+            ("TO_PLACE", self.to_place_sec, (plsh, plwr, self.grip_closed)),
+            ("PLACE",    self.grasp_sec, (plsh, plwr, self.grip_open)),    # open at place pose
+            ("STOW",     self.stow_sec, self.stow_pose),                   # return to driving pose
+        ])
         self._launch("PICK_PLACE")
 
     def _start_release(self) -> None:
         sh, wr = self.place_sw
         self.seq = [
-            ("TO_PLACE", self.move_sec,  (sh, wr, self.grip_closed)),  # move to place, holding
+            ("TO_PLACE", self.to_place_sec, (sh, wr, self.grip_closed)),
             ("RELEASE",  self.grasp_sec, (sh, wr, self.grip_open)),    # open at place pose
-            ("STOW",     self.grasp_sec, self.stow_pose),              # return to driving pose
+            ("STOW",     self.stow_sec, self.stow_pose),               # return to driving pose
         ]
         self._launch("RELEASE")
 
@@ -160,8 +193,11 @@ class PickSequencerNode(Node):
                 # The MCU moves each servo by at most MAX_STEP every update. If a YAML override
                 # requests a ramp shorter than that physical travel time, the MCU remains behind
                 # the host target and GRASP can start while the wrist is still descending.
-                travel_deg = max(abs(pose[i] - step_start_pose[i]) for i in range(3))
-                required_duration = travel_deg / max(self.servo_speed_dps, 1e-6)
+                required_duration = required_joint_move_sec(
+                    step_start_pose,
+                    pose,
+                    self.servo_speed_dps_by_channel,
+                )
                 duration = max(configured_duration, required_duration)
             timed_seq.append((name, duration, pose))
             t += duration
@@ -175,10 +211,12 @@ class PickSequencerNode(Node):
     def tick(self) -> None:
         if not self.running:
             self._publish(self.stow_pose)              # hold init_pose throughout match driving
+            self._publish_phase("IDLE")
             return
         el = self._now_s() - self.seq_start_s
         if el >= self.total:
             self._publish(self.seq[-1][2])
+            self._publish_phase("COMPLETE")
             self.running = False
             # RE-ARM the edge detector: the FSM sends a fresh True for EVERY pick, but on_trigger only
             # fires on a rising edge. Without this reset _last_trigger stays True and the 2nd, 3rd...
@@ -192,9 +230,11 @@ class PickSequencerNode(Node):
                 idx = i
                 break
         name, duration, pose = self.seq[idx]
+        self._publish_phase(name)
         step_start_t = 0.0 if idx == 0 else self.cum[idx - 1]
         progress = (el - step_start_t) / max(duration, 1e-6)
-        ramped_pose = self._lerp_pose(self.seq_start_poses[idx], pose, progress)
+        # GRASP issues the final closed target immediately; other motion remains host-ramped.
+        ramped_pose = step_command_pose(name, self.seq_start_poses[idx], pose, progress)
         if name != self._last_step:
             start = self.seq_start_poses[idx]
             self.get_logger().info(

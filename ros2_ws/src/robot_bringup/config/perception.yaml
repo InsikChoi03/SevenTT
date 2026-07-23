@@ -150,13 +150,14 @@ yolo_detector_node:
     device: "auto"
     top_min_interval_sec: 0.066
     body_min_interval_sec: 0.06
+    max_input_age_sec: 0.25              # 추론 대기열에 남은 오래된 프레임은 GPU 투입 전에 폐기한다.
     publish_shape_classification: true
     shape_topic: "/classification/shape"
 
 siglip_gate_node:
   ros__parameters:
     model_id: "google/siglip-base-patch16-224"
-    set2_label: "orange"                  # today's Set2 fruit target
+    set2_label: "apple"                   # today's Set2 fruit target
     fruit_labels: ["apple", "orange", "banana", "pineapple"]
     confidence_threshold: 0.5             # 이제 softmax MARGIN 임계값(best-2nd). 오픽방지 위해 다소 엄격
     device: "auto"
@@ -166,6 +167,39 @@ siglip_gate_node:
     aspect_ratio_max: 1.7                 # w/h 상한 — 이 밖이면 각도 나쁨/edge-on → 스킵
     classify_rate_hz: 1.5                 # SigLIP을 매 검출(16Hz)마다 X → 타이머 1.5Hz에서 batch로만(YOLO에 GPU 양보)
     max_batch: 4                          # 한 forward에 넣을 크롭 수 상한(VRAM)
+    final_classify_rate_hz: 3.0           # 최종 정지 판정은 빠르게 갱신한다.
+    final_classify_max_batch: 1           # 집기 직전에는 중앙 물체 하나만 판정한다.
+    final_classify_prefer_centered_crop: true
+    final_classify_crop_center_x_px: 320.0
+    frame_buffer_size: 12                 # DetectionArray 캡처 시각과 같은 원본 프레임을 보관한다.
+    body_frame_buffer_size: 96            # 30fps 기준 3.2초: GPU 지연 뒤에도 최종 Body 원본 crop을 유지.
+    wide_frame_buffer_size: 72            # 30fps 기준 2.4초: 광각 YOLO 지연을 흡수하는 힌트용 버퍼.
+    frame_match_tolerance_sec: 0.050      # 30fps 인접 프레임까지 허용해 sensor QoS 드롭을 흡수한다.
+    detection_frame_wait_max_age_sec: 0.25 # 검출 선착 시 동일 timestamp 이미지가 들어올 때까지 잠시 보류한다.
+    # --- TRANSIT 분류 (이동 중 body 백그라운드 저주기 분류; 기본 OFF, 기존 프로파일 무변경) ---
+    transit_classify_enabled: false       # true면 transit_classify_states에서 저주기 경로 사용
+    transit_classify_min_interval_sec: 0.5  # 이동 중 SigLIP 최소 간격(저주기)
+    transit_classify_min_crop_px: 48      # 이동 중 크롭 최소 변(px) — 모션블러 방어
+    transit_classify_min_det_conf: 0.60   # 이동 중 YOLO det conf 하한 — 블러 박스 배제
+    transit_classify_states: ["SCAN", "APPROACH", "DRIVE_TO_STORAGE"]
+    # --- WIDE 백그라운드 분류 (광각 Set2 힌트; 기본 OFF) ---
+    # 결과는 /classification/siglip_wide_hint(JSON String)로만 발행 — FSM CLASSIFY 게이트가
+    # 구독하는 /classification/siglip에는 절대 실리지 않아 픽 판정을 우회할 수 없다.
+    wide_classify_enabled: false
+    wide_classify_rate_hz: 1.0            # 광각 SigLIP 레이트 리밋(1Hz)
+    wide_classify_min_crop_px: 28         # 광각 크롭 최소 변(px)
+    wide_classify_min_det_conf: 0.55      # 광각 det conf 하한
+    wide_classify_max_batch: 2            # 한 tick당 크롭 수 상한(큰 것부터)
+    wide_hint_min_margin: 0.15            # 이 margin 미만 read는 힌트 발행 안 함
+    # --- HSV 색상 일관성 veto (body+wide 공용; 기본 OFF, 보수적 veto 전용) ---
+    color_filter_enabled: false
+    color_filter_min_expected_fraction: 0.10  # 기대 hue 비율 이 이상이면 절대 veto 안 함(느슨)
+    color_filter_dominant_min_fraction: 0.40  # 다른 과일 hue가 이만큼 우세해야 veto 후보
+    color_filter_dominance_ratio: 3.0     # 그리고 기대 hue의 3배 이상일 때만
+    color_filter_min_colored_fraction: 0.05   # 비백색 픽셀이 이보다 적으면(흰 큐브) veto 안 함
+    color_filter_sat_min: 60.0            # 비백색 판정 S 하한(0-255)
+    color_filter_val_min: 60.0            # 비백색 판정 V 하한(0-255)
+    color_filter_veto_scale: 0.25         # veto 시 margin 하향 배율(is_target은 무조건 false)
 
 world_model_node:
   ros__parameters:
@@ -228,9 +262,17 @@ world_model_node:
     class_conf_threshold: 0.85            # 광각 IDENTITY 커트라인(높게): 이 이상만 클래스 투표(광각=위치 위주)
     class_conf_threshold_body: 0.50       # 본체=신원 권위자라 낮은 바에서도 투표(0.6~0.8 octa/icosa도 자기 정체성 확립→과병합 방지)
     plain_cube_confirm_observations: 5    # 최근 유효 라벨 5개가 모두 cube일 때만 순수 일반 큐브로 확정
+    body_siglip_assoc_radius_m: 0.18      # 공간 태그 Body SigLIP과 Set2 track 결속 반경.
     fruit_cube_sticky_enabled: false      # 오분류 고착을 막고 이후 shape vote로 재분류를 허용한다
     fruit_cube_sticky_conf_wide: 0.75
     fruit_cube_sticky_conf_body: 0.50
+    # --- WIDE SigLIP 과일 힌트 수신 (라우팅 힌트 전용; producer 기본 OFF라 체인은 기본 비활성) ---
+    # 힌트는 wide_fruit_votes/fruit_label에만 붙고 fruit_votes/fruit_confidence/confidence/
+    # n_obs는 절대 건드리지 않는다(바디 라벨 우선, 픽 게이트 우회 불가).
+    wide_fruit_hint_enabled: true
+    wide_fruit_hint_assoc_radius_m: 0.35  # 힌트 픽셀 투영점-트랙 매칭 최대 거리
+    wide_fruit_hint_min_margin: 0.10      # 이 margin 미만 힌트는 무시(느슨)
+    wide_fruit_hint_max_age_sec: 4.0      # Wide YOLO+SigLIP GPU 지연을 포함한 캡처 기준 최대 나이
     # 카메라 커버 도형(base_link): 본체=부채꼴, 광각=전방 타원 (음의증거 판정 + 맵 표시 공용)
     body_fov_half_deg: 30.0               # 실측 footprint 반각 ~30°
     body_fov_near_m: 0.25                # 이미지 하단이 지면 0.29m → 그보다 가까우면 못 봄
@@ -274,8 +316,8 @@ world_model_node:
 
 target_selector_node:
   ros__parameters:
-    set1_label: "dodecahedron"            # today's Set1 shape target (정십이면체)
-    set2_label: "orange"                  # today's Set2 fruit target
+    set1_label: "icosahedron"             # today's Set1 shape target (정이십면체)
+    set2_label: "apple"                   # today's Set2 fruit target
     rate_hz: 2.0
     explore_base: 5.0
     set1_base: 20.0                       # Set1 outranks Set2 (approach bias; order enforced by FSM phase)
@@ -285,8 +327,8 @@ target_selector_node:
 
 mission_fsm_node:
   ros__parameters:
-    set1_label: "dodecahedron"            # today's Set1 shape target (정십이면체) — 4 placed
-    set2_label: "orange"                  # today's Set2 fruit target — 2 placed
+    set1_label: "icosahedron"             # today's Set1 shape target (정이십면체) — 4 placed
+    set2_label: "apple"                   # today's Set2 fruit target — 2 placed
     start_phase: 1
     conf_threshold: 0.7
     pick_track_conf: 0.5                   # 타겟 트랙 정체성 신뢰 하한(게이트=프레임전역 아닌 트랙기반)
@@ -304,6 +346,7 @@ mission_fsm_node:
     shape_target_total: 4                 # 정십이면체 4개
     fruit_target_total: 0                 # 오렌지 큐브 무시: 정십이면체만 집기
     set2_require_fruit_label: true
+    set2_committed_cube_pick_enabled: true # 바나나 선택 위치의 Body 큐브가 집기점에 있으면 빈 면으로 보고 PICK
     grab_x: 0.19                          # 집기점 전방(m). 0.21에서 2cm 더 가까이 잡도록 조정
     grab_min_x: 0.17                      # 이보다 더 가까이 밀지 않음(전진 안전한계)
     storage_x: 1.6                        # 보관함 위치 field xy (좌측하단 구석 안쪽). 실제 빈 위치로 조정
@@ -316,17 +359,19 @@ mission_fsm_node:
     # Upscale each body detection pixel to that domain before perspectiveTransform (npz untouched).
     body_px_scale_x: 2.5625               # 1640/640
     body_px_scale_y: 2.566667             # 1232/480
-    # 경기 시작 하드코딩 개막 이동(로봇 body 기준): 전진 1초 → 오른쪽 횡이동 0.5초 → 제자리 45도 회전 → 1초 정지 → SCAN.
+    # 경기 시작 하드코딩 개막 이동(로봇 body 기준): motion_tuning.yaml과 동일하게 유지한다.
     # 이후 phase 1에서 Set1 정이십면체를 탐색/접근한다.
     opening_enabled: true
-    startup_warmup_sec: 15.0              # YOLO 로드+world_model 뜰 때까지 정지 대기 후 개막(방향 잃음 방지)
-    opening_speed: 0.1755                 # 주행 속도 1.3배 상향: 0.135 -> 0.1755
-    opening_forward_sec: 2.0
-    opening_strafe_speed: 0.26325         # 횡이동 속도 1.5배 상향: 0.1755 -> 0.26325
-    opening_strafe_right_sec: 1.5
-    opening_turn_deg: 45.0
-    opening_turn_omega: -0.255            # 회전 속도 1.5배 상향: -0.17 -> -0.255
-    opening_wait_after_turn_sec: 1.0
+    startup_warmup_sec: 0.0
+    opening_speed: 0.2
+    opening_forward_sec: 1.5
+    opening_strafe_speed: 0.40
+    opening_strafe_right_sec: 0.3
+    opening_turn_deg: 90.0
+    opening_turn_omega: -0.30
+    opening_turn_tolerance_rad: 0.06
+    opening_turn_timeout_sec: 7.0
+    opening_wait_after_turn_sec: 2.0
     scan_search_omega: -0.255             # 탐색 회전 속도 1.5배 상향: -0.17 -> -0.255
     # ★레인-그래프 waypoint 플래너★ (50cm 물체격자, 40cm 로봇). 이동목표(SCAN 스윕·APPROACH standoff·
     # 보관함)를 충돌없는 레인 중심선으로 라우팅. go_to_goal은 각 via를 car-like+반응형으로 주행.
@@ -387,6 +432,10 @@ mission_fsm_node:
     align_wide_max_age_sec: 0.80          # 옥타 최종 분류에서 stale Wide 프레임 차단
     align_body_confirm_frames: 3          # 같은 근거리 물체를 새 Body 프레임 3개에서 확인
     align_body_lost_backoff_enabled: true # ALIGN에서 wide/world에는 있는데 body에 없으면 후진 후 재탐지
+    align_body_lost_confirm_sec: 0.40     # 단일 빈 프레임이 아닌 연속 누락만 유실로 확정
+    align_body_lost_confirm_frames: 3     # 서로 다른 새 Body 검출 프레임 3회 누락 필요
+    align_body_lost_max_backoffs: 2       # 바나나 재획득을 위해 같은 ALIGN 방문에서 후진을 두 번까지 허용
+    align_body_lost_reselect_cooldown_sec: 6.0 # 재획득 실패 위치 즉시 재선택 방지
     align_body_lost_backoff_speed: 0.189  # body lost 후진 duty: 0.27의 0.7배
     align_body_lost_backoff_sec: 0.54     # 속도 0.7배 기준 약 10cm 후진
     align_body_lost_backoff_settle_sec: 1.0 # 후진 후 카메라 안정화 대기
@@ -400,12 +449,17 @@ pick_sequencer_node:
     init_pose: [120.0, 5.0, 100.0]        # 검증된 초기/주행 대기 자세 [어깨, 손목, 그리퍼]
     pick_shoulder_wrist: [25.0, 150.0]    # 집기 도달: 어깨·손목
     place_shoulder_wrist: [110.0, 30.0]   # 놓기: 닫은 채 이동 후 이 위치에서 열기
-    grip_open: 115.0                      # 열림/놓기
-    grip_closed: 50.0                     # 닫힘/잡기
-    move_sec: 4.0                         # 팔 이동 단계 램프 시간(REACH/LIFT/TO_PLACE). 내림 속도 완화
-    grasp_sec: 1.0                        # 그리퍼 열림/닫힘 단계 램프 시간
-    pick_settle_sec: 0.25                 # 집기 자세 도달 후 열린 상태 정착 시간
-    servo_speed_dps: 60.0                 # 펌웨어 이동시간 계산에 쓰는 보수적 속도
+    grip_open: 118.0                      # 열림/놓기
+    grip_closed: 45.0                     # 독립 테스트에서 검증한 닫힘 각도
+    move_sec: 1.3                         # 구 설정 파일 호환용(현재는 단계별 시간 사용)
+    reach_lift_sec: 1.3                   # REACH/LIFT
+    to_place_sec: 1.25                    # 보관함 자세 이동
+    stow_sec: 1.0                         # 주행 대기 자세 복귀
+    grasp_sec: 0.75                       # 즉시 닫기 명령 유지 후 자동 LIFT
+    preopen_sec: 0.2                      # 하강 전 열기
+    pick_settle_sec: 0.0                  # REACH 뒤 즉시 GRASP
+    servo_speed_dps: 60.0                 # 이전 설정 호환용
+    servo_speed_dps_by_channel: [80.0, 120.0, 120.0]
 
 go_to_goal_node:
   ros__parameters:
@@ -497,9 +551,12 @@ recognition_viz_node:
     grid_spacing_m: 0.50
     grid_origin_x_m: -1.50                # world_model_node grid prior와 같은 기준
     grid_origin_y_m: -1.50
-    show_zone_regions: true               # FSM이 쓰는 격자 기준 구역을 라이브 맵에 사각형으로 표시
+    show_zone_regions: false              # global 지그재그 모드에서는 구형 zone 표시를 숨김
     zone_bounds_m: [-2.0, -0.25, -0.25, 2.0,  -2.0, -0.25, -2.0, -0.25,  -0.25, 2.0, -2.0, -0.25,  -0.25, 2.0, -0.25, 2.0]
-    show_zone_anchors: true
+    show_zone_anchors: false
+    show_global_zigzag_route: true
+    global_zigzag_start_xy: [-1.25, 1.60]
+    global_zigzag_waypoints_xy: [-1.25, 1.25, -1.25, -1.25, 1.25, -1.25]
     zone_anchor_xy: [-1.0, 0.5, -1.0, -1.0, 1.25, -1.25, 0.75, 0.5]
     # 맵 FOV 표시(world_model 과 동일값): 본체=부채꼴, 광각=전방 타원
     body_fov_half_deg: 30.0

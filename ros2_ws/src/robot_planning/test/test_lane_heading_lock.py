@@ -7,7 +7,9 @@ from robot_planning.nodes.mission_fsm_node import (
     PulsedHeadingController,
     _cardinal_waypoint_status,
     circular_heading_filter,
+    lane_cross_track_feedback,
     lane_heading_violation_time_step,
+    lane_route_replan_required,
 )
 
 
@@ -58,10 +60,65 @@ def test_cardinal_waypoint_pass_works_for_vertical_lane():
     assert math.isclose(lateral_error, 0.13)
 
 
+def test_failed_lane_route_retries_after_throttle_even_without_periodic_replan():
+    assert not lane_route_replan_required(
+        [], False, False, False, now_s=10.49, last_replan_s=10.0, throttle_sec=0.5
+    )
+    assert lane_route_replan_required(
+        [], False, False, False, now_s=10.50, last_replan_s=10.0, throttle_sec=0.5
+    )
+
+
+def test_valid_lane_route_stays_latched_without_a_replan_reason():
+    route = [(0.25, 0.25), (0.25, -0.25)]
+    assert not lane_route_replan_required(
+        route, False, False, False, now_s=20.0, last_replan_s=10.0, throttle_sec=0.5
+    )
+    assert lane_route_replan_required(
+        route, False, True, False, now_s=20.0, last_replan_s=10.0, throttle_sec=0.5
+    )
+
+
+def test_unattempted_or_route_mode_changed_plan_replans_immediately():
+    assert lane_route_replan_required(
+        None, False, False, False, now_s=1.0, last_replan_s=1.0, throttle_sec=0.5
+    )
+    assert lane_route_replan_required(
+        [(0.0, 0.0)], True, False, False,
+        now_s=1.0, last_replan_s=1.0, throttle_sec=0.5,
+    )
+
+
 def test_circular_heading_filter_handles_wraparound():
     filtered = circular_heading_filter(math.radians(179.0), math.radians(-179.0), 0.5)
     error = math.atan2(math.sin(filtered - math.pi), math.cos(filtered - math.pi))
     assert math.isclose(error, 0.0, abs_tol=1e-9)
+
+
+def test_cross_track_feedback_has_five_centimetre_dead_band_and_correct_sign():
+    inside = lane_cross_track_feedback(
+        (0.0, 0.0), (1.0, 0.0), (0.4, 0.05), 0.05, 0.55, 1.0, math.radians(10.0)
+    )
+    assert math.isclose(inside[0], 0.05)
+    assert inside[1:] == (0.0, 0.0)
+
+    left = lane_cross_track_feedback(
+        (0.0, 0.0), (1.0, 0.0), (0.4, 0.10), 0.05, 0.55, 1.0, math.radians(10.0)
+    )
+    right = lane_cross_track_feedback(
+        (0.0, 0.0), (1.0, 0.0), (0.4, -0.10), 0.05, 0.55, 1.0, math.radians(10.0)
+    )
+    assert left[0] > 0.0 and left[1] > 0.0 and left[2] < 0.0
+    assert right[0] < 0.0 and right[1] < 0.0 and right[2] > 0.0
+
+
+def test_cross_track_feedback_works_in_vertical_lane_and_caps_bias():
+    cte, effective, bias = lane_cross_track_feedback(
+        (0.0, 1.0), (0.0, 0.0), (-0.30, 0.5), 0.05, 0.20, 2.0, math.radians(10.0)
+    )
+    assert cte < 0.0
+    assert effective < 0.0
+    assert math.isclose(bias, math.radians(10.0))
 
 
 def test_single_ten_degree_spike_does_not_request_realign():
@@ -142,6 +199,45 @@ def test_pulsed_heading_controller_stops_between_torque_pulses():
         key=("lane", 1),
     )
     assert omega == 0.0
+
+
+def test_large_heading_error_turns_continuously_until_slowdown_band():
+    controller = PulsedHeadingController(
+        continuous_min_error_rad=math.radians(30.0),
+        slowdown_rad=math.radians(10.0),
+    )
+
+    aligned, omega, event = controller.step(
+        now_s=0.0,
+        current_heading=math.radians(-90.0),
+        target_heading=0.0,
+        tolerance_rad=math.radians(2.0),
+        key=("large", 1),
+    )
+    assert not aligned
+    assert omega == 0.10
+    assert event == "continuous_turn"
+
+    for now, heading in ((0.25, -70.0), (0.50, -45.0), (0.75, -15.0)):
+        _, omega, event = controller.step(
+            now_s=now,
+            current_heading=math.radians(heading),
+            target_heading=0.0,
+            tolerance_rad=math.radians(2.0),
+            key=("large", 1),
+        )
+        assert omega == 0.10
+        assert event is None
+
+    _, omega, event = controller.step(
+        now_s=1.0,
+        current_heading=math.radians(-8.0),
+        target_heading=0.0,
+        tolerance_rad=math.radians(2.0),
+        key=("large", 1),
+    )
+    assert omega == 0.0
+    assert event == "continuous_settle"
 
 
 def test_cardinal_follower_drives_directly_when_aligned_and_stops_to_realign():
@@ -471,7 +567,7 @@ def test_cardinal_follower_aligns_before_entry_and_never_translates_laterally():
     node._drive_cardinal_lane_segment(*args)
 
     assert node._lane_heading_phase == "align"
-    assert commands[-1] == (0.0, 0.0, 0.0)
+    assert commands[-1] == (0.0, 0.0, -0.10)
     assert decisions[1] == "LANE ENTRY PULSE ALIGN error=-90.0deg"
 
     now[0] = 0.05
@@ -481,15 +577,16 @@ def test_cardinal_follower_aligns_before_entry_and_never_translates_laterally():
     node.world.robot_theta = 0.0
     now[0] = 0.25
     node._drive_cardinal_lane_segment(*args)
-    now[0] = 0.44
+    assert commands[-1] == (0.0, 0.0, 0.0)
+    now[0] = 0.84
     node._drive_cardinal_lane_segment(*args)
-    now[0] = 0.45
+    now[0] = 0.85
     node._drive_cardinal_lane_segment(*args)
     assert node._lane_heading_phase == "settle"
 
-    now[0] = 0.76
+    now[0] = 1.16
     node._drive_cardinal_lane_segment(*args)
-    now[0] = 0.77
+    now[0] = 1.17
     node._drive_cardinal_lane_segment(*args)
     assert node._lane_heading_phase == "drive"
     assert commands[-1] == (0.07, 0.0, 0.0)

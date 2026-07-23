@@ -225,6 +225,7 @@ class WallLocalizerNode(Node):
         self._wall_field_ema = np.zeros(3, dtype=np.float64)
         self._wall_field_history: deque[np.ndarray] = deque(maxlen=self.wall_field_filter_window)
         self._wall_fast_correction = False
+        self._processing_enabled = True
         self._competition_state = "STANDBY"
         self._load_segmentation_model()
 
@@ -232,6 +233,9 @@ class WallLocalizerNode(Node):
         self.create_subscription(Bool, "/localization/is_stationary", self.on_stationary, 10)
         self.create_subscription(
             Bool, "/localization/wall_fast_correction", self.on_wall_fast_correction, 10
+        )
+        self.create_subscription(
+            Bool, "/localization/wall_processing_enabled", self.on_processing_enabled, 10
         )
         self.create_subscription(Image, "/camera_top/image_raw", self.on_img, qos_profile_sensor_data)
         self.create_subscription(
@@ -281,6 +285,13 @@ class WallLocalizerNode(Node):
         if fast and not self._wall_fast_correction:
             self._wall_field_history.clear()
         self._wall_fast_correction = fast
+
+    def on_processing_enabled(self, msg: Bool) -> None:
+        enabled = bool(msg.data)
+        if enabled and not self._processing_enabled:
+            # Permit an immediate inference instead of waiting for the old rate limiter.
+            self._last_seg_time = 0.0
+        self._processing_enabled = enabled
 
     def _wall_fast_active(self) -> bool:
         return bool(self._wall_fast_correction and self._stationary)
@@ -1243,6 +1254,8 @@ class WallLocalizerNode(Node):
 
     def tick(self) -> None:
         if self._competition_state not in {"READY", "RUNNING"}:
+            return
+        if not self._processing_enabled:
             return
         if self._img is None or self._pose is None:
             return

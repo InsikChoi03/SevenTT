@@ -26,10 +26,10 @@
 
 ## 2. 현재 상태 (Snapshot — 이 섹션만 최신값으로 덮어쓰기)
 
-- **현재 버전:** `v5.2.0` (`new` 브랜치, Git 태그 없음)
-- **최종 업데이트:** 2026-07-22 11:41 (KST)
+- **현재 버전:** `v6.0.0` (`new` 브랜치, Git 태그 예정)
+- **최종 업데이트:** 2026-07-23 12:08 (KST)
 - **최종 작업자:** `@AI`
-- **한 줄 요약:** ALIGN 최종 판별과 구역 재선택을 안정화하고, IMU-flow 완화 옵션·독립 브레이크·벽 거리 기반 150초 주차를 통합한 v5.2.0 상태다.
+- **한 줄 요약:** 실제 경기 run에서 안정 확인된 오프닝·전역 탐색·집기·보관함 복귀 통합 주행 상태를 v6.0.0 릴리스로 고정한다.
 
 ---
 
@@ -156,12 +156,168 @@
 - [x] 150초 주차를 아래 벽 30cm 접근→오른쪽 정렬→왼쪽 벽 방향 후진·벽 거리 종료 흐름으로 교체 — `@AI` (2026-07-22 완료)
 - [ ] 벽 검출 기반 주차가 아래 벽 30cm와 왼쪽 벽 설정값 5cm에서 정지하며, 벽 선분 미검출 시 안전 정지하는지 실주행 확인 — `@insik`
 - [ ] 현재 `GRASP=1.3초` 설정에서 실제 그리퍼가 완전히 닫힌 뒤 LIFT가 시작되는지 확인하고, 물리 중첩이 남으면 그리퍼 실제 이동시간을 재측정 — `@insik`
+- [x] 로컬 앵커 활성 후보의 fresh `is_target=True` 1회 판정으로 즉시 ALIGN에 진입하도록 변경 — `@AI` (2026-07-22 완료)
+- [x] 메인 경기의 고정 오프닝 이동을 활성화하고 설치 설정까지 반영 — `@AI` (2026-07-22 완료)
+- [ ] 실주행에서 오프닝 전진→우측 횡이동→시계 90도 회전 후 구역 진입으로 정상 전환되는지 확인 — `@insik`
+- [x] 메인 경기의 현재 2R 집기→놓기 로직을 재사용하는 독립 실행 테스트 작성 — `@AI` (2026-07-22 완료)
+- [ ] 독립 집기 테스트에서 정면 집기점의 물체를 잡아 보관 위치에 놓고 STOW로 복귀하는지 확인 — `@insik`
+- [x] 메인 코드를 변경하지 않고 v5.0.0 팔 타이밍을 재현하는 독립 테스트 프로파일 작성 — `@AI` (2026-07-22 완료)
+- [ ] v5.0.0 독립 프로파일에서 하강 중 조기 GRASP가 실제 물체 집기 성공률을 개선하는지 확인 — `@insik`
+- [x] 독립 테스트에서 GRASP 최종 목표를 즉시 보내고 1초 수행 완료 뒤 LIFT하도록 명령 단계를 분리 — `@AI` (2026-07-22 완료)
+- [ ] 즉시 GRASP 독립 테스트에서 실제 그리퍼 닫힘이 상승 전에 끝나고 물체가 함께 올라오는지 확인 — `@insik`
+- [x] 독립 테스트의 REACH/LIFT를 2.5초, 즉시 GRASP를 1.2초로 물리 속도 기준 보정 — `@AI` (2026-07-22 완료)
+- [ ] 물리 시간 보정 독립 테스트에서 REACH 종료 시 높이 고정과 GRASP 후 물체 상승을 확인 — `@insik`
+- [x] GRASP 완료를 사람이 확인해 Enter를 눌러야만 LIFT하는 수동 독립 테스트 작성 — `@AI` (2026-07-22 완료)
+- [ ] 수동 GRASP 확인 테스트에서 출력된 실측시간과 실제 물체 집기 성공 여부를 기록 — `@insik`
+- [x] 실제 경기 run에서 안정 확인된 메인 주행·집기·보관함 복귀 세팅을 v6.0.0 릴리스로 고정 — `@AI` (2026-07-23 완료)
+- [ ] v6.0.0 태그 기준으로 동일 경기장 세팅에서 재현 run 1회를 수행해 주차 완료와 덤프까지 확인 — `@insik`
 
 ---
 
 ## 5. 변경 이력 (Changelog) — ⛔ 삭제 금지 / 최신 항목이 맨 위
 
 <!-- 새 엔트리는 바로 이 줄 아래에 추가하세요. 기존 엔트리는 건드리지 마세요. -->
+
+### `v6.0.0` — 2026-07-23 12:08 (KST) · 작업자: `@AI` · ID: `2026-07-23-01`
+- **변경 요약:** 실제 경기 run에서 안정 확인된 메인 주행·집기·보관함 복귀 통합 상태를 v6.0.0으로 릴리스한다.
+- **상세:**
+  - 고정 오프닝, 3점/전역 경로 기반 탐색, 목표 후보 접근, Body/Wide/SigLIP 기반 최종 판정, PICK 조기 release, 보관함 복귀 흐름을 현재 실주행 성공 세팅으로 묶었다.
+  - SigLIP/색상/공간 결속 보조 모듈과 Wide 힌트, fruit cube 보완 로직, stale frame 방지, 최신 프레임 처리, self-exclusion, 인식 UI 표시를 통합했다.
+  - 레인 주행 중 heading/cross-track 보정을 10:09 안정 run 감각으로 완화해 전진 명령이 회전 보정에 과도하게 상쇄되지 않도록 조정했다.
+  - PICK 시퀀스 phase 수신, LIFT 즉시 주행 release, 그리퍼/팔 독립 시험 스크립트, base deadband/휠 보정 테스트를 추가·보완했다.
+  - 보관함 복귀는 벽 기반 접근·재정렬·후진 주차 설정을 유지하며, 마지막 실주행 로그에서 `DRIVE_TO_STORAGE` 진입 후 base command와 wheel speed가 정상 송신된 것을 확인했다.
+  - 빌드/실행 환경 오염을 피하도록 `run_test_field.sh`가 ROS prefix를 정리하고 필수 패키지 prefix를 검증하게 했다.
+- **변경 파일:**
+  - `PROJECT_LOG.md` / 수정
+  - `firmware/base_arm_combined/base_arm_combined.ino` / 수정
+  - `ros2_ws/src/robot_interfaces/msg/Object.msg` / 수정
+  - `ros2_ws/src/robot_bringup/config/motion_tuning.yaml` / 수정
+  - `ros2_ws/src/robot_bringup/config/perception.yaml` / 수정
+  - `ros2_ws/src/robot_bringup/config/test_field.yaml` / 수정
+  - `ros2_ws/src/robot_bringup/launch/test_field.launch.py` / 수정
+  - `ros2_ws/src/robot_bringup/test/test_storage_wall_mode_launch.py` / 신규
+  - `ros2_ws/src/robot_control/robot_control/nodes/base_controller_node.py` / 수정
+  - `ros2_ws/src/robot_control/robot_control/nodes/pick_sequencer_node.py` / 수정
+  - `ros2_ws/src/robot_control/test/test_base_controller_deadband.py` / 수정
+  - `ros2_ws/src/robot_control/test/test_pick_sequencer_timing.py` / 신규
+  - `ros2_ws/src/robot_perception/robot_perception/fruit_color_gate.py` / 신규
+  - `ros2_ws/src/robot_perception/robot_perception/spatial_siglip.py` / 신규
+  - `ros2_ws/src/robot_perception/robot_perception/wide_fruit_hint.py` / 신규
+  - `ros2_ws/src/robot_perception/robot_perception/nodes/localizer_node.py` / 수정
+  - `ros2_ws/src/robot_perception/robot_perception/nodes/recognition_viz_node.py` / 수정
+  - `ros2_ws/src/robot_perception/robot_perception/nodes/siglip_gate_node.py` / 수정
+  - `ros2_ws/src/robot_perception/robot_perception/nodes/wall_localizer_node.py` / 수정
+  - `ros2_ws/src/robot_perception/robot_perception/nodes/world_model_node.py` / 수정
+  - `ros2_ws/src/robot_perception/robot_perception/nodes/yolo_detector_node.py` / 수정
+  - `ros2_ws/src/robot_perception/test/*.py` / 신규·수정
+  - `ros2_ws/src/robot_planning/robot_planning/global_target_planner.py` / 신규
+  - `ros2_ws/src/robot_planning/robot_planning/local_anchor_fsm.py` / 수정
+  - `ros2_ws/src/robot_planning/robot_planning/nodes/local_anchor_test_node.py` / 수정
+  - `ros2_ws/src/robot_planning/robot_planning/nodes/mission_fsm_node.py` / 수정
+  - `ros2_ws/src/robot_planning/test/*.py` / 신규·수정
+  - `scripts/run_test_field.sh` / 수정
+  - `scripts/shape4_*_v*.py` / 신규
+- **다음 할 일 반영:** v6.0.0 릴리스 고정 항목을 완료 처리하고, 태그 기준 재현 run 확인 항목을 추가했다.
+- **버전 근거:** 메인 경기 실행 흐름 전반의 탐색·인식·집기·복귀·실행환경을 통합하고 실주행 안정 상태를 기준 릴리스로 고정하므로 MAJOR를 `v5.3.4`에서 `v6.0.0`으로 올렸다.
+
+### `v5.3.4` — 2026-07-22 20:43 (KST) · 작업자: `@AI` · ID: `2026-07-22-09`
+- **변경 요약:** 실제 그리퍼 닫힘을 사람이 확인하기 전에는 LIFT가 시작되지 않는 수동 독립 집기 테스트를 추가했다.
+- **상세:**
+  - 메인 집기 로직과 설정은 유지하고 v5.3.3의 REACH 2.5초 및 v5.0.0 포즈를 재사용했다.
+  - REACH 직후 `[25,150,50]` 닫힘 최종 목표를 즉시 보내고, 사용자가 Enter를 누르기 전까지 자동 LIFT를 완전히 차단한다.
+  - 입력 대기 중에도 같은 최하점·닫힘 목표를 20Hz로 재전송하고 직렬 텔레메트리를 비워 MCU loop와 팔 높이 유지가 계속되도록 했다.
+  - Enter를 누르면 GRASP 명령부터 확인까지 걸린 실측시간과 `실측+0.20초` 자동화 후보 시간을 출력한 뒤 LIFT한다. `q` 입력 시 상승 없이 안전 종료한다.
+  - 현재 메인 `motion_tuning.yaml`과 `pick_sequencer_node.py`는 수정하지 않았다. Python 구문 검사와 `--dry-run` 검증을 통과했다.
+- **변경 파일:**
+  - `PROJECT_LOG.md` / 수정
+  - `scripts/shape4_pick_place_test_v5.3.4.py` / 신규
+- **다음 할 일 반영:** 수동 GRASP 확인 테스트 작성을 완료 처리하고, 실측시간과 집기 성공 여부 기록 항목을 추가했다.
+- **버전 근거:** 독립 테스트에 수동 완료 게이트와 시간 측정을 추가한 소규모 기능 보완이므로 PATCH를 `v5.3.3`에서 `v5.3.4`로 올렸다.
+
+### `v5.3.3` — 2026-07-22 20:37 (KST) · 작업자: `@AI` · ID: `2026-07-22-08`
+- **변경 요약:** 독립 집기 테스트의 큰 관절 이동과 그리퍼 수행시간을 MCU 물리 속도 기준으로 보정했다.
+- **상세:**
+  - 메인 포즈는 변경하지 않고 v5.0.0의 `INIT [120,5,100]`, `PICK [25,150]`, `PLACE [110,30]`을 유지했다.
+  - 손목 최대 이동 145도와 보수적 속도 60°/s를 기준으로 REACH와 역방향 LIFT를 각각 2.5초로 늘렸다.
+  - REACH 완료 직후 그리퍼 최종 목표 50도를 즉시 보내고, `118→50도` 68도 이동의 계산시간 약 1.13초보다 여유 있는 1.2초 동안 최하점 목표를 반복 전송한 뒤 LIFT한다.
+  - 놓기 동작도 같은 그리퍼 이동량을 고려해 PLACE를 1.2초로 맞췄으며 전체 독립 시퀀스는 9.85초다.
+  - 현재 메인 `motion_tuning.yaml`과 `pick_sequencer_node.py`는 수정하지 않았다. Python 구문 검사와 `--dry-run` 검증을 통과했다.
+- **변경 파일:**
+  - `PROJECT_LOG.md` / 수정
+  - `scripts/shape4_pick_place_test_v5.3.3.py` / 신규
+- **다음 할 일 반영:** 물리 속도 기반 독립 프로파일 작성을 완료 처리하고, 실제 REACH 높이 고정과 집기 성공을 확인하는 항목을 추가했다.
+- **버전 근거:** 기존 독립 테스트의 단계 시간만 물리 속도에 맞춰 보정한 소규모 수정이므로 PATCH를 `v5.3.2`에서 `v5.3.3`으로 올렸다.
+
+### `v5.3.2` — 2026-07-22 20:32 (KST) · 작업자: `@AI` · ID: `2026-07-22-07`
+- **변경 요약:** 독립 집기 테스트에서 GRASP 물리 수행과 LIFT 명령이 겹치지 않도록 순서를 명확히 분리했다.
+- **상세:**
+  - v5.0.0 독립 프로파일의 포즈와 전체 단계 시간은 유지했다.
+  - 기존처럼 `118→50도` 목표를 1초 동안 host-ramp하지 않고, REACH 완료 직후 어깨·손목을 `[25,150]`에 둔 채 그리퍼 최종 목표 50도를 즉시 전송하도록 했다.
+  - 이어지는 1초는 추가 정지시간이 아니라 MCU가 실제로 그리퍼를 닫는 GRASP 수행시간이며, 이 동안 같은 `[25,150,50]` 목표만 반복 전송한다.
+  - GRASP 명령 구간 1초가 완전히 끝난 후에만 LIFT 보간을 시작하고, 콘솔에 `GRASP COMPLETE -> LIFT allowed` 경계를 표시한다.
+  - 현재 메인 `motion_tuning.yaml`과 `pick_sequencer_node.py`는 수정하지 않았다. Python 구문 검사와 `--dry-run` 검증을 통과했다.
+- **변경 파일:**
+  - `PROJECT_LOG.md` / 수정
+  - `scripts/shape4_pick_place_test_v5.3.2.py` / 신규
+- **다음 할 일 반영:** GRASP와 LIFT 명령 분리를 완료 처리하고, 실제 상승 전에 그리퍼 닫힘이 끝나는지 확인하는 항목을 추가했다.
+- **버전 근거:** 기존 독립 테스트의 GRASP 명령 방식만 보완한 소규모 수정이므로 PATCH를 `v5.3.1`에서 `v5.3.2`로 올렸다.
+
+### `v5.3.1` — 2026-07-22 20:24 (KST) · 작업자: `@AI` · ID: `2026-07-22-06`
+- **변경 요약:** 현재 메인 코드는 유지하고 v5.0.0의 팔 단계·각도·시간을 재현하는 독립 집기 테스트를 추가했다.
+- **상세:**
+  - v5.0.0 릴리스 커밋 `50bcc07`의 유효 `motion_tuning.yaml` 값을 독립 프로파일로 고정했다.
+  - `INIT [120,5,100]`, `PICK [25,150]`, `PLACE [110,30]`, 그리퍼 open 118/closed 50을 사용한다.
+  - 당시 로직대로 `PREOPEN 0.20초 → REACH 1.25초 → GRASP 1.00초 → LIFT 1.25초 → TO_PLACE 1.25초 → PLACE 1.00초 → STOW 1.00초`를 실행한다.
+  - v5.1.0 이후 도입된 `PICK_SETTLE`과 이동거리 기반 시간 자동 연장은 이 프로파일에서 의도적으로 제외해 하강 중 더 이른 GRASP 시작을 재현한다.
+  - 메인 `pick_sequencer_node.py`와 현재 `motion_tuning.yaml`은 수정하지 않았다. Python 구문 검사와 `--dry-run` 결과 총 6.95초 시퀀스를 확인했다.
+- **변경 파일:**
+  - `PROJECT_LOG.md` / 수정
+  - `scripts/shape4_pick_place_test_v5.3.1.py` / 신규
+- **다음 할 일 반영:** v5.0.0 독립 프로파일 작성을 완료 처리하고, 실제 물체에서 조기 GRASP의 집기 성공 여부를 확인하는 항목을 추가했다.
+- **버전 근거:** 기존 독립 하드웨어 테스트에 과거 릴리스 재현 프로파일을 추가한 소규모 변경이므로 PATCH를 `v5.3.0`에서 `v5.3.1`로 올렸다.
+
+### `v5.3.0` — 2026-07-22 20:18 (KST) · 작업자: `@AI` · ID: `2026-07-22-05`
+- **변경 요약:** 메인 경기의 현재 2R 집기→놓기 시퀀스만 한 번 수행하는 독립 하드웨어 테스트를 추가했다.
+- **상세:**
+  - 기존 `pick_sequencer_node.py`의 `PREOPEN → REACH → PICK_SETTLE → GRASP → LIFT → TO_PLACE → PLACE → STOW` 순서와 서보 이동시간 자동 연장 계산을 이식했다.
+  - 각도와 시간은 별도 상수로 복제하지 않고 실행 시 `motion_tuning.yaml`의 `pick_sequencer_node` 설정을 읽어 메인 경기와 동일한 값을 사용한다.
+  - 카메라·YOLO·정렬·주행 없이 현재 정면 집기점에서 바로 동작하며, 통합 MCU 연결 직후 베이스 정지와 리프트 OFF를 명시하고 완료·중단 시 STANDBY를 전송한다.
+  - 첫 ARM 명령은 현재 INIT 자세로 보내 boot-limp 스냅을 흡수하고, 기본 3초 안전 카운트다운 후 집기와 놓기를 한 번만 실행한다.
+  - Python 구문 검사, YAML 설정 로드, 전체 단계와 예상시간을 출력하는 `--dry-run` 검증을 통과했다.
+- **변경 파일:**
+  - `PROJECT_LOG.md` / 수정
+  - `scripts/shape4_pick_place_test_v5.3.0.py` / 신규
+- **다음 할 일 반영:** 독립 집기 테스트 작성을 완료 처리하고, 실제 물체로 집기·놓기·STOW 복귀를 확인하는 항목을 추가했다.
+- **버전 근거:** 독립 하드웨어 검증 도구라는 새 기능과 신규 파일을 추가했으므로 MINOR를 `v5.2.2`에서 `v5.3.0`으로 올렸다.
+
+### `v5.2.2` — 2026-07-22 20:05 (KST) · 작업자: `@AI` · ID: `2026-07-22-04`
+- **변경 요약:** 메인 경기 시작 시 고정 오프닝 이동이 실행되도록 유효 설정을 활성화했다.
+- **상세:**
+  - 런치에서 최종 override로 적용되는 `motion_tuning.yaml`의 `opening_enabled`를 `false`에서 `true`로 변경했다.
+  - 현재 오프닝 값에 따라 전진 1.5초, 우측 횡이동 0.3초, 시계 90도 회전을 실행한다.
+  - 요청 범위를 유지하기 위해 `opening_wall_validation_enabled=false`는 변경하지 않았다. 따라서 오프닝 이후 별도 벽 수렴 대기 없이 다음 경기 흐름으로 전환한다.
+  - YAML 파싱을 통과했고 `robot_bringup`을 일반 설치 방식으로 빌드한 뒤 설치 설정에도 `opening_enabled=true`가 반영된 것을 확인했다.
+- **변경 파일:**
+  - `PROJECT_LOG.md` / 수정
+  - `ros2_ws/src/robot_bringup/config/motion_tuning.yaml` / 수정
+- **다음 할 일 반영:** 오프닝 활성화와 설치 반영을 완료 처리하고, 실제 경기장에서 전체 오프닝 시퀀스와 다음 상태 전환을 확인하는 항목을 추가했다.
+- **버전 근거:** 기존 기능의 실행 설정만 활성화한 소규모 변경이므로 PATCH를 `v5.2.1`에서 `v5.2.2`로 올렸다.
+
+### `v5.2.1` — 2026-07-22 13:38 (KST) · 작업자: `@AI` · ID: `2026-07-22-03`
+- **변경 요약:** 로컬 앵커에서 현재 활성 후보의 fresh `is_target=True` 결과 한 번으로 즉시 ALIGN을 시작하도록 변경했다.
+- **상세:**
+  - 메인 경기와 독립 로컬 시험 노드가 SigLIP `Classification.is_target` 값을 공용 로컬 FSM에 전달하도록 연결했다.
+  - 현재 후보의 `CLASSIFY` 진입 이후 촬영된 결과라는 기존 freshness 검사와 `face_visible`, 최소 confidence 검사는 유지했다.
+  - upstream `is_target=True`인 오늘의 목표 과일은 반복 2회 누적을 기다리지 않고 ALIGN으로 전환하며, 일반 라벨과 비목표 과일의 기존 stable-frame 누적은 유지했다.
+  - 로컬 FSM 및 메인 통합 테스트 42개를 통과했고 `robot_planning` 일반 설치 빌드를 완료했다. 이 환경의 오래된 setuptools가 editable 옵션을 지원하지 않아 `--symlink-install` 대신 별도 일반 build base를 사용했다.
+- **변경 파일:**
+  - `PROJECT_LOG.md` / 수정
+  - `ros2_ws/src/robot_planning/robot_planning/local_anchor_fsm.py` / 수정
+  - `ros2_ws/src/robot_planning/robot_planning/nodes/mission_fsm_node.py` / 수정
+  - `ros2_ws/src/robot_planning/robot_planning/nodes/local_anchor_test_node.py` / 수정
+  - `ros2_ws/src/robot_planning/test/test_local_anchor_fsm.py` / 수정
+- **다음 할 일 반영:** fresh `is_target=True` 1회 즉시 ALIGN 항목을 완료 처리했다. 다음 실주행에서 구역별 해당 전이와 실제 접근·집기를 확인한다.
+- **버전 근거:** 로컬 목표 과일의 ALIGN 진입 지연을 수정한 소규모 동작 변경이므로 PATCH를 `v5.2.0`에서 `v5.2.1`로 올렸다.
 
 ### `v5.2.0` — 2026-07-22 11:41 (KST) · 작업자: `@AI` · ID: `2026-07-22-02`
 - **변경 요약:** 인식·ALIGN·구역 이동과 제동을 안정화하고, 150초 주차를 벽 거리 기반 직선 주행으로 전환했다.

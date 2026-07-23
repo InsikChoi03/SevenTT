@@ -39,6 +39,7 @@ from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import Image, Imu
 from std_msgs.msg import Bool, Float32, Float32MultiArray, String
+from robot_interfaces.msg import MissionState
 
 # tf2 broadcasting is optional: guard the import so the node runs without tf2_ros.
 try:
@@ -58,6 +59,26 @@ def yaw_to_quaternion(theta: float) -> Tuple[float, float, float, float]:
 def wrap_angle(theta: float) -> float:
     """Wrap an angle to (-pi, pi]."""
     return math.atan2(math.sin(theta), math.cos(theta))
+
+
+_LOCAL_ANCHOR_MISSION_STATES = frozenset(
+    {"LOCAL_ANCHOR_INSPECTION", "LOCAL_ANCHOR_ALIGN"}
+)
+
+
+def object_flow_min_conf_for_state(
+    mission_state: str,
+    normal_min_conf: float,
+    local_anchor_min_conf: float,
+) -> float:
+    """Select the relaxed three-point flow gate only in local-anchor states."""
+    state = str(mission_state).strip().upper()
+    selected = (
+        local_anchor_min_conf
+        if state in _LOCAL_ANCHOR_MISSION_STATES
+        else normal_min_conf
+    )
+    return max(0.0, min(1.0, float(selected)))
 
 
 def limit_planar_delta(
@@ -356,6 +377,10 @@ class LocalizerNode(Node):
         self.use_object_flow = bool(self.get_parameter("use_object_flow").value)
         self.declare_parameter("object_flow_min_conf", 0.25)   # ignore a low-confidence flow estimate
         self.object_flow_min_conf = float(self.get_parameter("object_flow_min_conf").value)
+        self.declare_parameter("local_anchor_object_flow_min_conf", 0.15)
+        self.local_anchor_object_flow_min_conf = float(
+            self.get_parameter("local_anchor_object_flow_min_conf").value
+        )
         self.declare_parameter("object_flow_stale_sec", 0.5)   # LK VO wakes up if flow older than this
         self.object_flow_stale_sec = float(self.get_parameter("object_flow_stale_sec").value)
         self.declare_parameter("object_flow_trans", True)      # also apply flow translation (else yaw only)
@@ -561,6 +586,10 @@ class LocalizerNode(Node):
         )
         self.create_subscription(
             Float32MultiArray, "/localization/object_odom", self.on_object_odom, 10
+        )
+        self._mission_state = ""
+        self.create_subscription(
+            MissionState, "/mission_state", self.on_mission_state, 10
         )
         self.pub = self.create_publisher(PoseStamped, "/localization/pose", 10)
         self.pub_stationary = self.create_publisher(Bool, "/localization/is_stationary", 10)
@@ -1064,6 +1093,10 @@ class LocalizerNode(Node):
         self.last_imu_time = now
 
     # ------------------------------------------------------------- object-flow odometry
+    def on_mission_state(self, msg: MissionState) -> None:
+        """Track the mission mode used by the state-scoped flow confidence gate."""
+        self._mission_state = str(msg.state).strip().upper()
+
     def on_object_odom(self, msg: Float32MultiArray) -> None:
         """PRIMARY yaw source: per-frame robot motion from wide-cam object points
         [dtheta, dfwd, dleft, conf] (robot frame). Grounded in real objects, so it stays ~0 when
@@ -1075,7 +1108,12 @@ class LocalizerNode(Node):
             return
         dtheta, dfwd, dleft = float(d[0]), float(d[1]), float(d[2])
         conf = float(d[3]) if len(d) > 3 else 1.0
-        if conf < self.object_flow_min_conf:
+        min_conf = object_flow_min_conf_for_state(
+            self._mission_state,
+            self.object_flow_min_conf,
+            self.local_anchor_object_flow_min_conf,
+        )
+        if conf < min_conf:
             return
         now = self.get_clock().now().nanoseconds * 1e-9
         if (

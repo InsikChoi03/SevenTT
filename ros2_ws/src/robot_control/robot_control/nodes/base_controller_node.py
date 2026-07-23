@@ -18,6 +18,23 @@ from robot_interfaces.msg import BaseCommand, MissionState
 from std_msgs.msg import Bool, Float32MultiArray
 
 
+LOCAL_ANCHOR_MOTION_STATES = frozenset(
+    {"LOCAL_ANCHOR_INSPECTION", "LOCAL_ANCHOR_ALIGN"}
+)
+
+
+def local_anchor_motion_profile_active(mission_state: str) -> bool:
+    """Return whether the isolated local-anchor base profile owns this state."""
+    return str(mission_state).strip().upper() in LOCAL_ANCHOR_MOTION_STATES
+
+
+def select_mission_profile_value(mission_state: str, main_value, local_anchor_value):
+    """Select a local-anchor tuning value without changing the normal match profile."""
+    if local_anchor_motion_profile_active(mission_state):
+        return local_anchor_value
+    return main_value
+
+
 def below_motion_deadband(
     wheel_magnitude: float,
     wheel_deadband: float,
@@ -54,6 +71,29 @@ def select_wheel_scales(
 
     strafe = strafe_right_scales if vy < 0.0 else strafe_left_scales
     return [(awx * wheel_scales[i] + awy * strafe[i]) / tot for i in range(4)]
+
+
+def mix_calibrated_translation_and_rotation(
+    vx: float,
+    vy: float,
+    omega: float,
+    k: float,
+    translation_scales: list[float],
+    drive_rotation_scales: list[float],
+) -> list[float]:
+    """Mix calibrated translation with an independently scaled yaw component.
+
+    Straight/strafe trims compensate unequal wheel drive gains.  Applying those unequal trims to
+    the yaw term as well can cancel most of a simultaneous steering command, so the yaw vector is
+    kept symmetric and added only after translation calibration.
+    """
+    translation = [vx - vy, vx + vy, vx + vy, vx - vy]
+    rotation = [-k * omega, k * omega, -k * omega, k * omega]
+    return [
+        translation[i] * translation_scales[i]
+        + rotation[i] * drive_rotation_scales[i]
+        for i in range(4)
+    ]
 
 
 def is_precision_strafe_command(
@@ -123,6 +163,26 @@ class BaseControllerNode(Node):
         # helped during scan turns without changing forward/strafe behavior.
         self.declare_parameter("rotation_cw_scales", [1.0, 1.0, 1.0, 1.0])
         self.declare_parameter("rotation_ccw_scales", [1.0, 1.0, 1.0, 1.0])
+        # Simultaneous translation+yaw needs an independent, symmetric steering vector.  Pure
+        # in-place turns keep using rotation_cw/ccw_scales above.
+        self.declare_parameter("drive_rotation_cw_scales", [1.0, 1.0, 1.0, 1.0])
+        self.declare_parameter("drive_rotation_ccw_scales", [1.0, 1.0, 1.0, 1.0])
+        # The isolated local-anchor test uses a deliberately gentler pulse/stop profile.  Keep its
+        # values separate so normal match navigation and ALIGN retain their existing calibration.
+        self.declare_parameter(
+            "local_anchor_rotation_cw_scales", [1.0, 1.0, 1.0, 1.0]
+        )
+        self.declare_parameter(
+            "local_anchor_rotation_ccw_scales", [1.0, 1.0, 1.0, 1.0]
+        )
+        self.declare_parameter("local_anchor_wheel_min_rot", 0.07)
+        self.declare_parameter("local_anchor_wheel_boost_rot", 0.35)
+        self.declare_parameter("local_anchor_wheel_boost_ms", 100)
+        self.declare_parameter("local_anchor_rotation_wheel_brake_ms", 120)
+        self.declare_parameter("local_anchor_rotation_wheel_brake_scale", 0.315)
+        self.declare_parameter("local_anchor_align_wheel_brake_ms", 120)
+        self.declare_parameter("local_anchor_align_wheel_brake_scale", 0.315)
+        self.declare_parameter("local_anchor_wheel_slew_per_tick", 0.06)
         # STICTION: the heavy base only moves above ~this <BASE> magnitude (firmware normalises by
         # MAX_SPEED 0.6, so 0.42 ~ 0.7 duty). The velocity pipeline commands 0.05-0.20 which just
         # buzzed — so any real move is floored to this (direction preserved). 0 disables.
@@ -175,6 +235,46 @@ class BaseControllerNode(Node):
         )
         self.rotation_ccw_scales = _four_scales(
             self.get_parameter("rotation_ccw_scales").value, [1.0, 1.0, 1.0, 1.0]
+        )
+        self.drive_rotation_cw_scales = _four_scales(
+            self.get_parameter("drive_rotation_cw_scales").value,
+            [1.0, 1.0, 1.0, 1.0],
+        )
+        self.drive_rotation_ccw_scales = _four_scales(
+            self.get_parameter("drive_rotation_ccw_scales").value,
+            [1.0, 1.0, 1.0, 1.0],
+        )
+        self.local_anchor_rotation_cw_scales = _four_scales(
+            self.get_parameter("local_anchor_rotation_cw_scales").value,
+            [1.0, 1.0, 1.0, 1.0],
+        )
+        self.local_anchor_rotation_ccw_scales = _four_scales(
+            self.get_parameter("local_anchor_rotation_ccw_scales").value,
+            [1.0, 1.0, 1.0, 1.0],
+        )
+        self.local_anchor_wheel_min_rot = float(
+            self.get_parameter("local_anchor_wheel_min_rot").value
+        )
+        self.local_anchor_wheel_boost_rot = float(
+            self.get_parameter("local_anchor_wheel_boost_rot").value
+        )
+        self.local_anchor_wheel_boost_ms = float(
+            self.get_parameter("local_anchor_wheel_boost_ms").value
+        )
+        self.local_anchor_rotation_wheel_brake_ms = float(
+            self.get_parameter("local_anchor_rotation_wheel_brake_ms").value
+        )
+        self.local_anchor_rotation_wheel_brake_scale = float(
+            self.get_parameter("local_anchor_rotation_wheel_brake_scale").value
+        )
+        self.local_anchor_align_wheel_brake_ms = float(
+            self.get_parameter("local_anchor_align_wheel_brake_ms").value
+        )
+        self.local_anchor_align_wheel_brake_scale = float(
+            self.get_parameter("local_anchor_align_wheel_brake_scale").value
+        )
+        self.local_anchor_wheel_slew = float(
+            self.get_parameter("local_anchor_wheel_slew_per_tick").value
         )
         self.wheel_min = float(self.get_parameter("wheel_min").value)
         self.wheel_min_strafe = float(self.get_parameter("wheel_min_strafe").value)
@@ -244,7 +344,11 @@ class BaseControllerNode(Node):
         self.add_on_set_parameters_callback(self._on_params)
         self.timer = self.create_timer(0.02, self.tick)  # 50 Hz
 
-        self.get_logger().info(f"base IK lx={self.lx} ly={self.ly} watchdog={self.cmd_timeout}s")
+        self.get_logger().info(
+            f"base IK lx={self.lx} ly={self.ly} watchdog={self.cmd_timeout}s "
+            f"drive_rotation_cw={self.drive_rotation_cw_scales} "
+            f"drive_rotation_ccw={self.drive_rotation_ccw_scales}"
+        )
 
     def on_cmd(self, msg: BaseCommand) -> None:
         self.last_cmd = (msg.vx, msg.vy, msg.omega)
@@ -306,6 +410,54 @@ class BaseControllerNode(Node):
                             reason="rotation_ccw_scales must have 4 values",
                         )
                     self.rotation_ccw_scales = vals
+                elif name == "drive_rotation_cw_scales":
+                    vals = [float(v) for v in p.value]
+                    if len(vals) != 4:
+                        return SetParametersResult(
+                            successful=False,
+                            reason="drive_rotation_cw_scales must have 4 values",
+                        )
+                    self.drive_rotation_cw_scales = vals
+                elif name == "drive_rotation_ccw_scales":
+                    vals = [float(v) for v in p.value]
+                    if len(vals) != 4:
+                        return SetParametersResult(
+                            successful=False,
+                            reason="drive_rotation_ccw_scales must have 4 values",
+                        )
+                    self.drive_rotation_ccw_scales = vals
+                elif name == "local_anchor_rotation_cw_scales":
+                    vals = [float(v) for v in p.value]
+                    if len(vals) != 4:
+                        return SetParametersResult(
+                            successful=False,
+                            reason="local_anchor_rotation_cw_scales must have 4 values",
+                        )
+                    self.local_anchor_rotation_cw_scales = vals
+                elif name == "local_anchor_rotation_ccw_scales":
+                    vals = [float(v) for v in p.value]
+                    if len(vals) != 4:
+                        return SetParametersResult(
+                            successful=False,
+                            reason="local_anchor_rotation_ccw_scales must have 4 values",
+                        )
+                    self.local_anchor_rotation_ccw_scales = vals
+                elif name == "local_anchor_wheel_min_rot":
+                    self.local_anchor_wheel_min_rot = float(p.value)
+                elif name == "local_anchor_wheel_boost_rot":
+                    self.local_anchor_wheel_boost_rot = float(p.value)
+                elif name == "local_anchor_wheel_boost_ms":
+                    self.local_anchor_wheel_boost_ms = float(p.value)
+                elif name == "local_anchor_rotation_wheel_brake_ms":
+                    self.local_anchor_rotation_wheel_brake_ms = float(p.value)
+                elif name == "local_anchor_rotation_wheel_brake_scale":
+                    self.local_anchor_rotation_wheel_brake_scale = float(p.value)
+                elif name == "local_anchor_align_wheel_brake_ms":
+                    self.local_anchor_align_wheel_brake_ms = float(p.value)
+                elif name == "local_anchor_align_wheel_brake_scale":
+                    self.local_anchor_align_wheel_brake_scale = float(p.value)
+                elif name == "local_anchor_wheel_slew_per_tick":
+                    self.local_anchor_wheel_slew = float(p.value)
                 elif name == "wheel_min":
                     self.wheel_min = float(p.value)
                 elif name == "wheel_min_strafe":
@@ -382,24 +534,52 @@ class BaseControllerNode(Node):
 
         # Mecanum inverse kinematics (wheel linear speeds, m/s)
         k = self.lx + self.ly
-        v_fl = vx - vy - k * omega
-        v_fr = vx + vy + k * omega
-        v_rl = vx + vy - k * omega
-        v_rr = vx - vy + k * omega
 
         # Direction-dependent per-wheel trim so forward/strafe/rotation can be tuned independently:
         # forward uses wheel_scales, strafe blends by |vx|:|vy|, pure rotation uses rotation_*_scales.
-        sc = select_wheel_scales(
-            vx,
-            vy,
-            omega,
-            self.wheel_scales,
-            self.strafe_right,
-            self.strafe_left,
+        # During translation+yaw, do not multiply yaw by the unequal straight trims: add a symmetric
+        # drive_rotation vector after the translation calibration so steering authority is retained.
+        local_anchor_profile = local_anchor_motion_profile_active(self._mstate)
+        rotation_cw_scales = select_mission_profile_value(
+            self._mstate,
             self.rotation_cw_scales,
-            self.rotation_ccw_scales,
+            self.local_anchor_rotation_cw_scales,
         )
-        wheels = [v_fl * sc[0], v_fr * sc[1], v_rl * sc[2], v_rr * sc[3]]
+        rotation_ccw_scales = select_mission_profile_value(
+            self._mstate,
+            self.rotation_ccw_scales,
+            self.local_anchor_rotation_ccw_scales,
+        )
+        pure_rotation = abs(vx) < 0.02 and abs(vy) < 0.02 and abs(omega) > 1e-3
+        if pure_rotation:
+            rotation_scales = rotation_cw_scales if omega < 0.0 else rotation_ccw_scales
+            wheels = mix_calibrated_translation_and_rotation(
+                vx, vy, omega, k, [1.0, 1.0, 1.0, 1.0], rotation_scales
+            )
+        else:
+            translation_scales = select_wheel_scales(
+                vx,
+                vy,
+                0.0,
+                self.wheel_scales,
+                self.strafe_right,
+                self.strafe_left,
+                rotation_cw_scales,
+                rotation_ccw_scales,
+            )
+            drive_rotation_scales = (
+                self.drive_rotation_cw_scales
+                if omega < 0.0
+                else self.drive_rotation_ccw_scales
+            )
+            wheels = mix_calibrated_translation_and_rotation(
+                vx,
+                vy,
+                omega,
+                k,
+                translation_scales,
+                drive_rotation_scales,
+            )
         wheels = [max(-1.0, min(1.0, w)) for w in wheels]
 
         # Stiction floor + start-from-rest boost + stop brake. The whole vector is scaled so the
@@ -407,7 +587,7 @@ class BaseControllerNode(Node):
         # brief reverse pulse to kill the heavy base's coast; below the deadband otherwise = full stop.
         m = max(abs(w) for w in wheels)
         now = self.get_clock().now().nanoseconds * 1e-9
-        aligning = self._mstate == "ALIGN"
+        aligning = self._mstate in {"ALIGN", "LOCAL_ANCHOR_ALIGN"}
         is_rot = abs(vx) < 0.02 and abs(vy) < 0.02 and abs(omega) > 1e-3
         is_strafe = abs(vy) >= 0.02 and abs(vy) >= abs(vx)
         opening = self._mstate == "OPENING"
@@ -441,16 +621,36 @@ class BaseControllerNode(Node):
         ):
             if self._moving:                          # transition move -> rest: start the brake pulse
                 self._moving = False
+                rotation_brake_ms = select_mission_profile_value(
+                    self._mstate,
+                    self.rotation_wheel_brake_ms,
+                    self.local_anchor_rotation_wheel_brake_ms,
+                )
+                rotation_brake_scale = select_mission_profile_value(
+                    self._mstate,
+                    self.rotation_wheel_brake_scale,
+                    self.local_anchor_rotation_wheel_brake_scale,
+                )
+                align_brake_ms = select_mission_profile_value(
+                    self._mstate,
+                    self.align_wheel_brake_ms,
+                    self.local_anchor_align_wheel_brake_ms,
+                )
+                align_brake_scale = select_mission_profile_value(
+                    self._mstate,
+                    self.align_wheel_brake_scale,
+                    self.local_anchor_align_wheel_brake_scale,
+                )
                 brake_ms, brake_scale = select_brake_pulse_parameters(
                     align_profile=aligning or self._last_align_profile_move,
                     rotation_profile=self._last_rotation_move,
                     align_brake_off=self.align_brake_off,
                     wheel_brake_ms=self.wheel_brake_ms,
                     wheel_brake_scale=self.wheel_brake_scale,
-                    rotation_wheel_brake_ms=self.rotation_wheel_brake_ms,
-                    rotation_wheel_brake_scale=self.rotation_wheel_brake_scale,
-                    align_wheel_brake_ms=self.align_wheel_brake_ms,
-                    align_wheel_brake_scale=self.align_wheel_brake_scale,
+                    rotation_wheel_brake_ms=rotation_brake_ms,
+                    rotation_wheel_brake_scale=rotation_brake_scale,
+                    align_wheel_brake_ms=align_brake_ms,
+                    align_wheel_brake_scale=align_brake_scale,
                 )
                 brake = brake_ms > 0.0 and brake_scale > 0.0
                 if brake:
@@ -473,7 +673,10 @@ class BaseControllerNode(Node):
             # its own floor, while strafe/rotation starts also get a short breakaway boost.
             boost = 0.0
             boost_ms = self.wheel_boost_ms
-            if opening and is_rot:
+            if local_anchor_profile and is_rot:
+                boost = self.local_anchor_wheel_boost_rot
+                boost_ms = self.local_anchor_wheel_boost_ms
+            elif opening and is_rot:
                 boost = self.opening_wheel_boost_rot
                 boost_ms = self.opening_wheel_boost_ms
             elif opening and is_strafe:
@@ -496,7 +699,11 @@ class BaseControllerNode(Node):
                 steady_floor = self.opening_wheel_min
             else:
                 if is_rot:
-                    steady_floor = self.wheel_min_rot
+                    steady_floor = select_mission_profile_value(
+                        self._mstate,
+                        self.wheel_min_rot,
+                        self.local_anchor_wheel_min_rot,
+                    )
                 elif is_strafe:
                     steady_floor = self.wheel_min_strafe
                 else:
@@ -516,14 +723,19 @@ class BaseControllerNode(Node):
 
         # Slew-limit toward the target so accel/decel is smooth (no jack-rabbit start / no slip).
         # Brake pulses bypass slew (kick) so they hit hard enough to actually cut the coast.
-        if self.wheel_slew > 0.0 and not kick:
+        wheel_slew = select_mission_profile_value(
+            self._mstate,
+            self.wheel_slew,
+            self.local_anchor_wheel_slew,
+        )
+        if wheel_slew > 0.0 and not kick:
             lim = []
             for w, pv in zip(wheels, self._prev_out):
                 dw = w - pv
-                if dw > self.wheel_slew:
-                    dw = self.wheel_slew
-                elif dw < -self.wheel_slew:
-                    dw = -self.wheel_slew
+                if dw > wheel_slew:
+                    dw = wheel_slew
+                elif dw < -wheel_slew:
+                    dw = -wheel_slew
                 lim.append(pv + dw)
             wheels = lim
         self._prev_out = list(wheels)

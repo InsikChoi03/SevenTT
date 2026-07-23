@@ -149,13 +149,14 @@ yolo_detector_node:
     device: "auto"
     top_min_interval_sec: 0.066
     body_min_interval_sec: 0.06
+    max_input_age_sec: 0.25              # 추론 대기열에 남은 오래된 프레임은 GPU 투입 전에 폐기한다.
     publish_shape_classification: true
     shape_topic: "/classification/shape"
 
 siglip_gate_node:
   ros__parameters:
     model_id: "google/siglip-base-patch16-224"
-    set2_label: "orange"                  # today's Set2 fruit target
+    set2_label: "apple"                   # today's Set2 fruit target
     fruit_labels: ["apple", "orange", "banana", "pineapple"]
     confidence_threshold: 0.5             # 이제 softmax MARGIN 임계값(best-2nd). 오픽방지 위해 다소 엄격
     device: "auto"
@@ -273,8 +274,8 @@ world_model_node:
 
 target_selector_node:
   ros__parameters:
-    set1_label: "dodecahedron"            # today's Set1 shape target (정십이면체)
-    set2_label: "orange"                  # today's Set2 fruit target
+    set1_label: "icosahedron"             # today's Set1 shape target (정이십면체)
+    set2_label: "apple"                   # today's Set2 fruit target
     rate_hz: 2.0
     explore_base: 5.0
     set1_base: 20.0                       # Set1 outranks Set2 (approach bias; order enforced by FSM phase)
@@ -284,8 +285,8 @@ target_selector_node:
 
 mission_fsm_node:
   ros__parameters:
-    set1_label: "dodecahedron"            # today's Set1 shape target (정십이면체) — 4 placed
-    set2_label: "orange"                  # today's Set2 fruit target — 2 placed
+    set1_label: "icosahedron"             # today's Set1 shape target (정이십면체) — 4 placed
+    set2_label: "apple"                   # today's Set2 fruit target — 2 placed
     start_phase: 1
     conf_threshold: 0.7
     pick_track_conf: 0.5                   # 타겟 트랙 정체성 신뢰 하한(게이트=프레임전역 아닌 트랙기반)
@@ -303,6 +304,7 @@ mission_fsm_node:
     shape_target_total: 4                 # 정십이면체 4개
     fruit_target_total: 0                 # 오렌지 큐브 무시: 정십이면체만 집기
     set2_require_fruit_label: true
+    set2_committed_cube_pick_enabled: true # 바나나 선택 위치의 Body 큐브가 집기점에 있으면 빈 면으로 보고 PICK
     grab_x: 0.19                          # 집기점 전방(m). 0.21에서 2cm 더 가까이 잡도록 조정
     grab_min_x: 0.17                      # 이보다 더 가까이 밀지 않음(전진 안전한계)
     storage_x: 1.6                        # 보관함 위치 field xy (좌측하단 구석 안쪽). 실제 빈 위치로 조정
@@ -315,17 +317,19 @@ mission_fsm_node:
     # Upscale each body detection pixel to that domain before perspectiveTransform (npz untouched).
     body_px_scale_x: 2.5625               # 1640/640
     body_px_scale_y: 2.566667             # 1232/480
-    # 경기 시작 하드코딩 개막 이동(로봇 body 기준): 전진 1초 → 오른쪽 횡이동 0.5초 → 제자리 45도 회전 → 1초 정지 → SCAN.
+    # 경기 시작 하드코딩 개막 이동(로봇 body 기준): motion_tuning.yaml과 동일하게 유지한다.
     # 이후 phase 1에서 Set1 정이십면체를 탐색/접근한다.
     opening_enabled: true
-    startup_warmup_sec: 15.0              # YOLO 로드+world_model 뜰 때까지 정지 대기 후 개막(방향 잃음 방지)
-    opening_speed: 0.1755                 # 주행 속도 1.3배 상향: 0.135 -> 0.1755
-    opening_forward_sec: 2.0
-    opening_strafe_speed: 0.26325         # 횡이동 속도 1.5배 상향: 0.1755 -> 0.26325
-    opening_strafe_right_sec: 1.5
-    opening_turn_deg: 45.0
-    opening_turn_omega: -0.255            # 회전 속도 1.5배 상향: -0.17 -> -0.255
-    opening_wait_after_turn_sec: 1.0
+    startup_warmup_sec: 0.0
+    opening_speed: 0.2
+    opening_forward_sec: 1.5
+    opening_strafe_speed: 0.40
+    opening_strafe_right_sec: 0.3
+    opening_turn_deg: 90.0
+    opening_turn_omega: -0.30
+    opening_turn_tolerance_rad: 0.06
+    opening_turn_timeout_sec: 7.0
+    opening_wait_after_turn_sec: 2.0
     scan_search_omega: -0.255             # 탐색 회전 속도 1.5배 상향: -0.17 -> -0.255
     # ★레인-그래프 waypoint 플래너★ (50cm 물체격자, 40cm 로봇). 이동목표(SCAN 스윕·APPROACH standoff·
     # 보관함)를 충돌없는 레인 중심선으로 라우팅. go_to_goal은 각 via를 car-like+반응형으로 주행.
@@ -386,6 +390,10 @@ mission_fsm_node:
     align_wide_max_age_sec: 0.80          # 옥타 최종 분류에서 stale Wide 프레임 차단
     align_body_confirm_frames: 3          # 같은 근거리 물체를 새 Body 프레임 3개에서 확인
     align_body_lost_backoff_enabled: true # ALIGN에서 wide/world에는 있는데 body에 없으면 후진 후 재탐지
+    align_body_lost_confirm_sec: 0.40     # 단일 빈 프레임이 아닌 연속 누락만 유실로 확정
+    align_body_lost_confirm_frames: 3     # 서로 다른 새 Body 검출 프레임 3회 누락 필요
+    align_body_lost_max_backoffs: 2       # 바나나 재획득을 위해 같은 ALIGN 방문에서 후진을 두 번까지 허용
+    align_body_lost_reselect_cooldown_sec: 6.0 # 재획득 실패 위치 즉시 재선택 방지
     align_body_lost_backoff_speed: 0.189  # body lost 후진 duty: 0.27의 0.7배
     align_body_lost_backoff_sec: 0.54     # 속도 0.7배 기준 약 10cm 후진
     align_body_lost_backoff_settle_sec: 1.0 # 후진 후 카메라 안정화 대기
@@ -399,12 +407,17 @@ pick_sequencer_node:
     init_pose: [120.0, 5.0, 100.0]        # 검증된 초기/주행 대기 자세 [어깨, 손목, 그리퍼]
     pick_shoulder_wrist: [25.0, 150.0]    # 집기 도달: 어깨·손목
     place_shoulder_wrist: [110.0, 30.0]   # 놓기: 닫은 채 이동 후 이 위치에서 열기
-    grip_open: 115.0                      # 열림/놓기
-    grip_closed: 50.0                     # 닫힘/잡기
-    move_sec: 4.0                         # 팔 이동 단계 램프 시간(REACH/LIFT/TO_PLACE). 내림 속도 완화
-    grasp_sec: 1.0                        # 그리퍼 열림/닫힘 단계 램프 시간
-    pick_settle_sec: 0.25                 # 집기 자세 도달 후 열린 상태 정착 시간
-    servo_speed_dps: 60.0                 # 펌웨어 이동시간 계산에 쓰는 보수적 속도
+    grip_open: 118.0                      # 열림/놓기
+    grip_closed: 45.0                     # 독립 테스트에서 검증한 닫힘 각도
+    move_sec: 1.3                         # 구 설정 파일 호환용(현재는 단계별 시간 사용)
+    reach_lift_sec: 1.3                   # REACH/LIFT
+    to_place_sec: 1.25                    # 보관함 자세 이동
+    stow_sec: 1.0                         # 주행 대기 자세 복귀
+    grasp_sec: 0.75                       # 즉시 닫기 명령 유지 후 자동 LIFT
+    preopen_sec: 0.2                      # 하강 전 열기
+    pick_settle_sec: 0.0                  # REACH 뒤 즉시 GRASP
+    servo_speed_dps: 60.0                 # 이전 설정 호환용
+    servo_speed_dps_by_channel: [80.0, 120.0, 120.0]
 
 go_to_goal_node:
   ros__parameters:
@@ -496,9 +509,12 @@ recognition_viz_node:
     grid_spacing_m: 0.50
     grid_origin_x_m: -1.50                # world_model_node grid prior와 같은 기준
     grid_origin_y_m: -1.50
-    show_zone_regions: true               # FSM이 쓰는 격자 기준 구역을 라이브 맵에 사각형으로 표시
+    show_zone_regions: false              # global 지그재그 모드에서는 구형 zone 표시를 숨김
     zone_bounds_m: [-2.0, -0.25, -0.25, 2.0,  -2.0, -0.25, -2.0, -0.25,  -0.25, 2.0, -2.0, -0.25,  -0.25, 2.0, -0.25, 2.0]
-    show_zone_anchors: true
+    show_zone_anchors: false
+    show_global_zigzag_route: true
+    global_zigzag_start_xy: [-1.25, 1.60]
+    global_zigzag_waypoints_xy: [-1.25, 1.25, -1.25, -1.25, 1.25, -1.25]
     zone_anchor_xy: [-1.0, 0.5, -1.0, -1.0, 1.25, -1.25, 0.75, 0.5]
     # 맵 FOV 표시(world_model 과 동일값): 본체=부채꼴, 광각=전방 타원
     body_fov_half_deg: 30.0
