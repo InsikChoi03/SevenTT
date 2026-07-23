@@ -1406,6 +1406,18 @@ class MissionFsmNode(Node):
         self.declare_parameter("storage_wall_confirm_frames", 3)
         self.declare_parameter("storage_wall_max_age_sec", 1.50)
         self.declare_parameter("storage_wall_detection_required_m", 0.60)
+        self.declare_parameter("storage_pose_fallback_enabled", False)
+        self.declare_parameter("storage_pose_fallback_hold_sec", 0.8)
+        self.declare_parameter("storage_pose_fallback_contact_speed", 0.06)
+        self.declare_parameter("storage_last_chance_enabled", False)
+        self.declare_parameter("storage_last_chance_trigger_sec", 145.0)
+        self.declare_parameter("storage_last_chance_pre_backoff_m", 0.05)
+        self.declare_parameter("storage_last_chance_pre_backoff_speed", 0.10)
+        self.declare_parameter("storage_last_chance_turn_left_deg", 95.0)
+        self.declare_parameter("storage_last_chance_reverse_sec", 5.0)
+        self.declare_parameter("storage_last_chance_alternate_sec", 2.0)
+        self.declare_parameter("storage_last_chance_force_dump_after_sec", 12.0)
+        self.declare_parameter("storage_last_chance_speed", 0.20)
         self.declare_parameter("storage_contact_hold_enabled", True)
         self.declare_parameter("storage_contact_hold_speed", 0.08)
         self.declare_parameter("shape_target_total", 4)   # set1 shape * 4
@@ -2038,6 +2050,42 @@ class MissionFsmNode(Node):
             self.storage_bottom_wall_stop_m,
             self.storage_left_wall_stop_m,
             float(self.get_parameter("storage_wall_detection_required_m").value),
+        )
+        self.storage_pose_fallback_enabled = bool(
+            self.get_parameter("storage_pose_fallback_enabled").value
+        )
+        self.storage_pose_fallback_hold_sec = max(
+            0.0, float(self.get_parameter("storage_pose_fallback_hold_sec").value)
+        )
+        self.storage_pose_fallback_contact_speed = abs(
+            float(self.get_parameter("storage_pose_fallback_contact_speed").value)
+        )
+        self.storage_last_chance_enabled = bool(
+            self.get_parameter("storage_last_chance_enabled").value
+        )
+        self.storage_last_chance_trigger_sec = max(
+            0.0, float(self.get_parameter("storage_last_chance_trigger_sec").value)
+        )
+        self.storage_last_chance_pre_backoff_m = max(
+            0.0, float(self.get_parameter("storage_last_chance_pre_backoff_m").value)
+        )
+        self.storage_last_chance_pre_backoff_speed = abs(
+            float(self.get_parameter("storage_last_chance_pre_backoff_speed").value)
+        )
+        self.storage_last_chance_turn_left_deg = float(
+            self.get_parameter("storage_last_chance_turn_left_deg").value
+        )
+        self.storage_last_chance_reverse_sec = max(
+            0.0, float(self.get_parameter("storage_last_chance_reverse_sec").value)
+        )
+        self.storage_last_chance_alternate_sec = max(
+            0.1, float(self.get_parameter("storage_last_chance_alternate_sec").value)
+        )
+        self.storage_last_chance_force_dump_after_sec = max(
+            0.0, float(self.get_parameter("storage_last_chance_force_dump_after_sec").value)
+        )
+        self.storage_last_chance_speed = abs(
+            float(self.get_parameter("storage_last_chance_speed").value)
         )
         self.storage_contact_hold_enabled = bool(
             self.get_parameter("storage_contact_hold_enabled").value
@@ -2928,6 +2976,13 @@ class MissionFsmNode(Node):
         self._storage_route_phase = "face_bottom_wall"
         self._storage_staging_heading: float | None = None
         self._storage_reverse_heading: float | None = self.storage_right_heading_rad
+        self._storage_pose_fallback_key: str | None = None
+        self._storage_pose_fallback_start_s = 0.0
+        self._storage_last_chance_active = False
+        self._storage_last_chance_phase = "idle"
+        self._storage_last_chance_started_s = 0.0
+        self._storage_last_chance_phase_started_s = 0.0
+        self._storage_last_chance_turn_heading: float | None = None
         self._wall_segments: list[tuple[float, float, float, float]] = []
         self._wall_segments_s = 0.0
         self._wall_segments_seq = 0
@@ -3236,6 +3291,13 @@ class MissionFsmNode(Node):
         self._storage_route_phase = "face_bottom_wall"
         self._storage_staging_heading = None
         self._storage_reverse_heading = self.storage_right_heading_rad
+        self._storage_pose_fallback_key = None
+        self._storage_pose_fallback_start_s = 0.0
+        self._storage_last_chance_active = False
+        self._storage_last_chance_phase = "idle"
+        self._storage_last_chance_started_s = 0.0
+        self._storage_last_chance_phase_started_s = 0.0
+        self._storage_last_chance_turn_heading = None
         self._reset_storage_wall_confirmation()
         self._wall_initialization_last_seq = self._wall_segments_seq
         self._wall_initialization_valid_frames = 0
@@ -3457,6 +3519,13 @@ class MissionFsmNode(Node):
             self._storage_route_phase = "face_bottom_wall"
             self._storage_staging_heading = None
             self._storage_reverse_heading = self.storage_right_heading_rad
+            self._storage_pose_fallback_key = None
+            self._storage_pose_fallback_start_s = 0.0
+            self._storage_last_chance_active = False
+            self._storage_last_chance_phase = "idle"
+            self._storage_last_chance_started_s = 0.0
+            self._storage_last_chance_phase_started_s = 0.0
+            self._storage_last_chance_turn_heading = None
             self._reset_storage_wall_confirmation()
             self._storage_wall_warmup_last_seq = self._wall_segments_seq
             self._storage_wall_warmup_valid_frames = 0
@@ -9717,10 +9786,148 @@ class MissionFsmNode(Node):
         self._decide(f"STORAGE LEFT WALL PARKED {reason}")
         self._enter("ALIGN_OVER_BIN")
 
+    def _mission_elapsed_s(self) -> float:
+        if not self._run_started:
+            return 0.0
+        return max(0.0, self._now_s() - self._node_start_s)
+
+    def _fresh_storage_wall_available(self) -> bool:
+        return (
+            bool(self._wall_segments)
+            and self._now_s() - self._wall_segments_s <= self.storage_wall_max_age_sec
+        )
+
+    def _maybe_start_storage_last_chance(self) -> bool:
+        if self._storage_last_chance_active:
+            return True
+        if not self.storage_last_chance_enabled:
+            return False
+        if self._storage_route_completed or self.state != "DRIVE_TO_STORAGE":
+            return False
+        elapsed = self._mission_elapsed_s()
+        if elapsed < self.storage_last_chance_trigger_sec:
+            return False
+        if self._fresh_storage_wall_available():
+            return False
+        now = self._now_s()
+        self._storage_last_chance_active = True
+        self._storage_last_chance_phase = "pre_backoff"
+        self._storage_last_chance_started_s = now
+        self._storage_last_chance_phase_started_s = now
+        self._storage_last_chance_turn_heading = None
+        self._storage_pose_fallback_key = None
+        self._reset_storage_wall_confirmation()
+        self._reset_pulsed_heading()
+        self._decide(
+            "STORAGE LAST-CHANCE no fresh wall "
+            f"t={elapsed:.1f}s -> BACKOFF {self.storage_last_chance_pre_backoff_m * 100.0:.0f}cm"
+        )
+        return True
+
+    def _step_storage_last_chance(self) -> None:
+        if self.world is None:
+            self._drive(0.0, 0.0, 0.0)
+            return
+        now = self._now_s()
+        total_elapsed = now - self._storage_last_chance_started_s
+        if (
+            self.storage_last_chance_force_dump_after_sec > 0.0
+            and total_elapsed >= self.storage_last_chance_force_dump_after_sec
+        ):
+            self._decide(
+                f"STORAGE LAST-CHANCE force dump after {total_elapsed:.1f}s"
+            )
+            self._finish_storage_reverse("last-chance force dump")
+            return
+
+        speed = max(0.0, self.storage_last_chance_speed)
+        phase = self._storage_last_chance_phase
+        phase_elapsed = now - self._storage_last_chance_phase_started_s
+
+        if phase == "pre_backoff":
+            backoff_speed = max(0.01, self.storage_last_chance_pre_backoff_speed)
+            backoff_sec = self.storage_last_chance_pre_backoff_m / backoff_speed
+            if phase_elapsed < backoff_sec:
+                self._drive(-backoff_speed, 0.0, 0.0)
+                return
+            self._storage_last_chance_phase = "turn_left"
+            self._storage_last_chance_phase_started_s = now
+            self._storage_last_chance_turn_heading = self._wrap_pi(
+                float(self.world.robot_theta)
+                + math.radians(self.storage_last_chance_turn_left_deg)
+            )
+            self._reset_pulsed_heading()
+            self._decide(
+                f"STORAGE LAST-CHANCE left turn {self.storage_last_chance_turn_left_deg:.0f}deg"
+            )
+            phase = self._storage_last_chance_phase
+
+        if phase == "turn_left":
+            target = self._storage_last_chance_turn_heading
+            if target is None:
+                target = self._wrap_pi(
+                    float(self.world.robot_theta)
+                    + math.radians(self.storage_last_chance_turn_left_deg)
+                )
+                self._storage_last_chance_turn_heading = target
+            aligned = self._turn_in_place_pulsed(
+                target,
+                self.storage_heading_tolerance_rad,
+                key=("storage_last_chance_turn_left", round(target, 6)),
+            )
+            if aligned:
+                self._storage_last_chance_phase = "reverse_charge"
+                self._storage_last_chance_phase_started_s = now
+                self._decide(
+                    f"STORAGE LAST-CHANCE reverse charge {self.storage_last_chance_reverse_sec:.1f}s "
+                    f"speed={speed:.2f}"
+                )
+            return
+
+        if phase == "reverse_charge":
+            if phase_elapsed < self.storage_last_chance_reverse_sec:
+                self._drive(-speed, 0.0, 0.0)
+                return
+            self._storage_last_chance_phase = "strafe_right"
+            self._storage_last_chance_phase_started_s = now
+            self._decide(
+                f"STORAGE LAST-CHANCE alternate right strafe/reverse "
+                f"{self.storage_last_chance_alternate_sec:.1f}s each"
+            )
+            self._drive(0.0, -speed, 0.0)
+            return
+
+        if phase == "strafe_right":
+            if phase_elapsed >= self.storage_last_chance_alternate_sec:
+                self._storage_last_chance_phase = "alternate_reverse"
+                self._storage_last_chance_phase_started_s = now
+                self._decide("STORAGE LAST-CHANCE alternate reverse")
+                self._drive(-speed, 0.0, 0.0)
+                return
+            self._drive(0.0, -speed, 0.0)
+            return
+
+        if phase == "alternate_reverse":
+            if phase_elapsed >= self.storage_last_chance_alternate_sec:
+                self._storage_last_chance_phase = "strafe_right"
+                self._storage_last_chance_phase_started_s = now
+                self._decide("STORAGE LAST-CHANCE alternate right strafe")
+                self._drive(0.0, -speed, 0.0)
+                return
+            self._drive(-speed, 0.0, 0.0)
+            return
+
+        self._storage_last_chance_phase = "turn_left"
+        self._storage_last_chance_phase_started_s = now
+        self._drive(0.0, 0.0, 0.0)
+
     def _step_drive_to_storage(self) -> None:
         """Approach the bottom wall, face right, then reverse toward the left wall."""
         if self.world is None:
             self._drive(0.0, 0.0, 0.0)
+            return
+        if self._maybe_start_storage_last_chance():
+            self._step_storage_last_chance()
             return
 
         if self._storage_route_phase == "face_bottom_wall":
@@ -9742,6 +9949,7 @@ class MissionFsmNode(Node):
             observed = self._storage_wall_distance(axis="y", direction=1)
             pose_distance = self._storage_pose_wall_distance(axis="y", direction=1)
             if observed is not None and observed <= self.storage_bottom_wall_stop_m:
+                self._storage_pose_fallback_key = None
                 self._drive(0.0, 0.0, 0.0)
                 if self._storage_wall_stop_confirmed(
                     observed, self.storage_bottom_wall_stop_m
@@ -9755,6 +9963,38 @@ class MissionFsmNode(Node):
                 return
             self._storage_wall_stop_confirmed(observed, self.storage_bottom_wall_stop_m)
             if observed is None and pose_distance <= self.storage_wall_detection_required_m:
+                if self.storage_pose_fallback_enabled:
+                    key = "bottom_wall"
+                    now = self._now_s()
+                    if self._storage_pose_fallback_key != key:
+                        self._storage_pose_fallback_key = key
+                        self._storage_pose_fallback_start_s = now
+                        self._decide(
+                            f"STORAGE POSE FALLBACK bottom wall pose={pose_distance:.2f}m "
+                            f"-> CONTACT {self.storage_pose_fallback_hold_sec:.1f}s"
+                        )
+                    elapsed = now - self._storage_pose_fallback_start_s
+                    if elapsed >= self.storage_pose_fallback_hold_sec:
+                        self._drive(0.0, 0.0, 0.0)
+                        self._storage_route_phase = "face_right"
+                        self._storage_pose_fallback_key = None
+                        self._reset_storage_wall_confirmation()
+                        self._reset_pulsed_heading()
+                        self._decide(
+                            f"STORAGE BOTTOM WALL POSE FALLBACK {pose_distance:.2f}m "
+                            "-> FACE RIGHT"
+                        )
+                        return
+                    vx, vy, omega = straight_forward_command(
+                        current_heading=float(self.world.robot_theta),
+                        target_heading=self.storage_down_heading_rad,
+                        distance_m=1.0,
+                        max_speed=self.storage_pose_fallback_contact_speed,
+                        heading_kp=self.storage_reverse_heading_kp,
+                        omega_max=self.storage_reverse_omega_max,
+                    )
+                    self._drive(vx, vy, omega)
+                    return
                 self._drive(0.0, 0.0, 0.0)
                 self.get_logger().warn(
                     "storage bottom wall is near by pose but has no fresh wall detection; "
@@ -9762,6 +10002,7 @@ class MissionFsmNode(Node):
                     throttle_duration_sec=2.0,
                 )
                 return
+            self._storage_pose_fallback_key = None
             heading_error = self._wrap_pi(
                 self.storage_down_heading_rad - float(self.world.robot_theta)
             )
@@ -9811,12 +10052,38 @@ class MissionFsmNode(Node):
         observed = self._storage_wall_distance(axis="x", direction=1)
         pose_distance = self._storage_pose_wall_distance(axis="x", direction=1)
         if observed is not None and observed <= self.storage_left_wall_stop_m:
+            self._storage_pose_fallback_key = None
             self._drive(0.0, 0.0, 0.0)
             if self._storage_wall_stop_confirmed(observed, self.storage_left_wall_stop_m):
                 self._finish_storage_reverse(f"left wall={observed:.2f}m")
             return
         self._storage_wall_stop_confirmed(observed, self.storage_left_wall_stop_m)
         if observed is None and pose_distance <= self.storage_wall_detection_required_m:
+            if self.storage_pose_fallback_enabled:
+                key = "left_wall"
+                now = self._now_s()
+                if self._storage_pose_fallback_key != key:
+                    self._storage_pose_fallback_key = key
+                    self._storage_pose_fallback_start_s = now
+                    self._decide(
+                        f"STORAGE POSE FALLBACK left wall pose={pose_distance:.2f}m "
+                        f"-> REVERSE CONTACT {self.storage_pose_fallback_hold_sec:.1f}s"
+                    )
+                elapsed = now - self._storage_pose_fallback_start_s
+                if elapsed >= self.storage_pose_fallback_hold_sec:
+                    self._storage_pose_fallback_key = None
+                    self._finish_storage_reverse(f"pose fallback left wall={pose_distance:.2f}m")
+                    return
+                vx, vy, omega = straight_reverse_command(
+                    current_heading=float(self.world.robot_theta),
+                    target_heading=self.storage_right_heading_rad,
+                    distance_m=1.0,
+                    max_speed=self.storage_pose_fallback_contact_speed,
+                    heading_kp=self.storage_reverse_heading_kp,
+                    omega_max=self.storage_reverse_omega_max,
+                )
+                self._drive(vx, vy, omega)
+                return
             self._drive(0.0, 0.0, 0.0)
             self.get_logger().warn(
                 "storage left wall is near by pose but has no fresh wall detection; "
@@ -9824,6 +10091,7 @@ class MissionFsmNode(Node):
                 throttle_duration_sec=2.0,
             )
             return
+        self._storage_pose_fallback_key = None
 
         heading_error = self._wrap_pi(
             self.storage_right_heading_rad - float(self.world.robot_theta)

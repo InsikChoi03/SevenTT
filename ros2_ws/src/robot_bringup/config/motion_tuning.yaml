@@ -128,7 +128,7 @@ wall_localizer_node:
 
 target_selector_node:
   ros__parameters:
-    set1_label: "octahedron"             # Set1 목표: 정이십면체.
+    set1_label: "cube"             # Set1 목표: 정이십면체.
     set2_label: "apple"                   # Set2 목표: 사과 과일 큐브.
     rate_hz: 2.0                          # 목표 후보 선택 노드 실행 주기.
     explore_base: 5.0                     # 탐색 후보 기본 점수.
@@ -140,7 +140,7 @@ target_selector_node:
 mission_fsm_node:
   ros__parameters:
     # 목표/단계 설정
-    set1_label: "octahedron"             # FSM이 Set1에서 실제로 집을 정이십면체 라벨.
+    set1_label: "cube"             # FSM이 Set1에서 실제로 집을 정이십면체 라벨.
     set2_label: "apple"                   # FSM이 Set2에서 실제로 집을 사과 라벨.
     start_phase: 1                        # anchor 슬롯을 고르면 실제 물체 set_type으로 phase가 갱신된다.
     mixed_target_mode: false              # 목표 순서는 각 anchor의 최초 고정 snapshot queue가 결정한다.
@@ -585,7 +585,19 @@ mission_fsm_node:
     storage_reverse_realign_rad: 0.1745   # 구버전 호환값(현재는 정지 pivot 없이 주행 중 heading을 계속 보정).
     storage_wall_confirm_frames: 3        # 서로 다른 벽 검출 프레임 3회 연속으로 거리 조건을 확인한다.
     storage_wall_max_age_sec: 1.50        # 이보다 오래된 벽 선분은 주차 거리 판단에 사용하지 않는다.
-    storage_wall_detection_required_m: 0.60 # pose상 벽 60cm 이내인데 검출이 없으면 경고하되 접촉 주행은 유지한다.
+    storage_wall_detection_required_m: 0.60 # pose상 벽 60cm 이내인데 검출이 없으면 fallback/hold 판단에 들어간다.
+    storage_pose_fallback_enabled: false  # pose 기반 접촉 fallback은 최후수단과 겹치므로 비활성화한다.
+    storage_pose_fallback_hold_sec: 0.8   # pose fallback 접촉 주행 유지 시간.
+    storage_pose_fallback_contact_speed: 0.06 # pose fallback 접촉 주행 속도. 실제 벽 경기장에서는 fresh wall 확정이 우선된다.
+    storage_last_chance_enabled: true     # 최후 수단: t=145s 이후 fresh wall이 없으면 좌회전 후 보관함 방향으로 강제 돌진한다.
+    storage_last_chance_trigger_sec: 145.0 # RUNNING/오프닝 시작 기준 145초 이후에만 발동한다.
+    storage_last_chance_pre_backoff_m: 0.05 # 최후 수단 시작 직후 왼쪽 회전 전에 5cm만 살짝 후진한다.
+    storage_last_chance_pre_backoff_speed: 0.10 # 5cm 후진 속도. 약 0.5초 동작한다.
+    storage_last_chance_turn_left_deg: 95.0 # 현재 차체 기준 왼쪽으로 약 95도 회전한다.
+    storage_last_chance_reverse_sec: 5.0  # 회전 후 5초 동안 최고속으로 후진 돌진한다.
+    storage_last_chance_alternate_sec: 2.0 # 이후 오른쪽 횡이동/후진을 2초씩 번갈아 수행한다.
+    storage_last_chance_force_dump_after_sec: 12.0 # 최후 돌진 시작 후 12초가 지나면 즉시 덤프 단계로 넘긴다.
+    storage_last_chance_speed: 0.20       # 현재 주행 설정 중 최고 속도급 명령. vy<0은 오른쪽 횡이동이다.
     storage_contact_hold_enabled: true    # 벽 접촉 확인/투하/END 동안에도 후진 출력을 계속 유지한다.
     storage_contact_hold_speed: 0.08      # 마지막 보관함 벽에 계속 밀착할 후진 출력.
 

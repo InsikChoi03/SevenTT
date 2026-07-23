@@ -168,6 +168,18 @@ class _StorageStub:
     storage_wall_confirm_frames = 3
     storage_wall_max_age_sec = 1.50
     storage_wall_detection_required_m = 0.60
+    storage_pose_fallback_enabled = False
+    storage_pose_fallback_hold_sec = 0.8
+    storage_pose_fallback_contact_speed = 0.06
+    storage_last_chance_enabled = False
+    storage_last_chance_trigger_sec = 145.0
+    storage_last_chance_pre_backoff_m = 0.05
+    storage_last_chance_pre_backoff_speed = 0.10
+    storage_last_chance_turn_left_deg = 95.0
+    storage_last_chance_reverse_sec = 5.0
+    storage_last_chance_alternate_sec = 2.0
+    storage_last_chance_force_dump_after_sec = 12.0
+    storage_last_chance_speed = 0.20
     storage_contact_hold_enabled = True
     storage_contact_hold_speed = 0.08
     storage_wall_warmup_sec = 0.8
@@ -180,6 +192,13 @@ class _StorageStub:
         self._storage_route_completed = False
         self._storage_wall_confirm_count = 0
         self._storage_wall_confirm_last_seq = -1
+        self._storage_pose_fallback_key = None
+        self._storage_pose_fallback_start_s = 0.0
+        self._storage_last_chance_active = False
+        self._storage_last_chance_phase = "idle"
+        self._storage_last_chance_started_s = 0.0
+        self._storage_last_chance_phase_started_s = 0.0
+        self._storage_last_chance_turn_heading = None
         self._wall_segments = []
         self._wall_segments_s = 10.0
         self._wall_segments_seq = 0
@@ -190,6 +209,8 @@ class _StorageStub:
         self.commands = []
         self.decisions = []
         self.state = "DRIVE_TO_STORAGE"
+        self._run_started = True
+        self._node_start_s = 0.0
 
     def set_segments(self, *segments):
         self._wall_segments = list(segments)
@@ -243,6 +264,18 @@ class _StorageStub:
 
     def _enter(self, state):
         self.state = state
+
+    def _mission_elapsed_s(self):
+        return MissionFsmNode._mission_elapsed_s(self)
+
+    def _fresh_storage_wall_available(self):
+        return MissionFsmNode._fresh_storage_wall_available(self)
+
+    def _maybe_start_storage_last_chance(self):
+        return MissionFsmNode._maybe_start_storage_last_chance(self)
+
+    def _step_storage_last_chance(self):
+        MissionFsmNode._step_storage_last_chance(self)
 
     def get_logger(self):
         return _Logger()
@@ -306,6 +339,96 @@ def test_storage_holds_when_near_wall_detection_is_temporarily_missing():
 
     assert node.commands[-1] == (0.0, 0.0, 0.0)
     assert node._storage_route_phase == "approach_bottom_wall"
+
+
+def test_storage_pose_fallback_advances_without_fresh_bottom_wall_detection():
+    node = _StorageStub()
+    node.storage_pose_fallback_enabled = True
+    node._storage_route_phase = "approach_bottom_wall"
+    node.world.robot_y = 1.45
+    node._wall_segments_s = 0.0
+
+    MissionFsmNode._step_drive_to_storage(node)
+
+    assert node.commands[-1][0] > 0.0
+    assert node._storage_route_phase == "approach_bottom_wall"
+    assert any("STORAGE POSE FALLBACK bottom wall" in d for d in node.decisions)
+
+    node._now += node.storage_pose_fallback_hold_sec
+    MissionFsmNode._step_drive_to_storage(node)
+
+    assert node.commands[-1] == (0.0, 0.0, 0.0)
+    assert node._storage_route_phase == "face_right"
+    assert any("STORAGE BOTTOM WALL POSE FALLBACK" in d for d in node.decisions)
+
+
+def test_storage_pose_fallback_finishes_reverse_without_fresh_left_wall_detection():
+    node = _StorageStub()
+    node.storage_pose_fallback_enabled = True
+    node._storage_route_phase = "reverse_to_left_wall"
+    node.world.robot_x = 1.55
+    node.world.robot_theta = math.pi
+    node._wall_segments_s = 0.0
+
+    MissionFsmNode._step_drive_to_storage(node)
+
+    assert node.commands[-1][0] < 0.0
+    assert node.state == "DRIVE_TO_STORAGE"
+    assert any("STORAGE POSE FALLBACK left wall" in d for d in node.decisions)
+
+    node._now += node.storage_pose_fallback_hold_sec
+    MissionFsmNode._step_drive_to_storage(node)
+
+    assert node._storage_route_completed is True
+    assert node.state == "ALIGN_OVER_BIN"
+
+
+def test_storage_last_chance_runs_desperation_pattern_and_forces_dump():
+    node = _StorageStub()
+    node.storage_last_chance_enabled = True
+    node._storage_route_phase = "approach_bottom_wall"
+    node._now = 145.0
+    node._wall_segments_s = 0.0
+
+    MissionFsmNode._step_drive_to_storage(node)
+
+    assert node._storage_last_chance_active is True
+    assert node._storage_last_chance_phase == "pre_backoff"
+    assert node._storage_last_chance_turn_heading is None
+    assert node.commands[-1] == pytest.approx((-0.10, 0.0, 0.0))
+    assert any("STORAGE LAST-CHANCE no fresh wall" in d for d in node.decisions)
+    assert any("BACKOFF 5cm" in d for d in node.decisions)
+
+    node._now = node._storage_last_chance_phase_started_s + 0.5
+    MissionFsmNode._step_drive_to_storage(node)
+    assert node._storage_last_chance_phase == "reverse_charge"
+    assert node._storage_last_chance_turn_heading == pytest.approx(
+        math.atan2(
+            math.sin(math.pi / 2.0 + math.radians(95.0)),
+            math.cos(math.pi / 2.0 + math.radians(95.0)),
+        )
+    )
+    assert any("STORAGE LAST-CHANCE left turn 95deg" in d for d in node.decisions)
+
+    node._now += 0.1
+    MissionFsmNode._step_drive_to_storage(node)
+    assert node.commands[-1] == pytest.approx((-0.20, 0.0, 0.0))
+
+    node._now = node._storage_last_chance_phase_started_s + 5.0
+    MissionFsmNode._step_drive_to_storage(node)
+    assert node._storage_last_chance_phase == "strafe_right"
+    assert node.commands[-1] == pytest.approx((0.0, -0.20, 0.0))
+
+    node._now = node._storage_last_chance_phase_started_s + 2.0
+    MissionFsmNode._step_drive_to_storage(node)
+    assert node._storage_last_chance_phase == "alternate_reverse"
+    assert node.commands[-1] == pytest.approx((-0.20, 0.0, 0.0))
+
+    node._now = node._storage_last_chance_started_s + 12.0
+    MissionFsmNode._step_drive_to_storage(node)
+    assert node._storage_route_completed is True
+    assert node.state == "ALIGN_OVER_BIN"
+    assert any("last-chance force dump" in d for d in node.decisions)
 
 
 def test_storage_flag_disabled_still_uses_v520_wall_route():
