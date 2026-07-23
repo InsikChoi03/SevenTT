@@ -26,10 +26,10 @@
 
 ## 2. 현재 상태 (Snapshot — 이 섹션만 최신값으로 덮어쓰기)
 
-- **현재 버전:** `v6.1.0` (`new` 브랜치, 예선1용)
-- **최종 업데이트:** 2026-07-23 13:16 (KST)
+- **현재 버전:** `v6.2.0` (`new` 브랜치, 예선1용)
+- **최종 업데이트:** 2026-07-23 13:37 (KST)
 - **최종 작업자:** `@AI`
-- **한 줄 요약:** v6.0.0 안정 주행을 유지하되, 보관함 벽 감지 실패 시 145초 최후수단 주차 패턴을 적용한 예선1용 상태다.
+- **한 줄 요약:** 예선1용으로 목표를 cube/banana로 맞추고, 보관함 출발을 RUNNING 이후 match 150초 고정으로 정리한 상태다.
 
 ---
 
@@ -173,12 +173,31 @@
 - [ ] v6.0.0 태그 기준으로 동일 경기장 세팅에서 재현 run 1회를 수행해 주차 완료와 덤프까지 확인 — `@insik`
 - [x] 예선1용 보관함 최후수단 주차 fallback을 설정·테스트·빌드하고 커밋 — `@AI` (2026-07-23 완료)
 - [ ] 예선1 실제 경기장에서 fresh wall 감지, 145초 최후수단 진입 여부, 덤프 완료 시간을 로그로 확인 — `@insik`
+- [x] 예선1용 목표를 cube/banana로 설정하고 UI에 run/match 시간을 분리 표시 — `@AI` (2026-07-23 완료)
+- [ ] 예선1 run에서 보관함 출발이 RUNNING 이후 match 150초 전에는 발생하지 않는지 확인 — `@insik`
 
 ---
 
 ## 5. 변경 이력 (Changelog) — ⛔ 삭제 금지 / 최신 항목이 맨 위
 
 <!-- 새 엔트리는 바로 이 줄 아래에 추가하세요. 기존 엔트리는 건드리지 마세요. -->
+
+### `v6.2.0` — 2026-07-23 13:37 (KST) · 작업자: `@AI` · ID: `2026-07-23-03`
+- **변경 요약:** 예선1용으로 목표를 cube/banana로 변경하고 보관함 출발 시간을 match 150초 고정으로 정리했다.
+- **상세:**
+  - `target_selector_node`, `mission_fsm_node`, `siglip_gate_node`의 목표를 Set1 `cube`, Set2 `banana`로 맞췄다.
+  - 보관함 출발 시간이 launch/run uptime과 헷갈리지 않도록 FSM이 `/planning/match_time`을 발행하고, UI HUD·decision log·event log에 run uptime과 RUNNING 이후 match elapsed를 함께 표시하도록 했다.
+  - `STORAGE DEADLINE` decision 로그에 `match_t`와 `run_uptime`을 동시에 남겨, 실제 트리거 기준이 버튼/RUNNING 이후 시간인지 바로 확인할 수 있게 했다.
+  - 최근 run 분석에서 match 150초 전 조기 복귀는 run 시간 오인보다 `timed_storage_dynamic_enabled`의 거리 기반 조기 복귀 및 quota 완료 대기 경로 영향으로 확인했다.
+  - 예선1 운용은 단순하게 RUNNING 이후 match 150초 고정 복귀가 맞다고 판단해 `timed_storage_dynamic_enabled: false`로 비활성화했다.
+  - Python 구문 검사, 관련 테스트 20개, `robot_planning`·`robot_perception`·`robot_bringup` 빌드를 통과했다.
+- **변경 파일:**
+  - `PROJECT_LOG.md` / 수정
+  - `ros2_ws/src/robot_bringup/config/motion_tuning.yaml` / 수정
+  - `ros2_ws/src/robot_perception/robot_perception/nodes/recognition_viz_node.py` / 수정
+  - `ros2_ws/src/robot_planning/robot_planning/nodes/mission_fsm_node.py` / 수정
+- **다음 할 일 반영:** 예선1용 cube/banana 목표 및 run/match 시간 분리 표시 항목을 완료 처리하고, 실제 run에서 match 150초 전 보관함 출발이 발생하지 않는지 확인하는 항목을 추가했다.
+- **버전 근거:** 실전 목표 설정과 운영 시간 표시/복귀 트리거 정책을 예선1 운용 기준으로 바꾼 기능성 설정 변경이므로 MINOR를 `v6.1.0`에서 `v6.2.0`으로 올렸다.
 
 ### `v6.1.0` — 2026-07-23 13:16 (KST) · 작업자: `@AI` · ID: `2026-07-23-02`
 - **변경 요약:** 예선1용으로 보관함 복귀 벽 감지 실패 시 최후수단 주차 패턴을 추가하고 pose fallback은 비활성화했다.

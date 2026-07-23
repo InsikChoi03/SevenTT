@@ -3021,7 +3021,10 @@ class MissionFsmNode(Node):
         self._localization_pose: tuple[float, float, float] | None = None
         self._localization_pose_history: list[tuple[float, float, float, float]] = []
         self._imu_last_s = -math.inf
-        self._node_start_s = self._now_s()
+        self._process_start_s = self._now_s()
+        # Mission/match t=0 is overwritten on the first latched RUNNING button event.
+        # Keep process uptime separate so deadline logs cannot be confused with launch time.
+        self._node_start_s = self._process_start_s
         self.phase = 2 if self.start_phase == 2 else 1  # 1 = Set1, 2 = Set2 (mapping is continuous)
         self.tray_shape = 0
         self.tray_fruit = 0
@@ -3124,6 +3127,9 @@ class MissionFsmNode(Node):
         self.pub_wall_processing = self.create_publisher(
             Bool, "/localization/wall_processing_enabled", 10
         )
+        # Debug/operator timing: [process uptime, match elapsed since RUNNING,
+        # timed-storage trigger, last-chance trigger, match duration].
+        self.pub_match_time = self.create_publisher(Float32MultiArray, "/planning/match_time", 10)
         self.timer = self.create_timer(1.0 / rate, self.tick)
 
         self.get_logger().info(
@@ -3228,6 +3234,9 @@ class MissionFsmNode(Node):
     def _now_s(self) -> float:
         return self.get_clock().now().nanoseconds * 1e-9
 
+    def _process_elapsed_s(self) -> float:
+        return max(0.0, self._now_s() - getattr(self, "_process_start_s", self._node_start_s))
+
     def on_competition_state(self, msg: String) -> None:
         """Hold safely through STANDBY/READY and start OPENING once on RUNNING."""
         state = str(msg.data).strip().upper()
@@ -3245,6 +3254,8 @@ class MissionFsmNode(Node):
         """Establish the mission clock and pristine opening state at competition t=0."""
         now = self._now_s()
         self._run_started = True
+        # This is the official match clock zero: the second accepted button press drives
+        # /competition/state to RUNNING, the same moment OPENING begins moving.
         self._node_start_s = now
         self.state = self._run_initial_state
         self.state_enter_s = now
@@ -9681,11 +9692,16 @@ class MissionFsmNode(Node):
         self._opportunistic_set2_active = False
         self._post_pick_lane_entry_pending = False
         destination = f"BOTTOM WALL {self.storage_bottom_wall_stop_m:.2f}m"
-        elapsed = self._now_s() - self._node_start_s
+        now = self._now_s()
+        match_elapsed = now - self._node_start_s
+        process_elapsed = now - getattr(self, "_process_start_s", self._node_start_s)
         distance_text = (
             f" path={route_distance:.2f}m" if route_distance is not None else " path=unknown"
         )
-        self._decide(f"STORAGE DEADLINE t={elapsed:.1f}s{distance_text} -> {destination}")
+        self._decide(
+            f"STORAGE DEADLINE match_t={match_elapsed:.1f}s "
+            f"run_uptime={process_elapsed:.1f}s{distance_text} -> {destination}"
+        )
         self._enter("DRIVE_TO_STORAGE")
 
     def _estimate_storage_return_path_distance(self) -> float | None:
@@ -9790,6 +9806,20 @@ class MissionFsmNode(Node):
         if not self._run_started:
             return 0.0
         return max(0.0, self._now_s() - self._node_start_s)
+
+    def _publish_match_time(self) -> None:
+        now = self._now_s()
+        process_elapsed = now - getattr(self, "_process_start_s", self._node_start_s)
+        match_elapsed = now - self._node_start_s if self._run_started else -1.0
+        msg = Float32MultiArray()
+        msg.data = [
+            float(max(0.0, process_elapsed)),
+            float(max(-1.0, match_elapsed)),
+            float(getattr(self, "timed_storage_start_sec", 0.0)),
+            float(getattr(self, "storage_last_chance_trigger_sec", 0.0)),
+            float(getattr(self, "timed_storage_match_duration_sec", 180.0)),
+        ]
+        self.pub_match_time.publish(msg)
 
     def _fresh_storage_wall_available(self) -> bool:
         return (
@@ -11535,6 +11565,7 @@ class MissionFsmNode(Node):
         self.pub_wall_processing.publish(
             Bool(data=bool(running and self._wall_processing_requested()))
         )
+        self._publish_match_time()
 
         # 2) publish mission state every tick
         msg = MissionState()

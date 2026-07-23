@@ -40,7 +40,13 @@ from collections import deque
 import rclpy
 from rcl_interfaces.msg import SetParametersResult
 from rclpy.node import Node
-from rclpy.qos import qos_profile_sensor_data
+from rclpy.qos import (
+    DurabilityPolicy,
+    HistoryPolicy,
+    QoSProfile,
+    ReliabilityPolicy,
+    qos_profile_sensor_data,
+)
 
 from geometry_msgs.msg import PoseStamped
 from sensor_msgs.msg import Image
@@ -218,6 +224,13 @@ _ANCHOR_SLOT_CODES = {
     "CHECKED": "C",
     "PICKED": "P",
 }
+
+COMPETITION_QOS = QoSProfile(
+    history=HistoryPolicy.KEEP_LAST,
+    depth=1,
+    reliability=ReliabilityPolicy.RELIABLE,
+    durability=DurabilityPolicy.TRANSIENT_LOCAL,
+)
 
 
 def action_summary(
@@ -555,6 +568,14 @@ class RecognitionVizNode(Node):
         self.shape: Classification | None = None
         self.arm_pick_phase = "IDLE"
         self.latest_decision = ""
+        self.competition_state = "STANDBY"
+        self._competition_running_wall_s: float | None = None
+        self._match_time_rx_wall_s = 0.0
+        self._fsm_process_elapsed_s = 0.0
+        self._fsm_match_elapsed_s = -1.0
+        self._storage_trigger_sec = 0.0
+        self._last_chance_trigger_sec = 0.0
+        self._match_duration_sec = 180.0
         # Latest raw camera image msgs + their detections (converted at draw time, ~redraw rate).
         self.top_img: Image | None = None
         self.body_img: Image | None = None
@@ -585,9 +606,10 @@ class RecognitionVizNode(Node):
         self._csv_path = os.path.join(self.run_dir, "events.csv")
         self._jsonl_path = os.path.join(self.run_dir, "events.jsonl")
         self._csv_cols = [
-            "t_iso", "elapsed_s", "event", "obj_id", "class_label", "set_type", "x", "y",
-            "conf", "blacklisted", "shape_label", "shape_conf", "siglip_label", "siglip_conf",
-            "image_face_visible", "phase", "mission_state", "robot_x", "robot_y", "robot_theta",
+            "t_iso", "elapsed_s", "run_elapsed_s", "match_elapsed_s", "competition_state",
+            "event", "obj_id", "class_label", "set_type", "x", "y", "conf", "blacklisted",
+            "shape_label", "shape_conf", "siglip_label", "siglip_conf", "image_face_visible",
+            "phase", "mission_state", "robot_x", "robot_y", "robot_theta",
         ]
         self._csv_file = open(self._csv_path, "w", newline="")
         self._csv = csv.DictWriter(self._csv_file, fieldnames=self._csv_cols)
@@ -596,6 +618,10 @@ class RecognitionVizNode(Node):
         self._jsonl_file = open(self._jsonl_path, "w")
 
         self.create_subscription(WorldModel, "/world_model", self.on_world, 10)
+        self.create_subscription(
+            String, "/competition/state", self.on_competition_state, COMPETITION_QOS
+        )
+        self.create_subscription(Float32MultiArray, "/planning/match_time", self.on_match_time, 10)
         self.create_subscription(PoseStamped, "/localization/pose", self.on_pose, 10)
         self.create_subscription(
             Float32MultiArray, "/localization/wall_map_transform", self.on_wall_map_transform, 10
@@ -644,6 +670,27 @@ class RecognitionVizNode(Node):
             if obj.id not in self._seen_ids:
                 self._seen_ids.add(obj.id)
                 self._log_event("first_seen", obj=obj)
+
+    def on_competition_state(self, msg: String) -> None:
+        state = str(msg.data).strip().upper()
+        if state not in {"STANDBY", "READY", "RUNNING"}:
+            return
+        self.competition_state = state
+        if state == "RUNNING" and self._competition_running_wall_s is None:
+            self._competition_running_wall_s = time.time()
+
+    def on_match_time(self, msg: Float32MultiArray) -> None:
+        data = list(msg.data)
+        if len(data) >= 2:
+            self._fsm_process_elapsed_s = float(data[0])
+            self._fsm_match_elapsed_s = float(data[1])
+            self._match_time_rx_wall_s = time.time()
+        if len(data) >= 3:
+            self._storage_trigger_sec = float(data[2])
+        if len(data) >= 4:
+            self._last_chance_trigger_sec = float(data[3])
+        if len(data) >= 5:
+            self._match_duration_sec = float(data[4])
 
     def on_pose(self, msg: PoseStamped) -> None:
         point = (float(msg.pose.position.x), float(msg.pose.position.y))
@@ -746,7 +793,10 @@ class RecognitionVizNode(Node):
 
     def on_decision(self, msg: String) -> None:
         self.latest_decision = str(msg.data)
-        self.decisions.append(f"[{time.time() - self._t0:5.0f}s] {self.latest_decision}")
+        self.decisions.append(
+            f"[m={self._match_elapsed_text()} r={self._run_elapsed_s():5.0f}s] "
+            f"{self.latest_decision}"
+        )
         zigzag_match = re.match(
             r"^GLOBAL\s+ZIGZAG\s+Z2-FIRST\s+(\d+)/(\d+)\b", msg.data
         )
@@ -814,13 +864,36 @@ class RecognitionVizNode(Node):
                 return obj
         return None
 
+    def _run_elapsed_s(self) -> float:
+        if time.time() - self._match_time_rx_wall_s <= 2.0:
+            return max(0.0, float(self._fsm_process_elapsed_s))
+        return max(0.0, time.time() - self._t0)
+
+    def _match_elapsed_s(self) -> float | None:
+        if time.time() - self._match_time_rx_wall_s <= 2.0:
+            if self._fsm_match_elapsed_s >= 0.0:
+                return max(0.0, float(self._fsm_match_elapsed_s))
+            return None
+        if self._competition_running_wall_s is None:
+            return None
+        return max(0.0, time.time() - self._competition_running_wall_s)
+
+    def _match_elapsed_text(self) -> str:
+        elapsed = self._match_elapsed_s()
+        return " --s" if elapsed is None else f"{elapsed:5.0f}s"
+
     def _log_event(self, event: str, obj: Object | None) -> None:
         rx = ry = rt = 0.0
         if self.world is not None:
             rx, ry, rt = self.world.robot_x, self.world.robot_y, self.world.robot_theta
+        run_elapsed = self._run_elapsed_s()
+        match_elapsed = self._match_elapsed_s()
         row = {c: "" for c in self._csv_cols}
         row["t_iso"] = time.strftime("%Y-%m-%dT%H:%M:%S")
-        row["elapsed_s"] = f"{time.time() - self._t0:.1f}"
+        row["elapsed_s"] = f"{run_elapsed:.1f}"
+        row["run_elapsed_s"] = f"{run_elapsed:.1f}"
+        row["match_elapsed_s"] = "" if match_elapsed is None else f"{match_elapsed:.1f}"
+        row["competition_state"] = self.competition_state
         row["event"] = event
         row["phase"] = self.phase
         row["mission_state"] = self.mission_state
@@ -1569,9 +1642,23 @@ class RecognitionVizNode(Node):
     def _draw_hud(self, canvas) -> None:
         n_obj = len(self.world.objects) if self.world is not None else 0
         n_bl = sum(1 for o in self.world.objects if o.blacklisted) if self.world is not None else 0
+        run_elapsed = self._run_elapsed_s()
+        match_elapsed = self._match_elapsed_s()
+        match_text = "--" if match_elapsed is None else f"{match_elapsed:5.0f}"
+        storage_text = (
+            f"{self._storage_trigger_sec:.0f}s"
+            if self._storage_trigger_sec > 0.0
+            else "--"
+        )
+        last_chance_text = (
+            f"{self._last_chance_trigger_sec:.0f}s"
+            if self._last_chance_trigger_sec > 0.0
+            else "--"
+        )
         lines = [
             f"state={self.mission_state}  phase={self.phase} zone={self.zone}  "
-            f"t={time.time() - self._t0:5.0f}s",
+            f"match={match_text}s  run={run_elapsed:5.0f}s  comp={self.competition_state}",
+            f"timers: storage@match {storage_text}  last-chance@match {last_chance_text}",
             f"objects={n_obj} (picked/bl={n_bl})  tray shape={self.tray_shape} fruit={self.tray_fruit}",
             f"det wide={len(self.top_dets)} body={len(self.body_dets)}",
         ]
@@ -1672,7 +1759,8 @@ class RecognitionVizNode(Node):
                 cv2.imwrite(os.path.join(self.run_dir, "map_final.png"), canvas)
             lines = [
                 f"mock field test summary  ({time.strftime('%Y-%m-%d %H:%M:%S')})",
-                f"duration: {time.time() - self._t0:.0f}s",
+                f"duration/run uptime: {self._run_elapsed_s():.0f}s",
+                f"match elapsed: {self._match_elapsed_text()}",
                 f"final state: {self.mission_state}  phase: {self.phase}",
                 f"tray: shape={self.tray_shape} fruit={self.tray_fruit}",
                 f"objects tracked: {len(self._seen_ids)}",

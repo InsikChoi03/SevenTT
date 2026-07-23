@@ -128,8 +128,8 @@ wall_localizer_node:
 
 target_selector_node:
   ros__parameters:
-    set1_label: "cube"             # Set1 목표: 정이십면체.
-    set2_label: "apple"                   # Set2 목표: 사과 과일 큐브.
+    set1_label: "cube"                    # Set1 목표: 큐브.
+    set2_label: "banana"                  # Set2 목표: 바나나 과일 큐브.
     rate_hz: 2.0                          # 목표 후보 선택 노드 실행 주기.
     explore_base: 5.0                     # 탐색 후보 기본 점수.
     set1_base: 10.0                       # Set1 목표 후보 기본 점수. 클수록 우선 선택된다.
@@ -140,8 +140,8 @@ target_selector_node:
 mission_fsm_node:
   ros__parameters:
     # 목표/단계 설정
-    set1_label: "cube"             # FSM이 Set1에서 실제로 집을 정이십면체 라벨.
-    set2_label: "apple"                   # FSM이 Set2에서 실제로 집을 사과 라벨.
+    set1_label: "cube"                    # FSM이 Set1에서 실제로 집을 큐브 라벨.
+    set2_label: "banana"                  # FSM이 Set2에서 실제로 집을 바나나 라벨.
     start_phase: 1                        # anchor 슬롯을 고르면 실제 물체 set_type으로 phase가 갱신된다.
     mixed_target_mode: false              # 목표 순서는 각 anchor의 최초 고정 snapshot queue가 결정한다.
     shape_target_total: 4                 # 전체 anchor 경로에서 집을 목표 도형 최대 개수.
@@ -550,7 +550,7 @@ mission_fsm_node:
     # Storage
     timed_storage_enabled: true           # 시작 버튼으로 RUNNING이 된 순간을 t=0으로 삼아 동적 복귀한다.
     timed_storage_start_sec: 150.0        # 가까우면 최대 t=150초까지 탐색하되 이후에는 무조건 복귀한다.
-    timed_storage_dynamic_enabled: true   # 멀리 있으면 예상 복귀+정렬·덤프+여유에 따라 150초 전에도 복귀한다.
+    timed_storage_dynamic_enabled: false  # 보관함 출발은 RUNNING/match 기준 150초 고정. 거리 기반 조기 복귀는 끈다.
     timed_storage_match_duration_sec: 180.0 # 시작 버튼부터 계산하는 공식 경기시간 3분.
     timed_storage_effective_speed_mps: 0.10 # 명령속도 0.20이 아닌 장애물·회전을 포함한 보수적 실효속도.
     timed_storage_fixed_overhead_sec: 12.0 # ALIGN_OVER_BIN 약 1초 + DUMP_ALL 최대 11초.
@@ -608,7 +608,7 @@ yolo_detector_node:
 
 siglip_gate_node:
   ros__parameters:
-    set2_label: "apple"                   # SigLIP이 비교할 목표 과일 라벨.
+    set2_label: "banana"                  # SigLIP이 비교할 목표 과일 라벨.
     fruit_prompt_templates:               # 과일별 prompt 묶음. max pooling이라 비스듬한/길쭉한 crop 표현을 보강한다.
       - "a photo of a {fruit}"
       - "a printed photo of a {fruit}"
