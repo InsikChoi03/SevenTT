@@ -117,6 +117,44 @@ def test_confirmed_cube_clears_ambiguous_observation_count():
     assert node._plain_cube_unknown_count == 0
 
 
+def test_definitive_fruit_cube_overrides_earlier_plain_cube_commit():
+    node = _approach_node()
+    node.global_target_mode = True
+    node._global_approach_committed_from_wide = True
+    node._appr_tgt_xy = (-1.5, 0.5)
+    changed_to_fruit = SimpleNamespace(
+        set_type=2,
+        class_label="fruit_photo_cube",
+        last_seen=_stamp(3),
+    )
+
+    assert node._plain_cube_approach_identity_action(changed_to_fruit) == "exclude"
+
+
+def test_definitive_fruit_cube_at_frozen_position_cancels_plain_cube_commit():
+    fruit = SimpleNamespace(
+        id=91,
+        x=0.50,
+        y=-0.50,
+        set_type=2,
+        class_label="fruit_photo_cube",
+    )
+    node = SimpleNamespace(
+        global_target_mode=True,
+        set1_label="cube",
+        phase=1,
+        _opportunistic_set2_active=False,
+        _global_approach_committed_from_wide=True,
+        _appr_tgt_xy=(0.50, -0.50),
+        global_body_target_match_radius_m=0.18,
+        current_target=fruit,
+        world=SimpleNamespace(objects=[fruit]),
+        _lookup_object=lambda _object_id: fruit,
+    )
+
+    assert not MissionFsmNode._committed_global_plain_cube(node)
+
+
 def test_zone_exclusion_matches_track_id_or_nearby_recreated_track():
     node = MissionFsmNode.__new__(MissionFsmNode)
     node.zone_mission_enabled = True

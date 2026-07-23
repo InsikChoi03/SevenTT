@@ -419,6 +419,12 @@ class SiglipGateNode(Node):
         self.declare_parameter("color_filter_sat_min", 60.0)
         self.declare_parameter("color_filter_val_min", 60.0)
         self.declare_parameter("color_filter_veto_scale", 0.25)
+        # When HSV overwhelmingly matches today's target fruit, allow it to correct a conflicting
+        # SigLIP fruit name. This is intentionally target-only and requires strong coloured-pixel
+        # evidence; it cannot turn an arbitrary crop into another non-target label.
+        self.declare_parameter("color_target_override_enabled", False)
+        self.declare_parameter("color_target_override_min_fraction", 0.90)
+        self.declare_parameter("color_target_override_min_colored_fraction", 0.10)
 
         self.model_id = str(self.get_parameter("model_id").value)
         self.set2_label = str(self.get_parameter("set2_label").value)
@@ -527,6 +533,17 @@ class SiglipGateNode(Node):
         self.color_filter_enabled = bool(self.get_parameter("color_filter_enabled").value)
         self.color_filter_veto_scale = float(
             self.get_parameter("color_filter_veto_scale").value
+        )
+        self.color_target_override_enabled = bool(
+            self.get_parameter("color_target_override_enabled").value
+        )
+        self.color_target_override_min_fraction = float(
+            self.get_parameter("color_target_override_min_fraction").value
+        )
+        self.color_target_override_min_colored_fraction = float(
+            self.get_parameter(
+                "color_target_override_min_colored_fraction"
+            ).value
         )
         self.color_gate_config = ColorGateConfig(
             min_expected_fraction=float(
@@ -982,6 +999,50 @@ class SiglipGateNode(Node):
             )
         return result.veto
 
+    def _apply_color_target_override(
+        self,
+        crop: np.ndarray,
+        label: str,
+        margin: float,
+    ) -> tuple[str, float, bool]:
+        """Return a target-only strong-HSV correction, otherwise the normal veto result."""
+        if not self.color_filter_enabled:
+            return str(label), float(margin), False
+        result = evaluate_color_consistency(crop, label, self.color_gate_config)
+        target_override = bool(
+            self.color_target_override_enabled
+            # Banana and pineapple share the same yellow hue band. Colour cannot safely
+            # distinguish that pair, so only SigLIP may change either identity.
+            and self.set2_label not in {"banana", "pineapple"}
+            and str(label) != self.set2_label
+            and result.dominant_label == self.set2_label
+            and result.dominant_fraction
+            >= self.color_target_override_min_fraction
+            and result.colored_fraction
+            >= self.color_target_override_min_colored_fraction
+        )
+        if target_override:
+            corrected_margin = max(float(margin), float(result.dominant_fraction))
+            self.get_logger().info(
+                f"color target override: {label}->{self.set2_label} "
+                f"dominant={result.dominant_fraction:.2f} "
+                f"colored={result.colored_fraction:.2f}",
+                throttle_duration_sec=1.0,
+            )
+            return self.set2_label, corrected_margin, False
+        if result.veto:
+            self.get_logger().info(
+                f"color veto: {label} expected={result.expected_fraction:.2f} "
+                f"dominant={result.dominant_label}:{result.dominant_fraction:.2f}",
+                throttle_duration_sec=2.0,
+            )
+            return (
+                str(label),
+                float(margin) * self.color_filter_veto_scale,
+                True,
+            )
+        return str(label), float(margin), False
+
     def _classify_and_publish(
         self,
         crops: list[np.ndarray],
@@ -997,14 +1058,11 @@ class SiglipGateNode(Node):
             return
         published = 0
         for index, (crop, score) in enumerate(zip(crops, scores)):
-            margin = score.margin
-            vetoed = self._color_veto(crop, score.label)
-            if vetoed:
-                # Downgrade only (veto-only filter): the read still publishes, but with a
-                # scaled-down margin and never as a pick-approving target.
-                margin *= self.color_filter_veto_scale
+            label, margin, vetoed = self._apply_color_target_override(
+                crop, score.label, score.margin
+            )
             is_target = (
-                score.label == self.set2_label
+                label == self.set2_label
                 and margin >= self.confidence_threshold
                 and score.image_face_visible
                 and not vetoed
@@ -1014,7 +1072,7 @@ class SiglipGateNode(Node):
             # World-model/FSM consumers can therefore bind every batched read spatially.
             out.header.stamp = stamp
             out.header.frame_id = "camera_body"
-            out.label = score.label
+            out.label = label
             out.set_type = 2
             out.confidence = float(margin)
             out.is_target = is_target
@@ -1028,7 +1086,7 @@ class SiglipGateNode(Node):
             published += 1
             capture_sec = self._stamp_sec(stamp)
             self.get_logger().info(
-                f"siglip: {score.label} soft={score.best_soft:.2f} margin={margin:.2f} "
+                f"siglip: {label} soft={score.best_soft:.2f} margin={margin:.2f} "
                 f"face={score.image_face_visible} target={is_target} "
                 f"crop={index + 1}/{len(crops)} source={out.source} "
                 f"capture={capture_sec:.3f}",
@@ -1062,7 +1120,7 @@ class SiglipGateNode(Node):
             )
 
     def on_world_model(self, msg: WorldModel) -> None:
-        """Track whether any Set2 track still lacks a fruit_label (wide-path GPU gate)."""
+        """Retain unlabeled-track telemetry; live Wide classification no longer stops on it."""
         self._unlabeled_set2_present = any(
             int(obj.set_type) == 2 and not str(obj.fruit_label) and not obj.blacklisted
             for obj in msg.objects
@@ -1137,9 +1195,6 @@ class SiglipGateNode(Node):
             return
         if getattr(self, "_wide_pending", None) is None or self.model is None or self.processor is None:
             return
-        if not self._unlabeled_set2_present:
-            SiglipGateNode._set_pending_value(self, "_wide_pending", None)
-            return
         pending = SiglipGateNode._take_pending_value(self, "_wide_pending")
         if pending is None:
             return
@@ -1163,20 +1218,23 @@ class SiglipGateNode(Node):
         for det, crop, score in zip(kept, crops, scores):
             if not score.image_face_visible:      # blank/edge face -> no fruit to hint
                 continue
-            if score.margin < self.wide_hint_min_margin:
+            label, margin, vetoed = self._apply_color_target_override(
+                crop, score.label, score.margin
+            )
+            if margin < self.wide_hint_min_margin:
                 continue
-            if self._color_veto(crop, score.label):
+            if vetoed:
                 continue
             hint = String()
             hint.data = build_wide_hint(
-                score.label, score.margin,
+                label, margin,
                 float(det.x_center), float(det.y_center), stamp_sec,
             )
             self.pub_wide_hint.publish(hint)
             published += 1
             published_details.append(
-                f"{score.label}@({det.x_center:.0f},{det.y_center:.0f}) "
-                f"m={score.margin:.2f} t={stamp_sec:.3f}"
+                f"{label}@({det.x_center:.0f},{det.y_center:.0f}) "
+                f"m={margin:.2f} t={stamp_sec:.3f}"
             )
         if published:
             self.get_logger().info(

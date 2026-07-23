@@ -70,6 +70,25 @@ def test_mixed_labels_vote_over_the_window_and_can_end_inconclusive():
     assert node._classify_body_other_counts == {"cube": 4, "icosahedron": 1}
 
 
+def test_wide_positive_plain_cube_uses_body_presence_not_mutable_body_label():
+    node = _node()
+    node.set1_label = "cube"
+    node.phase = 1
+    node.global_target_mode = True
+    node._global_approach_committed_from_wide = True
+    node._appr_tgt_xy = (-1.5, 0.5)
+    node._opportunistic_set2_active = False
+    node._fresh_body_set1_pick_presence = lambda: (
+        "fruit_photo_cube", -0.009, -0.013
+    )
+
+    for _ in range(4):
+        decision, observed, fresh = _new_frame(node, "fruit_photo_cube")
+        assert (decision, observed, fresh) == ("pending", "cube", True)
+
+    assert _new_frame(node, "fruit_photo_cube") == ("target", "cube", True)
+
+
 def _octa_wide_node():
     node = _node()
     node.set1_label = "octahedron"

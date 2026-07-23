@@ -33,6 +33,38 @@ def test_fresh_aligned_body_target_survives_world_track_loss():
     assert candidate[1] == 0.96
 
 
+def test_fresh_aligned_body_target_survives_world_identity_regression():
+    node = _node()
+    node.current_target = SimpleNamespace(set_type=0, class_label="")
+
+    candidate = node._fresh_body_set1_pick_candidate()
+
+    assert candidate is not None
+    assert candidate[0] == "icosahedron"
+    assert candidate[1] == 0.96
+
+
+def test_fresh_aligned_body_target_does_not_require_a_live_world_track():
+    node = _node()
+    node.current_target = None
+
+    candidate = node._fresh_body_set1_pick_candidate()
+
+    assert candidate is not None
+    assert candidate[0] == "icosahedron"
+
+
+def test_wide_owned_set1_presence_survives_world_identity_regression():
+    node = _node()
+    node.current_target = SimpleNamespace(set_type=0, class_label="")
+    node._body_nearest_any = lambda: ("cube", 0.195, -0.01)
+
+    presence = node._fresh_body_set1_pick_presence()
+
+    assert presence is not None
+    assert presence[0] == "cube"
+
+
 def test_pre_classify_or_stale_body_frame_is_rejected():
     node = _node()
     node._body_dets_stamp_s = 9.9

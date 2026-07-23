@@ -112,6 +112,9 @@ def generate_launch_description() -> LaunchDescription:
     grid_prior_enabled = LaunchConfiguration("grid_prior_enabled")
     grid_track_lock_enabled = LaunchConfiguration("grid_track_lock_enabled")
     localizer_initial_theta = LaunchConfiguration("localizer_initial_theta")
+    wall_pose_correction_enabled = LaunchConfiguration(
+        "wall_pose_correction_enabled"
+    )
     output_dir = LaunchConfiguration("output_dir")
     cam_yaw = LaunchConfiguration("cam_yaw")      # wide-cam mount rotation about base z (0/90/180/270)
     rot180 = LaunchConfiguration("rot180")        # optical-axis flip for the 180-rotated top image
@@ -139,6 +142,14 @@ def generate_launch_description() -> LaunchDescription:
                               description="start 2R pick_sequencer (real grasp); needs with_base (shares ttyUSB0)"),
         DeclareLaunchArgument("with_wall_localizer", default_value="false",
                               description="use arena wall/floor lines as absolute pose correction"),
+        DeclareLaunchArgument(
+            "wall_pose_correction_enabled",
+            default_value="true",
+            description=(
+                "apply wall corrections to pose; false keeps wall detection/visualization "
+                "running for an A/B control run"
+            ),
+        ),
         DeclareLaunchArgument(
             "storage_wall_guided_enabled",
             default_value="true" if storage_wall_guided_default else "false",
@@ -174,7 +185,12 @@ def generate_launch_description() -> LaunchDescription:
         node("robot_hardware", "imu_mpu6050_node", "imu_mpu6050_node"),
         # perception core (always)
         node("robot_perception", "localizer_node", "localizer_node",
-             extra={"initial_theta": ParameterValue(localizer_initial_theta, value_type=float)}),
+             extra={
+                 "initial_theta": ParameterValue(localizer_initial_theta, value_type=float),
+                 "wall_pose_correction_enabled": ParameterValue(
+                     wall_pose_correction_enabled, value_type=bool
+                 ),
+             }),
         node("robot_perception", "yolo_detector_node", "yolo_detector_node"),
         node("robot_perception", "world_model_node", "world_model_node",
              extra={"cam_yaw_deg": ParameterValue(cam_yaw, value_type=float),

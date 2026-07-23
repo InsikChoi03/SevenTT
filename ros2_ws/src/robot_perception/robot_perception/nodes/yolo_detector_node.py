@@ -109,6 +109,56 @@ def center_inside_normalized_rect(
     return min(x0, x1) <= u <= max(x0, x1) and min(y0, y1) <= v <= max(y0, y1)
 
 
+def collapse_nested_fruit_cube_detections(detections):
+    """Promote an outer cube when it contains one or more fruit-face boxes."""
+    detections = list(detections)
+    cube_indices = [
+        index for index, detection in enumerate(detections)
+        if str(detection.label) == "cube"
+    ]
+    fruit_indices = [
+        index for index, detection in enumerate(detections)
+        if str(detection.label) == "fruit_photo_cube"
+    ]
+    assignments: dict[int, list[int]] = {}
+    for fruit_index in fruit_indices:
+        fruit = detections[fruit_index]
+        containing = [
+            cube_index
+            for cube_index in cube_indices
+            if (
+                abs(float(fruit.x_center) - float(detections[cube_index].x_center))
+                <= float(detections[cube_index].width) * 0.5
+                and abs(float(fruit.y_center) - float(detections[cube_index].y_center))
+                <= float(detections[cube_index].height) * 0.5
+            )
+        ]
+        if containing:
+            owner = min(
+                containing,
+                key=lambda index: (
+                    float(detections[index].width)
+                    * float(detections[index].height)
+                ),
+            )
+            assignments.setdefault(owner, []).append(fruit_index)
+
+    consumed_fruits: set[int] = set()
+    for cube_index, nested_indices in assignments.items():
+        cube = detections[cube_index]
+        cube.label = "fruit_photo_cube"
+        cube.confidence = max(
+            [float(cube.confidence)]
+            + [float(detections[index].confidence) for index in nested_indices]
+        )
+        consumed_fruits.update(nested_indices)
+    return [
+        detection
+        for index, detection in enumerate(detections)
+        if index not in consumed_fruits
+    ]
+
+
 class YoloDetectorNode(Node):
     def __init__(self) -> None:
         super().__init__("yolo_detector_node")
@@ -364,6 +414,15 @@ class YoloDetectorNode(Node):
             if dropped:
                 self.get_logger().info(
                     f"top self-mask dropped {dropped} chassis/tray detection(s)",
+                    throttle_duration_sec=2.0,
+                )
+        if frame_id == "camera_top":
+            before = len(arr.detections)
+            arr.detections = collapse_nested_fruit_cube_detections(arr.detections)
+            collapsed = before - len(arr.detections)
+            if collapsed:
+                self.get_logger().info(
+                    f"top nested fruit priority collapsed {collapsed} inner box(es)",
                     throttle_duration_sec=2.0,
                 )
         pub.publish(arr)

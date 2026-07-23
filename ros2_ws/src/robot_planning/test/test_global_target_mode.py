@@ -1,13 +1,20 @@
 """Global target mode: whole-map tour selection tiers, exclusions, and quotas."""
 from types import SimpleNamespace
 
+import pytest
+
+from robot_planning.lane_planner import LanePlanner
 from robot_planning.nodes.mission_fsm_node import (
     MissionFsmNode,
+    closest_point_on_segment,
+    expand_route_at_cell_centers,
+    forward_rejoin_point_on_segment,
     global_retarget_is_worthwhile,
     global_target_absence_confirmed,
     global_target_in_route_corridor,
     holonomic_waypoint_velocity,
     keep_latched_global_approach,
+    prepare_guide_route,
     target_is_spatially_deferred,
 )
 
@@ -23,6 +30,28 @@ def test_holonomic_waypoint_velocity_stops_inside_radius():
     assert holonomic_waypoint_velocity(0.03, 0.04, 0.20, 0.10) == (0.0, 0.0)
 
 
+def test_closest_point_on_segment_returns_perpendicular_lane_rejoin():
+    closest, distance = closest_point_on_segment(
+        (-0.90, 0.40), (-1.25, 1.25), (-1.25, -1.25)
+    )
+
+    assert tuple(round(value, 6) for value in closest) == (-1.25, 0.40)
+    assert round(distance, 6) == 0.35
+
+
+def test_forward_rejoin_point_uses_one_meter_diagonal_entry():
+    rejoin, distance = forward_rejoin_point_on_segment(
+        (-0.90, 0.40),
+        (-1.25, 1.25),
+        (-1.25, -1.25),
+        1.0,
+    )
+
+    assert rejoin[0] == -1.25
+    assert rejoin[1] < 0.40
+    assert distance == pytest.approx(1.0)
+
+
 def _obj(
     oid,
     x,
@@ -34,6 +63,7 @@ def _obj(
     blacklisted=False,
     fruit_confidence=0.0,
     fruit_source="",
+    n_obs=3,
 ):
     return SimpleNamespace(
         id=oid,
@@ -45,6 +75,7 @@ def _obj(
         confidence=conf,
         fruit_confidence=fruit_confidence,
         fruit_label_source=fruit_source,
+        n_obs=n_obs,
         blacklisted=blacklisted,
     )
 
@@ -100,6 +131,83 @@ def test_route_corridor_accepts_nearby_target_and_rejects_cross_field_target():
     )
 
 
+def test_route_corridor_does_not_backtrack_for_an_already_passed_target():
+    assert not global_target_in_route_corridor(
+        (-1.50, 0.50),
+        (-1.75, 1.75),
+        (-1.75, -1.25),
+        0.45,
+        route_progress_xy=(-1.75, 0.20),
+        backtrack_allowance_m=0.10,
+    )
+    assert global_target_in_route_corridor(
+        (-1.50, -0.25),
+        (-1.75, 1.75),
+        (-1.75, -1.25),
+        0.45,
+        route_progress_xy=(-1.75, 0.20),
+        backtrack_allowance_m=0.10,
+    )
+
+
+def test_guide_route_stops_at_each_half_meter_cell_center():
+    points = expand_route_at_cell_centers(
+        (-1.25, 1.60),
+        [(-1.25, 1.25), (-1.25, -1.25), (1.25, -1.25)],
+        0.50,
+    )
+
+    assert points == [
+        (-1.25, 1.25),
+        (-1.25, 0.75),
+        (-1.25, 0.25),
+        (-1.25, -0.25),
+        (-1.25, -0.75),
+        (-1.25, -1.25),
+        (-0.75, -1.25),
+        (-0.25, -1.25),
+        (0.25, -1.25),
+        (0.75, -1.25),
+        (1.25, -1.25),
+    ]
+
+
+def test_recorded_guide_route_can_use_only_explicit_stop_points():
+    recorded = [
+        (-1.25, 0.75),
+        (-1.25, -0.25),
+        (-1.25, -1.25),
+    ]
+
+    selected = prepare_guide_route(
+        (-1.25, 1.60),
+        recorded,
+        expand_segments=False,
+        spacing_m=0.50,
+    )
+
+    assert selected == recorded
+    assert (-1.25, 0.25) not in selected
+
+
+def test_stopped_cell_center_accepts_all_four_surrounding_corner_nodes():
+    node = _node([], rx=-1.25, ry=0.25)
+    node.global_target_corridor_gate_enabled = True
+    node._global_initial_sweep_complete = False
+    node._global_guide_center_selection_xy = (-1.25, 0.25)
+    node.global_guide_cell_target_radius_m = 0.40
+
+    for x, y in (
+        (-1.50, 0.50),
+        (-1.00, 0.50),
+        (-1.50, 0.00),
+        (-1.00, 0.00),
+    ):
+        assert MissionFsmNode._global_target_in_active_corridor(
+            node, _obj(1, x, y, 1, label="dodecahedron")
+        )
+
+
 def test_global_selection_only_interrupts_for_target_near_active_zigzag_leg():
     node = _node([
         _obj(1, -1.50, 0.50, 1, label="dodecahedron"),
@@ -107,11 +215,33 @@ def test_global_selection_only_interrupts_for_target_near_active_zigzag_leg():
     ], rx=-1.75, ry=1.75)
     node.global_target_corridor_gate_enabled = True
     node.global_target_corridor_radius_m = 0.45
+    node.global_target_corridor_backtrack_m = 0.10
     node.global_zigzag_start = (-1.75, 1.75)
     node._global_zigzag_waypoints = [(-1.75, -1.25), (-0.75, -1.25)]
     node._global_zigzag_idx = 0
     node._global_patrol_goal_zigzag_index = None
 
+    kind, target = _select(node)
+
+    assert (kind, int(target.id)) == ("set1", 1)
+
+
+def test_initial_sweep_defers_passed_corridor_target_until_free_route():
+    node = _node([
+        _obj(1, -1.50, 0.50, 1, label="dodecahedron"),
+    ], rx=-1.75, ry=0.20)
+    node.global_target_corridor_gate_enabled = True
+    node.global_target_corridor_radius_m = 0.45
+    node.global_target_corridor_backtrack_m = 0.10
+    node.global_zigzag_start = (-1.75, 1.75)
+    node._global_zigzag_waypoints = [(-1.75, -1.25), (-0.75, -1.25)]
+    node._global_zigzag_idx = 0
+    node._global_patrol_goal_zigzag_index = None
+    node._global_initial_sweep_complete = False
+
+    assert _select(node) is None
+
+    node._global_initial_sweep_complete = True
     kind, target = _select(node)
 
     assert (kind, int(target.id)) == ("set1", 1)
@@ -151,7 +281,7 @@ def test_strong_target_fruit_positive_wins_after_initial_sweep():
     assert (kind, int(target.id)) == ("set2_object", 2)
 
 
-def test_weak_non_target_fruit_label_is_revisited_for_body_verification():
+def test_weak_non_target_fruit_label_is_recorded_but_never_visited():
     node = _node([
         _obj(
             7, -1.50, 0.50, 2, label="fruit_photo_cube", fruit="pineapple",
@@ -160,9 +290,7 @@ def test_weak_non_target_fruit_label_is_revisited_for_body_verification():
     ], rx=-1.25, ry=0.75)
     node.global_non_target_fruit_reject_min_confidence = 0.40
 
-    kind, target = _select(node)
-
-    assert (kind, int(target.id)) == ("set2_object", 7)
+    assert _select(node) is None
 
 
 def test_strong_non_target_fruit_label_is_not_revisited():
@@ -175,6 +303,84 @@ def test_strong_non_target_fruit_label_is_not_revisited():
     node.global_non_target_fruit_reject_min_confidence = 0.40
 
     assert _select(node) is None
+
+
+def test_initial_sweep_does_not_return_three_grid_cells_for_target():
+    node = _node([
+        _obj(7, 1.50, 0.0, 2, label="fruit_photo_cube", fruit="banana"),
+    ])
+    node.global_target_max_revisit_distance_m = 1.50
+    node._global_initial_sweep_complete = False
+
+    assert _select(node) is None
+
+
+def test_free_exploration_removes_three_grid_cell_distance_limit():
+    node = _node([
+        _obj(7, 1.50, 0.0, 2, label="fruit_photo_cube", fruit="banana"),
+    ])
+    node.global_target_max_revisit_distance_m = 1.50
+    node._global_initial_sweep_complete = True
+
+    kind, target = _select(node)
+
+    assert (kind, int(target.id)) == ("set2_object", 7)
+
+
+def test_body_non_target_position_ban_survives_track_and_set_type_churn():
+    replacement = _obj(99, 0.20, 0.0, 1, label="dodecahedron")
+    node = _node([replacement])
+    node.global_target_max_revisit_distance_m = 1.50
+    node.global_non_target_spatial_ban_radius_m = 0.22
+    node._global_non_target_bans = [(0.20, 0.0, 70.0)]
+    node._now_s = lambda: 10.0
+
+    assert _select(node) is None
+
+    node._now_s = lambda: 70.0
+    kind, target = _select(node)
+    assert (kind, int(target.id)) == ("set1", 99)
+
+
+def test_third_target_release_bans_position_for_sixty_seconds():
+    class _Logger:
+        def info(self, _message):
+            pass
+
+        def warn(self, _message):
+            pass
+
+    node = MissionFsmNode.__new__(MissionFsmNode)
+    node.global_target_mode = True
+    node.global_target_release_ban_threshold = 3
+    node.global_target_release_ban_sec = 60.0
+    node.global_target_release_match_radius_m = 0.22
+    node._global_target_release_counts = []
+    node._global_target_release_bans = []
+    node._now_s = lambda: 10.0
+    node._decide = lambda _text: None
+    node.get_logger = lambda: _Logger()
+
+    MissionFsmNode._record_global_target_release(
+        node, (0.50, -0.50), "first"
+    )
+    MissionFsmNode._record_global_target_release(
+        node, (0.54, -0.48), "second/new tracker"
+    )
+    assert node._global_target_release_bans == []
+
+    MissionFsmNode._record_global_target_release(
+        node, (0.47, -0.51), "third/new tracker"
+    )
+
+    assert node._global_target_release_counts == []
+    assert len(node._global_target_release_bans) == 1
+    assert node._global_target_release_bans[0][2] == pytest.approx(70.0)
+    replacement = _obj(99, 0.52, -0.49, 1, label="cube")
+    assert MissionFsmNode._global_position_is_release_banned(node, replacement)
+
+    node._now_s = lambda: 70.0
+    assert not MissionFsmNode._global_position_is_release_banned(node, replacement)
 
 
 def test_initial_sweep_finishes_without_wrapping_to_first_waypoint():
@@ -195,6 +401,32 @@ def test_initial_sweep_finishes_without_wrapping_to_first_waypoint():
     assert node._global_zigzag_idx == 3
     assert node._global_initial_sweep_complete
     assert decisions == ["INITIAL SWEEP COMPLETE -> OPTIMIZE MAPPED TARGET TOUR"]
+
+
+def test_guide_node_snapshot_waits_for_wide_frame_and_new_world_map():
+    node = SimpleNamespace(
+        global_guide_node_observe_min_sec=0.30,
+        global_guide_node_observe_frames=1,
+        _wide_relative_seq=10,
+        _wide_relative_last_frame_s=29.9,
+        _world_last_rx_s=20.0,
+        _now_s=lambda: 30.31,
+    )
+
+    assert not MissionFsmNode._global_guide_observation_complete(
+        node, start_s=30.0, start_seq=10, start_world_s=20.0
+    )
+
+    node._wide_relative_seq = 11
+    node._wide_relative_last_frame_s = 30.1
+    assert not MissionFsmNode._global_guide_observation_complete(
+        node, start_s=30.0, start_seq=10, start_world_s=20.0
+    )
+
+    node._world_last_rx_s = 30.2
+    assert MissionFsmNode._global_guide_observation_complete(
+        node, start_s=30.0, start_seq=10, start_world_s=20.0
+    )
 
 
 def test_initial_sweep_segment_uses_straight_feedback_without_planner():
@@ -284,6 +516,49 @@ def test_initial_sweep_segment_slows_near_waypoint():
     assert calls[1][4]["speed_limit_mps"] == 0.07
 
 
+def test_initial_sweep_rejoins_closest_lane_point_before_resuming_leg():
+    calls = []
+    node = SimpleNamespace(
+        _global_zigzag_waypoints=[
+            (-1.25, 1.25), (-1.25, -1.25), (1.25, -1.25),
+        ],
+        _global_initial_sweep_start_xy=(-1.25, 1.60),
+        _global_initial_sweep_rejoin_xy=None,
+        _global_initial_sweep_rejoin_goal_index=None,
+        global_initial_sweep_rejoin_enabled=True,
+        global_initial_sweep_rejoin_trigger_m=0.10,
+        global_initial_sweep_rejoin_reach_tol_m=0.06,
+        global_initial_sweep_rejoin_max_distance_m=1.0,
+        global_zigzag_start=(-1.25, 1.60),
+        global_patrol_reach_tol_m=0.15,
+        global_initial_sweep_slowdown_distance_m=1.0,
+        global_initial_sweep_slow_speed_mps=0.05,
+        _plan=[(9.0, 9.0)],
+        _plan_start_xy=(9.0, 9.0),
+        _plan_dest=(9.0, 9.0),
+        _robot_xy=lambda: (-0.90, 0.40),
+        _distance_to=lambda _x, _y: 1.0,
+        _decide=lambda text: calls.append(("decision", text)),
+        _drive=lambda vx, vy, omega: calls.append(("drive", vx, vy, omega)),
+        _drive_toward=lambda x, y, **kwargs: calls.append(
+            ("rejoin", x, y, kwargs)
+        ),
+    )
+    node._initial_sweep_segment_start = (
+        lambda goal_index: MissionFsmNode._initial_sweep_segment_start(
+            node, goal_index
+        )
+    )
+
+    MissionFsmNode._drive_initial_sweep_segment(node, -1.25, -1.25, 1)
+
+    rejoin = next(call for call in calls if call[0] == "rejoin")
+    assert round(rejoin[1], 6) == -1.25
+    assert rejoin[2] < 0.40
+    assert rejoin[3]["route_mode"] == "legacy"
+    assert rejoin[3]["allow_flexible_fallback"] is True
+
+
 def test_initial_sweep_accepts_waypoint_goal_line_overrun():
     calls = []
     decisions = []
@@ -357,6 +632,30 @@ def test_untyped_cube_is_the_fallback_when_no_confirmed_target():
     assert (kind, int(tgt.id)) == ("set2_object", 1)
 
 
+def test_untyped_fruit_is_not_approached_during_fixed_guide_sweep():
+    node = _node([
+        _obj(1, 0.3, 0.0, 2, label="fruit_photo_cube", fruit=""),
+    ])
+    node.global_zigzag_patrol_enabled = True
+    node._global_zigzag_waypoints = [(-1.25, 0.75), (-1.25, -0.25)]
+    node._global_initial_sweep_complete = False
+
+    assert _select(node) is None
+
+
+def test_wide_preclassified_target_can_interrupt_fixed_guide_sweep():
+    node = _node([
+        _obj(1, 0.3, 0.0, 2, label="fruit_photo_cube", fruit="banana"),
+    ])
+    node.global_zigzag_patrol_enabled = True
+    node._global_zigzag_waypoints = [(-1.25, 0.75), (-1.25, -0.25)]
+    node._global_initial_sweep_complete = False
+
+    kind, target = _select(node)
+
+    assert (kind, int(target.id)) == ("set2_object", 1)
+
+
 def test_known_wrong_fruit_hint_is_not_approached():
     objects = [
         _obj(1, 0.3, 0.0, 2, label="fruit_photo_cube", fruit="apple"),
@@ -397,6 +696,34 @@ def test_global_retarget_locks_once_current_goal_is_close():
     assert not global_retarget_is_worthwhile(0.79, 0.10, 0.20, 0.80)
     assert global_retarget_is_worthwhile(1.50, 0.80, 0.20, 0.80)
     assert not global_retarget_is_worthwhile(1.50, 1.30, 0.20, 0.80)
+
+
+def test_global_retarget_requires_stable_high_confidence_candidate():
+    current = _obj(1, 1.50, 0.0, 1, label="dodecahedron")
+    weak = _obj(2, 0.30, 0.0, 1, label="dodecahedron", conf=0.69, n_obs=8)
+    transient = _obj(3, 0.20, 0.0, 1, label="dodecahedron", conf=0.95, n_obs=2)
+    node = _node([current, weak])
+    node.current_target = current
+    node._appr_tgt_xy = (1.50, 0.0)
+    node._global_retarget_last_s = 0.0
+    node.global_retarget_check_sec = 1.0
+    node.global_retarget_min_gain = 0.35
+    node.global_retarget_lock_distance_m = 1.0
+    node.global_retarget_min_confidence = 0.70
+    node.global_retarget_min_observations = 3
+    node._now_s = lambda: 10.0
+    node._robot_xy = lambda: (0.0, 0.0)
+    node._committed_global_target_can_try_align = lambda: False
+    node._select_next_global_target = lambda: ("set1", weak)
+    node._latch_mixed_target = lambda *_args: (_ for _ in ()).throw(
+        AssertionError("weak candidate must not steal the active target")
+    )
+
+    MissionFsmNode._maybe_global_retarget(node)
+
+    node._global_retarget_last_s = 0.0
+    node._select_next_global_target = lambda: ("set1", transient)
+    MissionFsmNode._maybe_global_retarget(node)
 
 
 def test_wrong_wide_hint_stays_latched_during_global_approach():
@@ -659,6 +986,7 @@ def test_global_approach_route_blocked_defers_target_and_resumes_scan():
     node.global_approach_route_blocked_defer_enabled = True
     node.global_approach_route_blocked_confirm_sec = 0.0
     node.global_approach_route_blocked_confirm_attempts = 1
+    node.global_approach_route_blocked_defer_sec = 20.0
     node.align_body_lost_reselect_cooldown_sec = 6.0
     node.state = "APPROACH"
     node.current_target = target
@@ -682,13 +1010,56 @@ def test_global_approach_route_blocked_defers_target_and_resumes_scan():
 
     assert MissionFsmNode._handle_global_approach_route_blocked(node, 10.0)
 
-    assert node._global_deferred_targets == [(2, -1.5, -0.5, 16.0)]
+    assert node._global_deferred_targets == [(2, -1.5, -0.5, 30.0)]
     assert node.current_target is None
     assert node._appr_tgt_xy is None
     assert node._opportunistic_set2_active is False
     assert commands[-1] == (0.0, 0.0, 0.0)
     assert transitions == ["SCAN"]
     assert decisions[-1].endswith("-> DEFER / RESUME LANE")
+
+
+def test_route_blocked_escape_prefers_recent_safe_breadcrumb():
+    node = MissionFsmNode.__new__(MissionFsmNode)
+    node._planner = LanePlanner(block_radius=0.24)
+    node.route_blocked_escape_enabled = True
+    node.route_blocked_escape_distance_m = 0.18
+    node.route_blocked_escape_history_max_age_sec = 8.0
+    node.route_blocked_escape_max_attempts = 2
+    node._route_blocked_escape_attempts = 0
+    node._localization_pose_history = [(9.5, 0.38, 0.0, 0.0)]
+    node._now_s = lambda: 10.0
+
+    escape = MissionFsmNode._route_blocked_escape_waypoint(
+        node,
+        (0.20, 0.0),
+        [(0.0, 0.0)],
+    )
+
+    assert escape is not None
+    assert escape[:2] == pytest.approx((0.38, 0.0))
+    assert escape[2] == "breadcrumb"
+
+
+def test_planning_obstacles_merge_duplicates_and_remove_picked_stale_track():
+    node = MissionFsmNode.__new__(MissionFsmNode)
+    node.world = SimpleNamespace(
+        objects=[
+            _obj(1, 0.00, 0.00, 1),
+            _obj(2, 0.05, 0.02, 1),
+            _obj(3, 0.50, 0.00, 1),
+        ]
+    )
+    node.obstacle_min_conf = 0.4
+    node.obstacle_min_nobs = 2
+    node.exclude_target_radius_m = 0.12
+    node.planning_duplicate_merge_radius_m = 0.12
+    node.planning_picked_suppress_radius_m = 0.18
+    node._picked_obstacle_positions = [(0.50, 0.00)]
+
+    obstacles = MissionFsmNode._obstacles_snapshot(node)
+
+    assert obstacles == [(0.0, 0.0)]
 
 
 def test_set1_fresh_world_non_target_keeps_visit_for_final_classify():

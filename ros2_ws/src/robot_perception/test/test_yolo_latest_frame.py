@@ -2,10 +2,12 @@ from builtin_interfaces.msg import Time
 import pytest
 from rclpy.qos import HistoryPolicy, ReliabilityPolicy
 from sensor_msgs.msg import Image
+from types import SimpleNamespace
 
 from robot_perception.nodes.yolo_detector_node import (
     LATEST_IMAGE_QOS,
     center_inside_normalized_rect,
+    collapse_nested_fruit_cube_detections,
     image_capture_age_sec,
     image_is_fresh_for_inference,
     YoloDetectorNode,
@@ -53,6 +55,39 @@ def test_wide_self_mask_uses_normalized_detection_centres():
     assert not center_inside_normalized_rect(420.0, 422.0, 1280, 960, rect)
     assert not center_inside_normalized_rect(672.0, 900.0, 1280, 960, rect)
     assert center_inside_normalized_rect(0.34 * 1280, 0.25 * 960, 1280, 960, rect)
+
+
+def test_inner_fruit_box_promotes_outer_cube_and_removes_duplicate():
+    outer = SimpleNamespace(
+        label="cube", confidence=0.93,
+        x_center=320.0, y_center=856.0, width=74.0, height=68.0,
+    )
+    inner = SimpleNamespace(
+        label="fruit_photo_cube", confidence=0.77,
+        x_center=304.0, y_center=867.0, width=30.0, height=31.0,
+    )
+
+    result = collapse_nested_fruit_cube_detections([outer, inner])
+
+    assert result == [outer]
+    assert outer.label == "fruit_photo_cube"
+    assert outer.confidence == pytest.approx(0.93)
+
+
+def test_standalone_plain_cube_remains_plain():
+    cube = SimpleNamespace(
+        label="cube", confidence=0.90,
+        x_center=100.0, y_center=100.0, width=50.0, height=50.0,
+    )
+    distant_fruit = SimpleNamespace(
+        label="fruit_photo_cube", confidence=0.80,
+        x_center=300.0, y_center=300.0, width=20.0, height=20.0,
+    )
+
+    result = collapse_nested_fruit_cube_detections([cube, distant_fruit])
+
+    assert result == [cube, distant_fruit]
+    assert cube.label == "cube"
 
 
 def test_top_callback_never_runs_yolo_for_a_stale_queued_image():

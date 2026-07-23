@@ -16,7 +16,7 @@ from rcl_interfaces.msg import SetParametersResult
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from robot_interfaces.msg import MissionState
-from std_msgs.msg import Float32MultiArray, String
+from std_msgs.msg import Float32MultiArray, String, UInt64
 
 from robot_hardware.competition_state import RUNNING, CompetitionStateMachine
 
@@ -71,6 +71,10 @@ class McuBridgeBaseNode(Node):
         self._profile_off_deadline = 0.0
 
         self.pub_state = self.create_publisher(String, "/competition/state", COMPETITION_QOS)
+        # Every physical START press is also exposed as an event.  The latched competition state
+        # still owns the official STANDBY->READY->RUNNING transition, but late presses during
+        # RUNNING are useful as an explicit operator rescue trigger.
+        self.pub_start_event = self.create_publisher(UInt64, "/competition/start_event", 10)
         self.pub_odom = self.create_publisher(Float32MultiArray, "/base/wheel_odom", 10)
         self.create_subscription(
             Float32MultiArray, "/base/wheel_speeds", self.on_wheel_speeds, 10
@@ -189,14 +193,19 @@ class McuBridgeBaseNode(Node):
         state = self.competition.state
         self.pub_state.publish(String(data=state))
         if send_status:
-            self._write_line(f"<STATUS,{state}>", "competition STATUS")
+            self._write_competition_status("competition STATUS")
+
+    def _status_line_for_mission(self) -> str:
+        if self.competition.state == RUNNING and self._mission_state == "MANUAL_RESCUE_REVERSE":
+            return "RESCUE"
+        return self.competition.state
+
+    def _write_competition_status(self, context: str) -> None:
+        self._write_line(f"<STATUS,{self._status_line_for_mission()}>", context)
 
     def _status_tick(self) -> None:
         # Periodic resend also reconnects the port if the Arduino was unplugged/rebooted.
-        self._write_line(
-            f"<STATUS,{self.competition.state}>",
-            "periodic competition STATUS",
-        )
+        self._write_competition_status("periodic competition STATUS")
         if self.competition.state != RUNNING:
             self._write_line("<LIFT,0>", "pre-start profile stop")
 
@@ -206,11 +215,13 @@ class McuBridgeBaseNode(Node):
         except (TypeError, ValueError):
             self.get_logger().warn(f"invalid START packet ignored: {line}")
             return
+        self.pub_start_event.publish(UInt64(data=sequence))
         old_state = self.competition.state
         new_state = self.competition.accept_start(sequence)
         if new_state is None:
             self.get_logger().info(
-                f"START sequence ignored: n={sequence} state={old_state}"
+                f"START sequence ignored by state machine: n={sequence} state={old_state} "
+                "(event still published)"
             )
             return
         self.get_logger().info(
@@ -256,6 +267,8 @@ class McuBridgeBaseNode(Node):
     # ------------------------------------------------------- one-shot profile
     def on_mission_state(self, msg: MissionState) -> None:
         self._mission_state = str(msg.state)
+        if self.competition.state == RUNNING and self._mission_state == "MANUAL_RESCUE_REVERSE":
+            self._write_competition_status("manual rescue LED status")
         self._maybe_start_profile()
 
     def _maybe_start_profile(self) -> None:

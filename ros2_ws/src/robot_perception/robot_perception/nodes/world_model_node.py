@@ -194,6 +194,134 @@ class ObjectFlowSample:
         return self.dleft / self.dt
 
 
+@dataclass(frozen=True)
+class GlobalLandmarkMatch:
+    """One globally one-to-one translation hypothesis for object landmarks."""
+
+    pairs: tuple[tuple[int, float, float, float, float], ...]
+    dx: float
+    dy: float
+    rms: float
+    ambiguous: bool = False
+    alternate_dx: float = 0.0
+    alternate_dy: float = 0.0
+
+
+def _greedy_unique_landmark_pairs(
+    observations: list[tuple[float, float]],
+    anchors: list[tuple[int, float, float]],
+    dx: float,
+    dy: float,
+    gate: float,
+) -> tuple[tuple[tuple[int, float, float, float, float], ...], float]:
+    """Assign observations to anchors once each under a translation hypothesis."""
+    candidates: list[tuple[float, int, int]] = []
+    for obs_index, (ox, oy) in enumerate(observations):
+        shifted_x, shifted_y = ox + dx, oy + dy
+        for anchor_index, (_, ax, ay) in enumerate(anchors):
+            distance = math.hypot(shifted_x - ax, shifted_y - ay)
+            if distance <= gate:
+                candidates.append((distance, obs_index, anchor_index))
+    candidates.sort()
+
+    used_observations: set[int] = set()
+    used_tracks: set[int] = set()
+    pairs: list[tuple[int, float, float, float, float]] = []
+    squared_error = 0.0
+    for distance, obs_index, anchor_index in candidates:
+        tid, ax, ay = anchors[anchor_index]
+        if obs_index in used_observations or tid in used_tracks:
+            continue
+        used_observations.add(obs_index)
+        used_tracks.add(tid)
+        ox, oy = observations[obs_index]
+        pairs.append((tid, ox, oy, ax, ay))
+        squared_error += distance * distance
+    rms = math.sqrt(squared_error / len(pairs)) if pairs else math.inf
+    return tuple(pairs), rms
+
+
+def match_global_landmarks(
+    observations: list[tuple[float, float]],
+    anchors: list[tuple[int, float, float]],
+    *,
+    min_pairs: int,
+    residual_gate: float,
+    max_offset: float,
+    grid_spacing: float,
+    alias_tolerance: float,
+    alias_residual_margin: float,
+) -> GlobalLandmarkMatch | None:
+    """Match a full camera frame globally and reject equally valid one-cell shifts.
+
+    Localization deliberately ignores the four-node inspection cell used for picking. Candidate
+    translations use every visible observation and every persistent grid landmark, with each
+    observation and track used at most once. If two equally supported solutions differ by one
+    grid row or column, the periodic scene cannot provide an absolute fix and is marked ambiguous.
+    """
+    required = max(1, int(min_pairs))
+    gate = max(1e-6, float(residual_gate))
+    if len(observations) < required or len(anchors) < required:
+        return None
+
+    hypotheses: list[
+        tuple[
+            tuple[int, float, float],
+            float,
+            float,
+            tuple[tuple[int, float, float, float, float], ...],
+            float,
+        ]
+    ] = []
+    seen_bins: set[tuple[int, int]] = set()
+    bin_size = max(0.01, gate * 0.25)
+    for ox, oy in observations:
+        for _, ax, ay in anchors:
+            dx, dy = ax - ox, ay - oy
+            if math.hypot(dx, dy) > max(0.0, float(max_offset)):
+                continue
+            key = (round(dx / bin_size), round(dy / bin_size))
+            if key in seen_bins:
+                continue
+            seen_bins.add(key)
+            pairs, rms = _greedy_unique_landmark_pairs(
+                observations, anchors, dx, dy, gate
+            )
+            if len(pairs) < required:
+                continue
+            score = (len(pairs), -rms, -math.hypot(dx, dy))
+            hypotheses.append((score, dx, dy, pairs, rms))
+    if not hypotheses:
+        return None
+
+    hypotheses.sort(key=lambda item: item[0], reverse=True)
+    _, best_dx, best_dy, best_pairs, best_rms = hypotheses[0]
+    spacing = max(1e-6, float(grid_spacing))
+    alias_tol = max(0.0, float(alias_tolerance))
+    residual_margin = max(0.0, float(alias_residual_margin))
+    for score, dx, dy, _, rms in hypotheses[1:]:
+        if score[0] != len(best_pairs) or rms > best_rms + residual_margin:
+            continue
+        delta_x, delta_y = dx - best_dx, dy - best_dy
+        one_column = (
+            abs(abs(delta_x) - spacing) <= alias_tol and abs(delta_y) <= alias_tol
+        )
+        one_row = (
+            abs(abs(delta_y) - spacing) <= alias_tol and abs(delta_x) <= alias_tol
+        )
+        if one_column or one_row:
+            return GlobalLandmarkMatch(
+                best_pairs,
+                best_dx,
+                best_dy,
+                best_rms,
+                ambiguous=True,
+                alternate_dx=dx,
+                alternate_dy=dy,
+            )
+    return GlobalLandmarkMatch(best_pairs, best_dx, best_dy, best_rms)
+
+
 def select_translation_velocity_medoid(
     samples: list[ObjectFlowSample],
 ) -> ObjectFlowSample:
@@ -252,6 +380,10 @@ class Track:
     body_votes: dict = field(default_factory=dict)    # body YOLO label -> summed conf
     # Recent confident YOLO labels in cross-camera arrival order.
     label_history: list[str] = field(default_factory=list)
+    # Latest confident Wide cube-family label. Unlike fruit_cube_seen this is deliberately
+    # reversible: every new Wide observation replaces it, so Wide remains dominant without a
+    # single old fruit_photo_cube frame permanently fixing the track as Set2.
+    latest_wide_cube_label: str = ""
     fruit_votes: dict = field(default_factory=dict)   # SigLIP fruit -> summed conf
     wide_fruit_votes: dict = field(default_factory=dict)  # wide-hint fruit -> summed margin
     # Landmark anchoring: once a track is stable it LOCKS to a frozen world position, and
@@ -370,6 +502,7 @@ class WorldModelNode(Node):
         self.declare_parameter("lock_min_conf", 0.4)
         self.declare_parameter("landmark_min_pairs", 3)
         self.declare_parameter("landmark_max_resid_m", 0.30)
+        self.declare_parameter("landmark_grid_only", False)
         self.declare_parameter("unlock_after", 3)   # consecutive outlier frames -> object moved
         # Anchor spread (mean radius from their centroid) at which a heading fix is full-confidence.
         # Well-spread anchors constrain rotation tightly; clustered ones don't -> lower confidence.
@@ -380,6 +513,13 @@ class WorldModelNode(Node):
         # (which stays robust with few anchors). Prevents the sparse-view false-rotation jitter.
         self.declare_parameter("landmark_heading_min_pairs", 5)
         self.declare_parameter("landmark_heading_min_spread_m", 0.30)
+        # Localization uses the complete wide frame, independently of the nearby four-node
+        # inspection cell. A periodic layout one grid cell away is held as ambiguous.
+        self.declare_parameter("landmark_global_match_enabled", True)
+        self.declare_parameter("landmark_global_max_offset_m", 0.75)
+        self.declare_parameter("landmark_grid_alias_guard_enabled", True)
+        self.declare_parameter("landmark_grid_alias_tolerance_m", 0.08)
+        self.declare_parameter("landmark_grid_alias_residual_margin_m", 0.02)
         # Object-flow odometry (frame-to-frame wide-point scan matching).
         self.declare_parameter("object_flow", True)
         self.declare_parameter("object_flow_min_pairs", 4)       # need this many matched points to trust it
@@ -451,10 +591,10 @@ class WorldModelNode(Node):
         self.declare_parameter("class_conf_threshold_body", 0.50)
         self.declare_parameter("plain_cube_confirm_observations", 5)
         self.declare_parameter("body_siglip_assoc_radius_m", 0.18)
-        self.declare_parameter("fruit_cube_sticky_enabled", False)
+        self.declare_parameter("fruit_cube_sticky_enabled", True)
         self.declare_parameter("fruit_cube_sticky_conf_wide", 0.75)
         self.declare_parameter("fruit_cube_sticky_conf_body", 0.50)
-        self.declare_parameter("fruit_cube_sticky_min_wide_hits", 3)
+        self.declare_parameter("fruit_cube_sticky_min_wide_hits", 1)
         # --- Wide-cam SigLIP fruit HINTS (JSON String from siglip_gate_node's wide path).
         # Advisory routing labels only: attached to the nearest Set2 track's fruit_label
         # when no body-cam SigLIP evidence exists, touching NO pick-gate evidence field.
@@ -599,10 +739,33 @@ class WorldModelNode(Node):
         self.lock_min_conf = float(self.get_parameter("lock_min_conf").value)
         self.landmark_min_pairs = int(self.get_parameter("landmark_min_pairs").value)
         self.landmark_max_resid = float(self.get_parameter("landmark_max_resid_m").value)
+        self.landmark_grid_only = bool(
+            self.get_parameter("landmark_grid_only").value
+        )
         self.unlock_after = int(self.get_parameter("unlock_after").value)
         self.landmark_spread_ref = float(self.get_parameter("landmark_spread_ref_m").value)
         self.landmark_heading_min_pairs = int(self.get_parameter("landmark_heading_min_pairs").value)
         self.landmark_heading_min_spread = float(self.get_parameter("landmark_heading_min_spread_m").value)
+        self.landmark_global_match_enabled = bool(
+            self.get_parameter("landmark_global_match_enabled").value
+        )
+        self.landmark_global_max_offset = max(
+            0.0, float(self.get_parameter("landmark_global_max_offset_m").value)
+        )
+        self.landmark_grid_alias_guard_enabled = bool(
+            self.get_parameter("landmark_grid_alias_guard_enabled").value
+        )
+        self.landmark_grid_alias_tolerance = max(
+            0.0, float(self.get_parameter("landmark_grid_alias_tolerance_m").value)
+        )
+        self.landmark_grid_alias_residual_margin = max(
+            0.0,
+            float(
+                self.get_parameter(
+                    "landmark_grid_alias_residual_margin_m"
+                ).value
+            ),
+        )
         self.object_flow = bool(self.get_parameter("object_flow").value)
         self.object_flow_min_pairs = int(self.get_parameter("object_flow_min_pairs").value)
         self.local_anchor_object_flow_min_pairs = int(
@@ -620,6 +783,7 @@ class WorldModelNode(Node):
             self.get_parameter("object_flow_median_filter_enabled").value
         )
         self._corr_pairs: list[tuple[int, float, float, float, float]] = []  # (tid,obs_x,obs_y,anchor_x,anchor_y)
+        self._corr_observations: list[tuple[float, float]] = []
 
         self.can_project = self.fx != 0.0 and self.fy != 0.0 and self.cx != 0.0 and self.cy != 0.0
 
@@ -890,6 +1054,7 @@ class WorldModelNode(Node):
         self._proj_wide = []
         self._proj_body = []
         self._corr_pairs.clear()
+        self._corr_observations.clear()
 
     def _on_parameters_changed(self, params) -> SetParametersResult:
         """Allow the grid prior and its debug logging to be toggled without restarting ROS."""
@@ -909,6 +1074,10 @@ class WorldModelNode(Node):
                 self.grid_track_lock_alpha = min(1.0, max(0.0, float(param.value)))
             elif param.name == "fruit_cube_sticky_enabled":
                 self.fruit_cube_sticky_enabled = bool(param.value)
+                if not self.fruit_cube_sticky_enabled:
+                    for track in self.tracks.values():
+                        track.fruit_cube_seen = False
+                        self._refresh_identity(track)
             elif param.name == "plain_cube_confirm_observations":
                 self.plain_cube_confirm_observations = min(32, max(1, int(param.value)))
                 for track in self.tracks.values():
@@ -1267,6 +1436,7 @@ class WorldModelNode(Node):
         now = self._now_sec()
         rpose = self._pose_at(msg.header.stamp)   # robot pose at IMAGE-CAPTURE time (anti-smear)
         self._corr_pairs.clear()
+        self._corr_observations.clear()
         wide_pts: list[tuple[float, float]] = []
         wide_base: list[tuple[float, float, str]] = []   # (bx, by, label) robot-frame, for object-flow
         for det in msg.detections:
@@ -1308,6 +1478,8 @@ class WorldModelNode(Node):
             if base is not None and self._in_body_fov_base(base[0], base[1]):
                 continue
             set_type = _LABEL_TO_SET_TYPE.get(label, 0)
+            if set_type in (1, 2):
+                self._corr_observations.append((xy[0], xy[1]))
             self._associate(xy[0], xy[1], float(det.confidence), label, set_type, now, "wide")
         self._proj_wide = wide_pts
         # Object-flow odometry BEFORE the absolute correction: robot motion from how the raw
@@ -1331,6 +1503,7 @@ class WorldModelNode(Node):
         now = self._now_sec()
         rpose = self._pose_at(msg.header.stamp)   # robot pose at IMAGE-CAPTURE time (anti-smear)
         self._corr_pairs.clear()
+        self._corr_observations.clear()
         body_pts: list[tuple[float, float]] = []
         best_fruit = (-1.0, None)   # (conf, tid) of the PRIMARY fruit cube this frame
         for det in msg.detections:
@@ -1467,10 +1640,10 @@ class WorldModelNode(Node):
         if best_id is None:
             return
         tr = self.tracks[best_id]
-        tr.wide_fruit_votes[hint.label] = (
-            tr.wide_fruit_votes.get(hint.label, 0.0) + hint.confidence
-        )
-        tr.wide_fruit_confidence = max(tr.wide_fruit_confidence, hint.confidence)
+        # Wide is live routing evidence: the newest spatially-bound read replaces the previous
+        # hint instead of accumulating forever. Body SigLIP votes remain the pick authority.
+        tr.wide_fruit_votes = {hint.label: hint.confidence}
+        tr.wide_fruit_confidence = hint.confidence
         self._refresh_identity(tr)
         self.get_logger().info(
             f"wide fruit hint: track={best_id} {hint.label} "
@@ -1694,6 +1867,17 @@ class WorldModelNode(Node):
                                      "body_votes": body_votes,
                                      "wide_votes": wide_votes,
                                      "label_history": label_history,
+                                     "latest_wide_cube_label": (
+                                         label
+                                         if (
+                                             not is_body
+                                             and label in {"cube", "fruit_photo_cube"}
+                                             and self._is_recent_label_evidence(
+                                                 label, conf, is_body, vote_thresh
+                                             )
+                                         )
+                                         else ""
+                                     ),
                                      "fruit_cube_seen": fruit_seen,
                                      "fruit_cube_conf": conf if fruit_hit else 0.0,
                                      "fruit_cube_wide_hits": fruit_wide_hits,
@@ -1713,6 +1897,8 @@ class WorldModelNode(Node):
             history = best.setdefault("label_history", [])
             history.append(label)
             del history[:-self.plain_cube_confirm_observations]
+            if not is_body and label in {"cube", "fruit_photo_cube"}:
+                best["latest_wide_cube_label"] = label
         if self._is_fruit_cube_evidence(label, conf, is_body):
             if is_body:
                 best["fruit_cube_body_hits"] = int(best.get("fruit_cube_body_hits", 0)) + 1
@@ -1745,6 +1931,9 @@ class WorldModelNode(Node):
             wide_votes=dict(best.get("wide_votes", {})),
             body_votes=dict(best.get("body_votes", {})),
             label_history=list(best.get("label_history", [])),
+            latest_wide_cube_label=str(
+                best.get("latest_wide_cube_label", "")
+            ),
             spawn_grid_id=grid_id, current_grid_id=grid_id,
             grid_state=("grid_spawned" if snapped else "off_grid"), grid_snapped=snapped,
             fruit_cube_seen=bool(best.get("fruit_cube_seen", False)),
@@ -1815,7 +2004,18 @@ class WorldModelNode(Node):
         self._lock_track_to_grid(tr, set_type)
         if not self.grid_track_lock_enabled:
             self._update_grid_state(tr, x, y)
-        if tr.locked and self.landmark_correction:
+        if (
+            tr.locked
+            and self.landmark_correction
+            and (
+                not getattr(self, "landmark_grid_only", False)
+                or (
+                    tr.grid_snapped
+                    and tr.spawn_grid_id >= 0
+                    and tr.grid_state == "grid_spawned"
+                )
+            )
+        ):
             # Frozen landmark: don't move it — record (track id, fresh obs, anchor) so the batch
             # solve can recover the robot-pose drift AND spot anchors that moved (object picked up).
             self._corr_pairs.append((best_id, x, y, tr.anchor_x, tr.anchor_y))
@@ -1861,6 +2061,12 @@ class WorldModelNode(Node):
             self._vote(tr, label, conf, is_body)
         elif self._is_recent_label_evidence(label, conf, is_body, vote_thresh):
             self._record_recent_label(tr, label)
+        if (
+            not is_body
+            and label in {"cube", "fruit_photo_cube"}
+            and self._is_recent_label_evidence(label, conf, is_body, vote_thresh)
+        ):
+            tr.latest_wide_cube_label = label
         self._refresh_identity(tr)
         # Lock a stable track into a frozen world anchor once it has enough confident evidence.
         if (
@@ -1946,6 +2152,17 @@ class WorldModelNode(Node):
             tr.set_type = 2
             self._apply_wide_fruit_hint(tr)
             return
+        # Non-sticky live mode: the newest confident Wide cube-family observation is the
+        # dominant current geometry decision. A later Wide ``cube`` immediately releases this
+        # Set2 decision back to the normal recent-evidence resolver.
+        if (
+            not getattr(self, "fruit_cube_sticky_enabled", True)
+            and tr.latest_wide_cube_label == "fruit_photo_cube"
+        ):
+            tr.class_label = "fruit_photo_cube"
+            tr.set_type = 2
+            self._apply_wide_fruit_hint(tr)
+            return
         label, set_type = resolve_recent_yolo_identity(
             tr.body_votes,
             tr.wide_votes,
@@ -1982,6 +2199,56 @@ class WorldModelNode(Node):
         and publish the pose correction from the inliers only.
         """
         pairs = self._corr_pairs   # (tid, ox, oy, lx, ly)
+        if self.landmark_global_match_enabled:
+            anchors = [
+                (tr.id, tr.anchor_x, tr.anchor_y)
+                for tr in self.tracks.values()
+                if (
+                    tr.locked
+                    and not tr.blacklisted
+                    and (
+                        not self.landmark_grid_only
+                        or (
+                            tr.grid_snapped
+                            and tr.spawn_grid_id >= 0
+                            and tr.grid_state == "grid_spawned"
+                        )
+                    )
+                )
+            ]
+            match = match_global_landmarks(
+                self._corr_observations,
+                anchors,
+                min_pairs=self.landmark_min_pairs,
+                residual_gate=self.landmark_max_resid,
+                max_offset=self.landmark_global_max_offset,
+                grid_spacing=self.grid_spacing,
+                alias_tolerance=(
+                    self.landmark_grid_alias_tolerance
+                    if self.landmark_grid_alias_guard_enabled
+                    else -1.0
+                ),
+                alias_residual_margin=self.landmark_grid_alias_residual_margin,
+            )
+            if match is None:
+                return
+            if match.ambiguous and self.landmark_grid_alias_guard_enabled:
+                self.get_logger().warn(
+                    "landmark correction held: equally supported grid hypotheses "
+                    f"({match.dx:+.2f},{match.dy:+.2f})m and "
+                    f"({match.alternate_dx:+.2f},{match.alternate_dy:+.2f})m "
+                    f"differ by one {self.grid_spacing:.2f}m cell; retaining odometry",
+                    throttle_duration_sec=1.0,
+                )
+                return
+            pairs = list(match.pairs)
+        else:
+            # Sequential association can append the same track more than once in one frame.
+            # Duplicates must never satisfy landmark_min_pairs.
+            unique_pairs: dict[int, tuple[int, float, float, float, float]] = {}
+            for pair in pairs:
+                unique_pairs.setdefault(pair[0], pair)
+            pairs = list(unique_pairs.values())
         if not self.landmark_correction or len(pairs) < self.landmark_min_pairs:
             return
 
@@ -2041,10 +2308,12 @@ class WorldModelNode(Node):
         lxc = sum(p[3] for p in kept) / len(kept)
         lyc = sum(p[4] for p in kept) / len(kept)
         spread = sum(math.hypot(p[3] - lxc, p[4] - lyc) for p in kept) / len(kept)
-        n_factor = min(1.0, (len(kept) - 2) / 4.0)                     # 3 anchors -> .25, 6 -> 1
+        # Translation is observable with two known grid anchors even when their geometry is too
+        # sparse for heading. Do not zero its confidence merely because heading remains gated.
+        # This makes the four-node guide-cell snapshots useful for correcting x/y immediately.
+        n_factor = min(1.0, len(kept) / 3.0)                           # 2 anchors -> .67, 3 -> 1
         resid_factor = max(0.0, 1.0 - mean_resid / max(1e-6, self.landmark_max_resid))
-        spread_factor = min(1.0, spread / max(1e-6, self.landmark_spread_ref))
-        conf = max(0.0, n_factor * resid_factor * spread_factor)
+        conf = max(0.0, n_factor * resid_factor)
 
         # Heading gate: only trust the rotation term when the anchor geometry constrains it
         # (enough inliers AND wide spread). Otherwise keep translation, zero the heading — the
@@ -2328,6 +2597,8 @@ class WorldModelNode(Node):
                 ta.blacklisted = ta.blacklisted or tb.blacklisted
                 ta.last_seen_sec = max(ta.last_seen_sec, tb.last_seen_sec)
                 ta.last_body_sec = max(ta.last_body_sec, tb.last_body_sec)
+                if tb.last_wide_sec >= ta.last_wide_sec and tb.latest_wide_cube_label:
+                    ta.latest_wide_cube_label = tb.latest_wide_cube_label
                 ta.last_wide_sec = max(ta.last_wide_sec, tb.last_wide_sec)
                 if ta.spawn_grid_id < 0 and tb.spawn_grid_id >= 0:
                     ta.spawn_grid_id = tb.spawn_grid_id

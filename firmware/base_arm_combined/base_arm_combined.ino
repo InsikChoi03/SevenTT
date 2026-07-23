@@ -108,6 +108,7 @@ int buttonRaw = HIGH;
 int buttonStable = HIGH;
 unsigned long buttonChangedAt = 0;
 bool reportAcceptedRelease = false;
+bool rescueLedOverride = false;
 
 void stopAll();
 void setLift(bool on);
@@ -116,7 +117,11 @@ void showCompetitionState() {
   digitalWrite(RED_LED_PIN, LOW);
   digitalWrite(GREEN_LED_PIN, LOW);
   digitalWrite(YELLOW_LED_PIN, LOW);
-  if (competitionState == COMP_READY) {
+  if (rescueLedOverride) {
+    digitalWrite(RED_LED_PIN, HIGH);
+    digitalWrite(GREEN_LED_PIN, HIGH);
+    digitalWrite(YELLOW_LED_PIN, HIGH);
+  } else if (competitionState == COMP_READY) {
     digitalWrite(YELLOW_LED_PIN, HIGH);
   } else if (competitionState == COMP_RUNNING) {
     digitalWrite(GREEN_LED_PIN, HIGH);
@@ -128,12 +133,23 @@ void showCompetitionState() {
 
 void applyCompetitionStatus(const char* state) {
   CompetitionState nextState;
+  if (strcmp(state, "RESCUE") == 0) {
+    // Operator-visible last-resort mode.  Keep the electrical competition state RUNNING so
+    // BASE/ARM safety gates still accept commands; only override the three status LEDs.
+    if (competitionState == COMP_RUNNING) {
+      rescueLedOverride = true;
+      showCompetitionState();
+    }
+    return;
+  }
   if (strcmp(state, "STANDBY") == 0) nextState = COMP_STANDBY;
   else if (strcmp(state, "READY") == 0) nextState = COMP_READY;
   else if (strcmp(state, "RUNNING") == 0) nextState = COMP_RUNNING;
   else if (strcmp(state, "DONE") == 0) nextState = COMP_DONE;
   else if (strcmp(state, "ERROR") == 0) nextState = COMP_ERROR;
   else return;
+  bool wasRescueLedOverride = rescueLedOverride;
+  rescueLedOverride = false;
 
   // Reassert the lift's electrical off level on every non-running STATUS, even when the
   // competition state itself did not change.
@@ -143,7 +159,10 @@ void applyCompetitionStatus(const char* state) {
   }
   // The bridge refreshes STATUS once per second. Rewriting all PCA channels for the same
   // non-running state can make the motor driver chirp even though every commanded value is zero.
-  if (nextState == competitionState) return;
+  if (nextState == competitionState) {
+    if (wasRescueLedOverride) showCompetitionState();
+    return;
+  }
   competitionState = nextState;
   if (competitionState != COMP_RUNNING) {
     stopAll();
@@ -161,9 +180,17 @@ void updateStartButton(unsigned long now) {
 
   buttonStable = raw;
   if (buttonStable == LOW) {
-    // Only STANDBY -> READY -> RUNNING is locally permitted. Once RUNNING (or terminal),
-    // all later presses are ignored and can never act as a stop button.
-    if (competitionState != COMP_STANDBY && competitionState != COMP_READY) return;
+    // Only STANDBY -> READY -> RUNNING changes local state. Once RUNNING, later presses are
+    // still reported as START events for Jetson-side rescue logic, but never act as a stop button.
+    if (competitionState != COMP_STANDBY && competitionState != COMP_READY) {
+      if (competitionState == COMP_RUNNING) {
+        startPressCount++;
+        reportAcceptedRelease = true;
+        Serial.println("<SW,1>");
+        Serial.print("<START,"); Serial.print(startPressCount); Serial.println(">");
+      }
+      return;
+    }
     startPressCount++;
     competitionState = (
       competitionState == COMP_STANDBY ? COMP_READY : COMP_RUNNING

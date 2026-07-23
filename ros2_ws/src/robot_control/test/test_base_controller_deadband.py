@@ -2,6 +2,7 @@ import math
 
 from robot_control.nodes.base_controller_node import (
     below_motion_deadband,
+    forward_start_boost_active,
     is_precision_strafe_command,
     local_anchor_motion_profile_active,
     mix_calibrated_translation_and_rotation,
@@ -9,6 +10,19 @@ from robot_control.nodes.base_controller_node import (
     select_mission_profile_value,
     select_wheel_scales,
 )
+
+
+def test_forward_start_boost_is_scoped_to_normal_navigation():
+    assert forward_start_boost_active("SCAN", 0.05, 0.0)
+    assert forward_start_boost_active("APPROACH", 0.05, 0.0)
+    assert not forward_start_boost_active("OPENING", 0.05, 0.0)
+    assert not forward_start_boost_active("ALIGN", 0.05, 0.0)
+    assert not forward_start_boost_active("DRIVE_TO_STORAGE", 0.05, 0.0)
+
+
+def test_forward_start_boost_excludes_reverse_and_strafe():
+    assert not forward_start_boost_active("SCAN", -0.05, 0.0)
+    assert not forward_start_boost_active("SCAN", 0.0, 0.05)
 
 
 def test_combined_drive_keeps_translation_trim_and_adds_symmetric_yaw():

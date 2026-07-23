@@ -28,6 +28,7 @@ Pick-gate (rulebook §6/§7, mispick on Set2 = -40, so be conservative):
 """
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass
 import json
 import math
@@ -332,6 +333,69 @@ def target_is_spatially_deferred(
         <= max(0.0, float(match_radius_m))
         for set_type, x, y, until_s in deferred
     )
+
+
+def closest_point_on_segment(
+    point_xy: tuple[float, float],
+    start_xy: tuple[float, float],
+    end_xy: tuple[float, float],
+) -> tuple[tuple[float, float], float]:
+    """Return the clamped closest point on a route leg and its lateral distance."""
+    px, py = float(point_xy[0]), float(point_xy[1])
+    ax, ay = float(start_xy[0]), float(start_xy[1])
+    bx, by = float(end_xy[0]), float(end_xy[1])
+    dx, dy = bx - ax, by - ay
+    length_sq = dx * dx + dy * dy
+    if length_sq <= 1e-12:
+        closest = (ax, ay)
+    else:
+        ratio = ((px - ax) * dx + (py - ay) * dy) / length_sq
+        ratio = max(0.0, min(1.0, ratio))
+        closest = (ax + ratio * dx, ay + ratio * dy)
+    return closest, math.hypot(px - closest[0], py - closest[1])
+
+
+def forward_rejoin_point_on_segment(
+    point_xy: tuple[float, float],
+    start_xy: tuple[float, float],
+    end_xy: tuple[float, float],
+    max_entry_distance_m: float,
+) -> tuple[tuple[float, float], float]:
+    """Choose the furthest forward lane point reachable within the entry radius."""
+    closest, lateral_distance = closest_point_on_segment(
+        point_xy,
+        start_xy,
+        end_xy,
+    )
+    max_distance = max(0.0, float(max_entry_distance_m))
+    if max_distance <= 0.0 or lateral_distance >= max_distance:
+        return closest, lateral_distance
+
+    ax, ay = float(start_xy[0]), float(start_xy[1])
+    bx, by = float(end_xy[0]), float(end_xy[1])
+    dx, dy = bx - ax, by - ay
+    segment_length = math.hypot(dx, dy)
+    if segment_length <= 1e-9:
+        return closest, lateral_distance
+
+    ux, uy = dx / segment_length, dy / segment_length
+    closest_progress = max(
+        0.0,
+        min(
+            segment_length,
+            (float(closest[0]) - ax) * ux + (float(closest[1]) - ay) * uy,
+        ),
+    )
+    forward_allowance = math.sqrt(
+        max(0.0, max_distance * max_distance - lateral_distance * lateral_distance)
+    )
+    rejoin_progress = min(segment_length, closest_progress + forward_allowance)
+    rejoin = (ax + rejoin_progress * ux, ay + rejoin_progress * uy)
+    entry_distance = math.hypot(
+        float(point_xy[0]) - rejoin[0],
+        float(point_xy[1]) - rejoin[1],
+    )
+    return rejoin, entry_distance
 
 
 def global_retarget_is_worthwhile(
@@ -729,8 +793,10 @@ def global_target_in_route_corridor(
     segment_start_xy: tuple[float, float],
     segment_end_xy: tuple[float, float],
     corridor_radius_m: float,
+    route_progress_xy: tuple[float, float] | None = None,
+    backtrack_allowance_m: float = 0.0,
 ) -> bool:
-    """Return whether a target is close enough to interrupt the active sweep leg."""
+    """Return whether a target is beside the untravelled part of the active sweep leg."""
     px, py = float(target_xy[0]), float(target_xy[1])
     ax, ay = float(segment_start_xy[0]), float(segment_start_xy[1])
     bx, by = float(segment_end_xy[0]), float(segment_end_xy[1])
@@ -744,7 +810,57 @@ def global_target_in_route_corridor(
         nearest_x = ax + projection * dx
         nearest_y = ay + projection * dy
         distance = math.hypot(px - nearest_x, py - nearest_y)
-    return distance <= max(0.0, float(corridor_radius_m))
+    if distance > max(0.0, float(corridor_radius_m)):
+        return False
+    if route_progress_xy is None or length_sq <= 1e-12:
+        return True
+    progress_x = float(route_progress_xy[0])
+    progress_y = float(route_progress_xy[1])
+    target_along_m = ((px - ax) * dx + (py - ay) * dy) / math.sqrt(length_sq)
+    robot_along_m = (
+        (progress_x - ax) * dx + (progress_y - ay) * dy
+    ) / math.sqrt(length_sq)
+    return target_along_m + max(0.0, float(backtrack_allowance_m)) >= robot_along_m
+
+
+def expand_route_at_cell_centers(
+    start_xy: tuple[float, float],
+    waypoints: list[tuple[float, float]],
+    spacing_m: float,
+) -> list[tuple[float, float]]:
+    """Subdivide a guide polyline so the robot stops at every grid-cell centre."""
+    spacing = max(0.01, float(spacing_m))
+    expanded: list[tuple[float, float]] = []
+    segment_start = (float(start_xy[0]), float(start_xy[1]))
+    for waypoint in waypoints:
+        end = (float(waypoint[0]), float(waypoint[1]))
+        length = math.hypot(end[0] - segment_start[0], end[1] - segment_start[1])
+        steps = max(1, int(math.ceil(length / spacing - 1e-9)))
+        for step in range(1, steps + 1):
+            ratio = step / steps
+            point = (
+                segment_start[0] + (end[0] - segment_start[0]) * ratio,
+                segment_start[1] + (end[1] - segment_start[1]) * ratio,
+            )
+            if not expanded or math.hypot(
+                point[0] - expanded[-1][0], point[1] - expanded[-1][1]
+            ) > 1e-6:
+                expanded.append(point)
+        segment_start = end
+    return expanded
+
+
+def prepare_guide_route(
+    start_xy: tuple[float, float],
+    waypoints: list[tuple[float, float]],
+    *,
+    expand_segments: bool,
+    spacing_m: float,
+) -> list[tuple[float, float]]:
+    """Return either the exact recorded stops or their legacy spaced expansion."""
+    if not expand_segments:
+        return list(waypoints)
+    return expand_route_at_cell_centers(start_xy, waypoints, spacing_m)
 
 
 def holonomic_waypoint_velocity(
@@ -1053,6 +1169,175 @@ def directional_wall_distance(
     return min(distances) if distances else None
 
 
+class StableParkingWallTracker:
+    """Confirm one arena wall over time and coast briefly across missed frames.
+
+    The retained wall is a landmark, not a repeated localization measurement.  Callers may use a
+    coasting track for conservative approach guidance, but must require ``fresh`` before accepting
+    a final stop or enabling pose correction.
+    """
+
+    def __init__(
+        self,
+        *,
+        window_frames: int,
+        min_hits: int,
+        hold_sec: float,
+        fresh_sec: float,
+        min_length_m: float,
+        axis_tolerance_rad: float,
+        boundary_residual_m: float,
+        coordinate_spread_m: float,
+    ) -> None:
+        self.window_frames = max(1, int(window_frames))
+        self.min_hits = max(1, min(int(min_hits), self.window_frames))
+        self.hold_sec = max(0.0, float(hold_sec))
+        self.fresh_sec = max(0.0, float(fresh_sec))
+        self.min_length_m = max(0.0, float(min_length_m))
+        self.axis_tolerance_rad = max(0.0, float(axis_tolerance_rad))
+        self.boundary_residual_m = max(0.0, float(boundary_residual_m))
+        self.coordinate_spread_m = max(0.0, float(coordinate_spread_m))
+        self.reset()
+
+    def reset(self) -> None:
+        self.axis: str | None = None
+        self.direction = 1
+        self._samples: deque[float | None] = deque(maxlen=self.window_frames)
+        self._confirmed = False
+        self._last_seen_s = -math.inf
+        self._last_segment: tuple[float, float, float, float] | None = None
+
+    def _select_candidate(
+        self,
+        segments: list[tuple[float, float, float, float]],
+        *,
+        robot_x: float,
+        robot_y: float,
+        field_bounds: tuple[float, float, float, float],
+    ) -> tuple[float, tuple[float, float, float, float]] | None:
+        if self.axis not in {"x", "y"}:
+            return None
+        xmin, xmax, ymin, ymax = (float(value) for value in field_bounds)
+        boundary = (
+            (ymax if self.direction >= 0 else ymin)
+            if self.axis == "y"
+            else (xmax if self.direction >= 0 else xmin)
+        )
+        robot_coordinate = float(robot_y) if self.axis == "y" else float(robot_x)
+        sign = 1.0 if self.direction >= 0 else -1.0
+        candidates: list[
+            tuple[float, float, tuple[float, float, float, float]]
+        ] = []
+        for raw in segments:
+            x0, y0, x1, y1 = (float(value) for value in raw)
+            dx, dy = x1 - x0, y1 - y0
+            length = math.hypot(dx, dy)
+            if length < self.min_length_m:
+                continue
+            angle = math.atan2(dy, dx) % math.pi
+            horizontal_error = min(angle, math.pi - angle)
+            vertical_error = abs(angle - math.pi * 0.5)
+            orientation_error = (
+                horizontal_error if self.axis == "y" else vertical_error
+            )
+            if orientation_error > self.axis_tolerance_rad:
+                continue
+            coordinate = 0.5 * (y0 + y1) if self.axis == "y" else 0.5 * (x0 + x1)
+            if sign * (coordinate - robot_coordinate) < 0.0:
+                continue
+            residual = abs(boundary - coordinate)
+            if residual > self.boundary_residual_m:
+                continue
+            # Prefer the candidate nearest the known arena boundary, then the longest one.
+            candidates.append((residual, -length, (x0, y0, x1, y1)))
+        if not candidates:
+            return None
+        _, _, segment = min(candidates, key=lambda item: (item[0], item[1]))
+        coordinate = (
+            0.5 * (segment[1] + segment[3])
+            if self.axis == "y"
+            else 0.5 * (segment[0] + segment[2])
+        )
+        return coordinate, segment
+
+    def observe(
+        self,
+        segments: list[tuple[float, float, float, float]],
+        *,
+        axis: str,
+        direction: int,
+        robot_x: float,
+        robot_y: float,
+        field_bounds: tuple[float, float, float, float],
+        now_s: float,
+    ) -> None:
+        requested_axis = str(axis).strip().lower()
+        requested_direction = 1 if int(direction) >= 0 else -1
+        if self.axis != requested_axis or self.direction != requested_direction:
+            self.reset()
+            self.axis = requested_axis
+            self.direction = requested_direction
+
+        candidate = self._select_candidate(
+            segments,
+            robot_x=robot_x,
+            robot_y=robot_y,
+            field_bounds=field_bounds,
+        )
+        if candidate is None:
+            self._samples.append(None)
+        else:
+            coordinate, segment = candidate
+            prior = [value for value in self._samples if value is not None]
+            if (
+                prior
+                and abs(coordinate - float(np.median(prior)))
+                > self.coordinate_spread_m
+            ):
+                # A spatially contradictory line cannot replace a confirmed wall in one frame.
+                self._samples.append(None)
+            else:
+                self._samples.append(coordinate)
+                self._last_seen_s = float(now_s)
+                self._last_segment = segment
+
+        hits = [value for value in self._samples if value is not None]
+        consistent = (
+            bool(hits)
+            and max(hits) - min(hits) <= self.coordinate_spread_m
+        )
+        if len(hits) >= self.min_hits and consistent:
+            self._confirmed = True
+        if self._confirmed and float(now_s) - self._last_seen_s > self.hold_sec:
+            self._confirmed = False
+            self._last_segment = None
+
+    def confirmed(self, now_s: float) -> bool:
+        return bool(
+            self._confirmed
+            and self._last_segment is not None
+            and float(now_s) - self._last_seen_s <= self.hold_sec
+        )
+
+    def fresh(self, now_s: float) -> bool:
+        return bool(
+            self.confirmed(now_s)
+            and float(now_s) - self._last_seen_s <= self.fresh_sec
+        )
+
+    def distance(self, robot_x: float, robot_y: float, now_s: float) -> float | None:
+        if not self.confirmed(now_s) or self._last_segment is None or self.axis is None:
+            return None
+        return directional_wall_distance(
+            [self._last_segment],
+            float(robot_x),
+            float(robot_y),
+            axis=self.axis,
+            direction=self.direction,
+            angle_tolerance_rad=self.axis_tolerance_rad,
+        )
+
+
 def parking_face_heading(
     staging_x: float,
     staging_y: float,
@@ -1061,6 +1346,55 @@ def parking_face_heading(
 ) -> float:
     """Heading from the parking staging point toward the requested face point."""
     return math.atan2(float(face_y) - float(staging_y), float(face_x) - float(staging_x))
+
+
+def select_flag_snapshot_target(
+    candidates: list[tuple[float, float, float]],
+    *,
+    expected_x: float,
+    expected_y: float,
+    candidate_radius_m: float,
+    pair_max_spacing_m: float,
+) -> tuple[float, float, int] | None:
+    """Select one floor flag or the midpoint of the best floor-flag pair."""
+    expected = (float(expected_x), float(expected_y))
+    nearby = [
+        (float(x), float(y), float(confidence))
+        for x, y, confidence in candidates
+        if math.hypot(float(x) - expected[0], float(y) - expected[1])
+        <= max(0.0, float(candidate_radius_m))
+    ]
+    if not nearby:
+        return None
+    if len(nearby) == 1:
+        return nearby[0][0], nearby[0][1], 1
+
+    pairs: list[tuple[float, float, float, float]] = []
+    for idx, first in enumerate(nearby[:-1]):
+        for second in nearby[idx + 1:]:
+            spacing = math.hypot(second[0] - first[0], second[1] - first[1])
+            if spacing > max(0.01, float(pair_max_spacing_m)):
+                continue
+            midpoint_x = 0.5 * (first[0] + second[0])
+            midpoint_y = 0.5 * (first[1] + second[1])
+            center_error = math.hypot(
+                midpoint_x - expected[0],
+                midpoint_y - expected[1],
+            )
+            confidence = first[2] + second[2]
+            pairs.append((center_error, -confidence, midpoint_x, midpoint_y))
+    if pairs:
+        _error, _neg_confidence, midpoint_x, midpoint_y = min(pairs)
+        return midpoint_x, midpoint_y, 2
+
+    closest = min(
+        nearby,
+        key=lambda item: (
+            math.hypot(item[0] - expected[0], item[1] - expected[1]),
+            -item[2],
+        ),
+    )
+    return closest[0], closest[1], 1
 
 
 def straight_forward_command(
@@ -1266,7 +1600,7 @@ STATES = [
     "OPENING", "WALL_INIT", "SCAN", "ANCHOR_OBSERVE", "SELECT_TARGET", "ANCHOR_FACE_TARGET",
     "APPROACH", "ALIGN", "CLASSIFY", "WAIT_FOR_ARM", "PICK", "STORE_IN_TRAY", "ANCHOR_RETURN",
     "ANCHOR_FACE_NEXT", LOCAL_ANCHOR_STATE, "ZONE_STABILIZE", "WAIT_FOR_STORAGE",
-    "DRIVE_TO_STORAGE", "ALIGN_OVER_BIN", "DUMP_ALL", "END",
+    "DRIVE_TO_STORAGE", "ALIGN_OVER_BIN", "DUMP_ALL", "MANUAL_RESCUE_REVERSE", "END",
 ]
 
 
@@ -1295,6 +1629,7 @@ class MissionFsmNode(Node):
         self.declare_parameter("classify_body_max_frames", 10)
         self.declare_parameter("classify_body_retry_backoff_sec", 0.25)
         self.declare_parameter("classify_body_retry_settle_sec", 0.40)
+        self.declare_parameter("classify_fruit_siglip_wait_sec", 1.50)
         # At very close range the Body model can mistake an octahedron for a cube. Only for an
         # octahedron target, use the spatially associated raw-Wide label for final identity while
         # retaining Body solely as the fresh object-at-grab presence/range safety gate.
@@ -1373,7 +1708,38 @@ class MissionFsmNode(Node):
         self.declare_parameter("timed_storage_fixed_overhead_sec", 12.0)
         self.declare_parameter("timed_storage_safety_margin_sec", 10.0)
         self.declare_parameter("timed_storage_distance_safety_factor", 1.20)
+        # Parking strategy selected from motion_tuning.yaml.
+        # 1: drive to a staging point, face a field point, then reverse to Wide arrival.
+        # 2: face/press the bottom wall, back off, turn left, then reverse continuously.
+        # 3: current bottom-wall/turn/left-wall distance-guided route.
+        # 4: method 3 route with a temporally confirmed, dropout-tolerant wall track.
+        self.declare_parameter("storage_parking_method", 3)
+        self.declare_parameter("storage_flag_staging_x", 1.0)
+        self.declare_parameter("storage_flag_staging_y", 1.0)
+        self.declare_parameter("storage_flag_staging_tolerance_m", 0.30)
+        self.declare_parameter("storage_flag_face_x", 0.0)
+        self.declare_parameter("storage_flag_face_y", 0.0)
+        self.declare_parameter("storage_flag_min_confidence", 0.30)
+        self.declare_parameter("storage_flag_max_age_sec", 0.75)
+        self.declare_parameter("storage_flag_acquire_sec", 0.50)
+        self.declare_parameter("storage_flag_floor_center_x", 1.8)
+        self.declare_parameter("storage_flag_floor_center_y", 1.8)
+        self.declare_parameter("storage_flag_floor_candidate_radius_m", 0.75)
+        self.declare_parameter("storage_flag_pair_max_spacing_m", 0.80)
+        self.declare_parameter("storage_flag_stop_distance_m", 0.05)
+        self.declare_parameter("storage_flag_reverse_speed", 0.15)
+        self.declare_parameter("storage_flag_heading_kp", 1.0)
+        self.declare_parameter("storage_flag_omega_max", 0.08)
+        self.declare_parameter("storage_method2_contact_distance_m", 0.30)
+        self.declare_parameter("storage_method2_contact_hold_sec", 0.8)
+        self.declare_parameter("storage_method2_approach_speed", 0.08)
+        self.declare_parameter("storage_method2_backoff_distance_m", 0.10)
+        self.declare_parameter("storage_method2_backoff_speed", 0.10)
+        self.declare_parameter("storage_method2_turn_left_deg", 95.0)
+        self.declare_parameter("storage_method2_reverse_speed", 0.20)
+        self.declare_parameter("storage_method2_reverse_before_dump_sec", 8.0)
         self.declare_parameter("storage_wall_guided_enabled", False)
+        self.declare_parameter("wall_processing_during_mission_enabled", False)
         self.declare_parameter("wall_initialization_enabled", True)
         self.declare_parameter("wall_initialization_min_observe_sec", 1.5)
         self.declare_parameter("wall_initialization_confirm_frames", 3)
@@ -1405,12 +1771,20 @@ class MissionFsmNode(Node):
         self.declare_parameter("storage_wall_approach_speed", 0.08)
         self.declare_parameter("storage_wall_confirm_frames", 3)
         self.declare_parameter("storage_wall_max_age_sec", 1.50)
+        self.declare_parameter("storage_method4_window_frames", 5)
+        self.declare_parameter("storage_method4_min_hits", 4)
+        self.declare_parameter("storage_method4_hold_sec", 1.70)
+        self.declare_parameter("storage_method4_fresh_sec", 0.50)
+        self.declare_parameter("storage_method4_min_line_length_m", 0.35)
+        self.declare_parameter("storage_method4_axis_tolerance_deg", 12.0)
+        self.declare_parameter("storage_method4_boundary_residual_m", 0.35)
+        self.declare_parameter("storage_method4_coordinate_spread_m", 0.10)
         self.declare_parameter("storage_wall_detection_required_m", 0.60)
         self.declare_parameter("storage_pose_fallback_enabled", False)
         self.declare_parameter("storage_pose_fallback_hold_sec", 0.8)
         self.declare_parameter("storage_pose_fallback_contact_speed", 0.06)
         self.declare_parameter("storage_last_chance_enabled", False)
-        self.declare_parameter("storage_last_chance_trigger_sec", 145.0)
+        self.declare_parameter("storage_last_chance_trigger_sec", 15.0)
         self.declare_parameter("storage_last_chance_pre_backoff_m", 0.05)
         self.declare_parameter("storage_last_chance_pre_backoff_speed", 0.10)
         self.declare_parameter("storage_last_chance_turn_left_deg", 95.0)
@@ -1418,6 +1792,16 @@ class MissionFsmNode(Node):
         self.declare_parameter("storage_last_chance_alternate_sec", 2.0)
         self.declare_parameter("storage_last_chance_force_dump_after_sec", 12.0)
         self.declare_parameter("storage_last_chance_speed", 0.20)
+        self.declare_parameter("storage_last_chance_arrival_guidance_enabled", True)
+        self.declare_parameter("storage_last_chance_arrival_min_conf", 0.30)
+        self.declare_parameter("storage_last_chance_arrival_max_age_sec", 0.75)
+        self.declare_parameter("manual_reverse_rescue_enabled", False)
+        self.declare_parameter("manual_reverse_rescue_min_match_sec", 165.0)
+        self.declare_parameter("manual_reverse_rescue_stop_sec", 2.0)
+        self.declare_parameter("manual_reverse_rescue_speed", 0.20)
+        self.declare_parameter("manual_reverse_rescue_arrival_guidance_enabled", True)
+        self.declare_parameter("manual_reverse_rescue_arrival_min_conf", 0.30)
+        self.declare_parameter("manual_reverse_rescue_arrival_max_age_sec", 0.75)
         self.declare_parameter("storage_contact_hold_enabled", True)
         self.declare_parameter("storage_contact_hold_speed", 0.08)
         self.declare_parameter("shape_target_total", 4)   # set1 shape * 4
@@ -1585,9 +1969,11 @@ class MissionFsmNode(Node):
         # grid nodes the camera has not yet covered are swept only when the map is empty.
         # Expects zone_mission_enabled=false (the zone gates stay active otherwise).
         self.declare_parameter("global_target_mode", False)
-        self.declare_parameter("global_retarget_min_gain", 0.20)
+        self.declare_parameter("global_retarget_min_gain", 0.35)
         self.declare_parameter("global_retarget_check_sec", 1.0)
-        self.declare_parameter("global_retarget_lock_distance_m", 0.80)
+        self.declare_parameter("global_retarget_lock_distance_m", 1.00)
+        self.declare_parameter("global_retarget_min_confidence", 0.70)
+        self.declare_parameter("global_retarget_min_observations", 3)
         self.declare_parameter("global_mismatched_hint_verify_max_dist_m", 0.0)
         self.declare_parameter("global_fov_deg", 140.0)
         self.declare_parameter("global_fov_max_range_m", 2.5)
@@ -1598,14 +1984,30 @@ class MissionFsmNode(Node):
         self.declare_parameter("global_sensor_max_age_sec", 0.75)
         self.declare_parameter("global_initial_map_settle_sec", 1.0)
         self.declare_parameter("global_observe_min_sec", 0.20)
+        self.declare_parameter("global_guide_node_observe_min_sec", 0.30)
+        self.declare_parameter("global_guide_node_observe_frames", 1)
+        self.declare_parameter("global_guide_expand_segments_enabled", True)
+        self.declare_parameter("global_guide_cell_spacing_m", 0.50)
+        self.declare_parameter("global_guide_cell_target_radius_m", 0.40)
         self.declare_parameter("global_fast_safe_routes_enabled", True)
         self.declare_parameter("global_zigzag_patrol_enabled", True)
         self.declare_parameter("global_initial_sweep_holonomic_enabled", False)
         self.declare_parameter("global_initial_sweep_once_enabled", True)
         self.declare_parameter("global_initial_sweep_slowdown_distance_m", 0.45)
         self.declare_parameter("global_initial_sweep_slow_speed_mps", 0.07)
+        self.declare_parameter("global_initial_sweep_rejoin_enabled", True)
+        self.declare_parameter("global_initial_sweep_rejoin_trigger_m", 0.10)
+        self.declare_parameter("global_initial_sweep_rejoin_reach_tol_m", 0.06)
+        self.declare_parameter("global_initial_sweep_rejoin_max_distance_m", 1.0)
         self.declare_parameter("global_target_corridor_gate_enabled", False)
         self.declare_parameter("global_target_corridor_radius_m", 0.45)
+        self.declare_parameter("global_target_corridor_backtrack_m", 0.10)
+        self.declare_parameter("global_target_max_revisit_distance_m", 1.50)
+        self.declare_parameter("global_non_target_spatial_ban_sec", 60.0)
+        self.declare_parameter("global_non_target_spatial_ban_radius_m", 0.22)
+        self.declare_parameter("global_target_release_ban_threshold", 3)
+        self.declare_parameter("global_target_release_ban_sec", 60.0)
+        self.declare_parameter("global_target_release_match_radius_m", 0.22)
         self.declare_parameter("global_strong_fruit_positive_min_confidence", 0.50)
         self.declare_parameter("global_non_target_fruit_reject_min_confidence", 0.40)
         self.declare_parameter("global_zigzag_start_xy", [-1.25, 1.60])
@@ -1620,6 +2022,7 @@ class MissionFsmNode(Node):
         self.declare_parameter("global_approach_route_blocked_defer_enabled", True)
         self.declare_parameter("global_approach_route_blocked_confirm_sec", 0.6)
         self.declare_parameter("global_approach_route_blocked_confirm_attempts", 2)
+        self.declare_parameter("global_approach_route_blocked_defer_sec", 20.0)
         self.declare_parameter("global_patrol_heading_tol_rad", 0.08)
         self.declare_parameter("global_patrol_grid_rows", 6)
         self.declare_parameter("global_patrol_grid_cols", 7)
@@ -1755,6 +2158,13 @@ class MissionFsmNode(Node):
         self.classify_body_retry_settle_sec = max(
             0.0, float(self.get_parameter("classify_body_retry_settle_sec").value)
         )
+        self.classify_fruit_siglip_wait_sec = min(
+            self.classify_timeout_sec,
+            max(
+                0.0,
+                float(self.get_parameter("classify_fruit_siglip_wait_sec").value),
+            ),
+        )
         self.classify_octa_wide_final_enabled = bool(
             self.get_parameter("classify_octa_wide_final_enabled").value
         )
@@ -1792,6 +2202,7 @@ class MissionFsmNode(Node):
         self._classify_body_frame_count = 0
         self._classify_body_target_count = 0
         self._classify_body_other_counts: dict[str, int] = {}
+        self._classify_fruit_siglip_wait_started_s: float | None = None
         self.align_pulse_sec = float(self.get_parameter("align_pulse_sec").value)
         self.align_settle_pulse_sec = float(self.get_parameter("align_settle_pulse_sec").value)
         self.align_step_fwd_duty = float(self.get_parameter("align_step_fwd_duty").value)
@@ -1889,6 +2300,9 @@ class MissionFsmNode(Node):
         self._align_body_lost_sweep_strafe_sign = 0.0
         self._align_arrival_geometry_logged = False
         self._global_deferred_targets: list[tuple[int, float, float, float]] = []
+        self._global_non_target_bans: list[tuple[float, float, float]] = []
+        self._global_target_release_counts: list[tuple[float, float, int]] = []
+        self._global_target_release_bans: list[tuple[float, float, float]] = []
         self._require_precise_heading_before_align = False
         self._precise_heading_retry_start_s: float | None = None
         # Body-cam ground homography for POSE-INDEPENDENT servo: project the object's body pixel
@@ -1954,8 +2368,94 @@ class MissionFsmNode(Node):
         self.timed_storage_distance_safety_factor = max(
             1.0, float(self.get_parameter("timed_storage_distance_safety_factor").value)
         )
+        self.storage_parking_method = int(
+            self.get_parameter("storage_parking_method").value
+        )
+        if self.storage_parking_method not in {1, 2, 3, 4}:
+            self.get_logger().warn(
+                f"unsupported storage_parking_method={self.storage_parking_method}; "
+                "using method 3"
+            )
+            self.storage_parking_method = 3
+        self.storage_flag_staging_x = float(
+            self.get_parameter("storage_flag_staging_x").value
+        )
+        self.storage_flag_staging_y = float(
+            self.get_parameter("storage_flag_staging_y").value
+        )
+        self.storage_flag_staging_tolerance_m = max(
+            0.02, float(self.get_parameter("storage_flag_staging_tolerance_m").value)
+        )
+        self.storage_flag_face_x = float(
+            self.get_parameter("storage_flag_face_x").value
+        )
+        self.storage_flag_face_y = float(
+            self.get_parameter("storage_flag_face_y").value
+        )
+        self.storage_flag_min_confidence = max(
+            0.0, float(self.get_parameter("storage_flag_min_confidence").value)
+        )
+        self.storage_flag_max_age_sec = max(
+            0.05, float(self.get_parameter("storage_flag_max_age_sec").value)
+        )
+        self.storage_flag_acquire_sec = max(
+            0.0, float(self.get_parameter("storage_flag_acquire_sec").value)
+        )
+        self.storage_flag_floor_center_x = float(
+            self.get_parameter("storage_flag_floor_center_x").value
+        )
+        self.storage_flag_floor_center_y = float(
+            self.get_parameter("storage_flag_floor_center_y").value
+        )
+        self.storage_flag_floor_candidate_radius_m = max(
+            0.05,
+            float(self.get_parameter("storage_flag_floor_candidate_radius_m").value),
+        )
+        self.storage_flag_pair_max_spacing_m = max(
+            0.05, float(self.get_parameter("storage_flag_pair_max_spacing_m").value)
+        )
+        self.storage_flag_stop_distance_m = max(
+            0.01, float(self.get_parameter("storage_flag_stop_distance_m").value)
+        )
+        self.storage_flag_reverse_speed = abs(
+            float(self.get_parameter("storage_flag_reverse_speed").value)
+        )
+        self.storage_flag_heading_kp = max(
+            0.0, float(self.get_parameter("storage_flag_heading_kp").value)
+        )
+        self.storage_flag_omega_max = abs(
+            float(self.get_parameter("storage_flag_omega_max").value)
+        )
+        self.storage_method2_contact_distance_m = max(
+            0.05, float(self.get_parameter("storage_method2_contact_distance_m").value)
+        )
+        self.storage_method2_contact_hold_sec = max(
+            0.0, float(self.get_parameter("storage_method2_contact_hold_sec").value)
+        )
+        self.storage_method2_approach_speed = abs(
+            float(self.get_parameter("storage_method2_approach_speed").value)
+        )
+        self.storage_method2_backoff_distance_m = max(
+            0.0, float(self.get_parameter("storage_method2_backoff_distance_m").value)
+        )
+        self.storage_method2_backoff_speed = abs(
+            float(self.get_parameter("storage_method2_backoff_speed").value)
+        )
+        self.storage_method2_turn_left_deg = float(
+            self.get_parameter("storage_method2_turn_left_deg").value
+        )
+        self.storage_method2_reverse_speed = abs(
+            float(self.get_parameter("storage_method2_reverse_speed").value)
+        )
+        self.storage_method2_reverse_before_dump_sec = max(
+            0.0,
+            float(self.get_parameter("storage_method2_reverse_before_dump_sec").value),
+        )
         self.storage_wall_guided_enabled = bool(
             self.get_parameter("storage_wall_guided_enabled").value
+        )
+        self.wall_processing_during_mission_enabled = bool(
+            self.get_parameter("wall_processing_during_mission_enabled").value
         )
         self.wall_initialization_enabled = bool(
             self.get_parameter("wall_initialization_enabled").value
@@ -2046,6 +2546,55 @@ class MissionFsmNode(Node):
         self.storage_wall_max_age_sec = max(
             0.10, float(self.get_parameter("storage_wall_max_age_sec").value)
         )
+        self.storage_method4_window_frames = max(
+            1, int(self.get_parameter("storage_method4_window_frames").value)
+        )
+        self.storage_method4_min_hits = max(
+            1,
+            min(
+                self.storage_method4_window_frames,
+                int(self.get_parameter("storage_method4_min_hits").value),
+            ),
+        )
+        self.storage_method4_hold_sec = max(
+            0.0, float(self.get_parameter("storage_method4_hold_sec").value)
+        )
+        self.storage_method4_fresh_sec = max(
+            0.0,
+            min(
+                self.storage_method4_hold_sec,
+                float(self.get_parameter("storage_method4_fresh_sec").value),
+            ),
+        )
+        self.storage_method4_min_line_length_m = max(
+            0.12,
+            float(self.get_parameter("storage_method4_min_line_length_m").value),
+        )
+        self.storage_method4_axis_tolerance_rad = math.radians(
+            max(
+                1.0,
+                min(
+                    35.0,
+                    float(
+                        self.get_parameter(
+                            "storage_method4_axis_tolerance_deg"
+                        ).value
+                    ),
+                ),
+            )
+        )
+        self.storage_method4_boundary_residual_m = max(
+            0.05,
+            float(
+                self.get_parameter("storage_method4_boundary_residual_m").value
+            ),
+        )
+        self.storage_method4_coordinate_spread_m = max(
+            0.01,
+            float(
+                self.get_parameter("storage_method4_coordinate_spread_m").value
+            ),
+        )
         self.storage_wall_detection_required_m = max(
             self.storage_bottom_wall_stop_m,
             self.storage_left_wall_stop_m,
@@ -2086,6 +2635,39 @@ class MissionFsmNode(Node):
         )
         self.storage_last_chance_speed = abs(
             float(self.get_parameter("storage_last_chance_speed").value)
+        )
+        self.storage_last_chance_arrival_guidance_enabled = bool(
+            self.get_parameter("storage_last_chance_arrival_guidance_enabled").value
+        )
+        self.storage_last_chance_arrival_min_conf = max(
+            0.0,
+            float(self.get_parameter("storage_last_chance_arrival_min_conf").value),
+        )
+        self.storage_last_chance_arrival_max_age_sec = max(
+            0.05,
+            float(self.get_parameter("storage_last_chance_arrival_max_age_sec").value),
+        )
+        self.manual_reverse_rescue_enabled = bool(
+            self.get_parameter("manual_reverse_rescue_enabled").value
+        )
+        self.manual_reverse_rescue_min_match_sec = max(
+            0.0, float(self.get_parameter("manual_reverse_rescue_min_match_sec").value)
+        )
+        self.manual_reverse_rescue_stop_sec = max(
+            0.0, float(self.get_parameter("manual_reverse_rescue_stop_sec").value)
+        )
+        self.manual_reverse_rescue_speed = abs(
+            float(self.get_parameter("manual_reverse_rescue_speed").value)
+        )
+        self.manual_reverse_rescue_arrival_guidance_enabled = bool(
+            self.get_parameter("manual_reverse_rescue_arrival_guidance_enabled").value
+        )
+        self.manual_reverse_rescue_arrival_min_conf = max(
+            0.0, float(self.get_parameter("manual_reverse_rescue_arrival_min_conf").value)
+        )
+        self.manual_reverse_rescue_arrival_max_age_sec = max(
+            0.05,
+            float(self.get_parameter("manual_reverse_rescue_arrival_max_age_sec").value),
         )
         self.storage_contact_hold_enabled = bool(
             self.get_parameter("storage_contact_hold_enabled").value
@@ -2478,6 +3060,12 @@ class MissionFsmNode(Node):
         self.global_retarget_lock_distance_m = max(
             0.0, float(self.get_parameter("global_retarget_lock_distance_m").value)
         )
+        self.global_retarget_min_confidence = max(
+            0.0, float(self.get_parameter("global_retarget_min_confidence").value)
+        )
+        self.global_retarget_min_observations = max(
+            1, int(self.get_parameter("global_retarget_min_observations").value)
+        )
         self.global_mismatched_hint_verify_max_dist_m = max(
             0.0,
             float(self.get_parameter("global_mismatched_hint_verify_max_dist_m").value),
@@ -2503,6 +3091,27 @@ class MissionFsmNode(Node):
         self.global_observe_min_sec = max(
             0.0, float(self.get_parameter("global_observe_min_sec").value)
         )
+        self.global_guide_node_observe_min_sec = max(
+            0.0,
+            float(
+                self.get_parameter("global_guide_node_observe_min_sec").value
+            ),
+        )
+        self.global_guide_node_observe_frames = max(
+            1, int(self.get_parameter("global_guide_node_observe_frames").value)
+        )
+        self.global_guide_expand_segments_enabled = bool(
+            self.get_parameter("global_guide_expand_segments_enabled").value
+        )
+        self.global_guide_cell_spacing_m = max(
+            0.05, float(self.get_parameter("global_guide_cell_spacing_m").value)
+        )
+        self.global_guide_cell_target_radius_m = max(
+            0.05,
+            float(
+                self.get_parameter("global_guide_cell_target_radius_m").value
+            ),
+        )
         self.global_fast_safe_routes_enabled = bool(
             self.get_parameter("global_fast_safe_routes_enabled").value
         )
@@ -2525,12 +3134,65 @@ class MissionFsmNode(Node):
             0.0,
             float(self.get_parameter("global_initial_sweep_slow_speed_mps").value),
         )
+        self.global_initial_sweep_rejoin_enabled = bool(
+            self.get_parameter("global_initial_sweep_rejoin_enabled").value
+        )
+        self.global_initial_sweep_rejoin_trigger_m = max(
+            0.0,
+            float(self.get_parameter("global_initial_sweep_rejoin_trigger_m").value),
+        )
+        self.global_initial_sweep_rejoin_reach_tol_m = max(
+            0.02,
+            float(
+                self.get_parameter("global_initial_sweep_rejoin_reach_tol_m").value
+            ),
+        )
+        self.global_initial_sweep_rejoin_max_distance_m = max(
+            0.10,
+            float(
+                self.get_parameter(
+                    "global_initial_sweep_rejoin_max_distance_m"
+                ).value
+            ),
+        )
         self.global_target_corridor_gate_enabled = bool(
             self.get_parameter("global_target_corridor_gate_enabled").value
         )
         self.global_target_corridor_radius_m = max(
             0.0,
             float(self.get_parameter("global_target_corridor_radius_m").value),
+        )
+        self.global_target_corridor_backtrack_m = max(
+            0.0,
+            float(self.get_parameter("global_target_corridor_backtrack_m").value),
+        )
+        self.global_target_max_revisit_distance_m = max(
+            0.0,
+            float(self.get_parameter("global_target_max_revisit_distance_m").value),
+        )
+        self.global_non_target_spatial_ban_sec = max(
+            0.0,
+            float(self.get_parameter("global_non_target_spatial_ban_sec").value),
+        )
+        self.global_non_target_spatial_ban_radius_m = max(
+            0.0,
+            float(self.get_parameter("global_non_target_spatial_ban_radius_m").value),
+        )
+        self.global_target_release_ban_threshold = max(
+            1,
+            int(self.get_parameter("global_target_release_ban_threshold").value),
+        )
+        self.global_target_release_ban_sec = max(
+            0.0,
+            float(self.get_parameter("global_target_release_ban_sec").value),
+        )
+        self.global_target_release_match_radius_m = max(
+            0.01,
+            float(
+                self.get_parameter(
+                    "global_target_release_match_radius_m"
+                ).value
+            ),
         )
         self.global_strong_fruit_positive_min_confidence = max(
             0.0,
@@ -2561,10 +3223,16 @@ class MissionFsmNode(Node):
             float(value)
             for value in self.get_parameter("global_zigzag_waypoints_xy").value
         ]
-        self.global_zigzag_waypoints = [
+        configured_zigzag_waypoints = [
             (zigzag_xy[index], zigzag_xy[index + 1])
             for index in range(0, len(zigzag_xy) - 1, 2)
         ]
+        self.global_zigzag_waypoints = prepare_guide_route(
+            self.global_zigzag_start,
+            configured_zigzag_waypoints,
+            expand_segments=self.global_guide_expand_segments_enabled,
+            spacing_m=self.global_guide_cell_spacing_m,
+        )
         self.global_zigzag_fixed_route = bool(self.global_zigzag_waypoints)
         self.global_approach_speed_mps = max(
             0.0, float(self.get_parameter("global_approach_speed_mps").value)
@@ -2583,6 +3251,14 @@ class MissionFsmNode(Node):
             int(
                 self.get_parameter(
                     "global_approach_route_blocked_confirm_attempts"
+                ).value
+            ),
+        )
+        self.global_approach_route_blocked_defer_sec = max(
+            0.0,
+            float(
+                self.get_parameter(
+                    "global_approach_route_blocked_defer_sec"
                 ).value
             ),
         )
@@ -2608,7 +3284,11 @@ class MissionFsmNode(Node):
         self._global_zigzag_idx = 0
         self._global_initial_sweep_start_xy: tuple[float, float] | None = None
         self._global_initial_sweep_complete = not bool(self._global_zigzag_waypoints)
+        self._global_initial_sweep_rejoin_xy: tuple[float, float] | None = None
+        self._global_initial_sweep_rejoin_goal_index: int | None = None
+        self._global_guide_center_selection_xy: tuple[float, float] | None = None
         self._global_patrol_observe_seq = -1
+        self._global_patrol_observe_world_s = -math.inf
         self._global_patrol_observe_start_s = 0.0
         self.zone_mission_enabled = bool(self.get_parameter("zone_mission_enabled").value)
         self.zone_order = [int(v) for v in self.get_parameter("zone_order").value] or [1, 2, 3, 4]
@@ -2758,6 +3438,12 @@ class MissionFsmNode(Node):
         self.declare_parameter("obstacle_min_conf", 0.4)        # phantom filter for obstacles
         self.declare_parameter("obstacle_min_nobs", 2)
         self.declare_parameter("exclude_target_radius_m", 0.30)  # drop objects near dest (final leg reachable)
+        self.declare_parameter("planning_duplicate_merge_radius_m", 0.12)
+        self.declare_parameter("planning_picked_suppress_radius_m", 0.18)
+        self.declare_parameter("route_blocked_escape_enabled", True)
+        self.declare_parameter("route_blocked_escape_distance_m", 0.18)
+        self.declare_parameter("route_blocked_escape_history_max_age_sec", 8.0)
+        self.declare_parameter("route_blocked_escape_max_attempts", 2)
         self.declare_parameter("front_escape_enabled", True)
         self.declare_parameter("front_escape_x_min_m", 0.05)
         self.declare_parameter("front_escape_x_max_m", 0.45)
@@ -2787,6 +3473,33 @@ class MissionFsmNode(Node):
         self.obstacle_min_conf = float(self.get_parameter("obstacle_min_conf").value)
         self.obstacle_min_nobs = int(self.get_parameter("obstacle_min_nobs").value)
         self.exclude_target_radius_m = float(self.get_parameter("exclude_target_radius_m").value)
+        self.planning_duplicate_merge_radius_m = max(
+            0.0,
+            float(self.get_parameter("planning_duplicate_merge_radius_m").value),
+        )
+        self.planning_picked_suppress_radius_m = max(
+            0.0,
+            float(self.get_parameter("planning_picked_suppress_radius_m").value),
+        )
+        self.route_blocked_escape_enabled = bool(
+            self.get_parameter("route_blocked_escape_enabled").value
+        )
+        self.route_blocked_escape_distance_m = max(
+            0.05,
+            float(self.get_parameter("route_blocked_escape_distance_m").value),
+        )
+        self.route_blocked_escape_history_max_age_sec = max(
+            0.1,
+            float(
+                self.get_parameter(
+                    "route_blocked_escape_history_max_age_sec"
+                ).value
+            ),
+        )
+        self.route_blocked_escape_max_attempts = max(
+            0,
+            int(self.get_parameter("route_blocked_escape_max_attempts").value),
+        )
         self.front_escape_enabled = bool(self.get_parameter("front_escape_enabled").value)
         self.front_escape_x_min_m = float(self.get_parameter("front_escape_x_min_m").value)
         self.front_escape_x_max_m = float(self.get_parameter("front_escape_x_max_m").value)
@@ -2832,6 +3545,7 @@ class MissionFsmNode(Node):
         self._plan_stamp = 0.0
         self._last_replan_t = 0.0
         self._last_drive_route_blocked = False
+        self._route_blocked_escape_attempts = 0
         self._last_drive_command: tuple[float, float, float] = (0.0, 0.0, 0.0)
         self._stuck_watch_started_s: float | None = None
         self._stuck_watch_pose: tuple[float, float, float] | None = None
@@ -2973,9 +3687,15 @@ class MissionFsmNode(Node):
         )
         self._timed_storage_triggered = False
         self._storage_route_completed = False
-        self._storage_route_phase = "face_bottom_wall"
+        self._storage_route_phase = self._initial_storage_route_phase()
         self._storage_staging_heading: float | None = None
         self._storage_reverse_heading: float | None = self.storage_right_heading_rad
+        self._storage_flag_acquire_started_s = 0.0
+        self._storage_flag_acquire_start_seq = -1
+        self._storage_flag_target_field: tuple[float, float] | None = None
+        self._storage_flag_guidance_mode = "idle"
+        self._storage_method2_phase_started_s = 0.0
+        self._storage_method2_turn_heading: float | None = None
         self._storage_pose_fallback_key: str | None = None
         self._storage_pose_fallback_start_s = 0.0
         self._storage_last_chance_active = False
@@ -2983,11 +3703,24 @@ class MissionFsmNode(Node):
         self._storage_last_chance_started_s = 0.0
         self._storage_last_chance_phase_started_s = 0.0
         self._storage_last_chance_turn_heading: float | None = None
+        self._storage_last_chance_guidance_mode = "pattern"
+        self._manual_reverse_rescue_mode = "idle"
         self._wall_segments: list[tuple[float, float, float, float]] = []
         self._wall_segments_s = 0.0
         self._wall_segments_seq = 0
         self._storage_wall_confirm_count = 0
         self._storage_wall_confirm_last_seq = -1
+        self._storage_method4_wall_tracker = StableParkingWallTracker(
+            window_frames=self.storage_method4_window_frames,
+            min_hits=self.storage_method4_min_hits,
+            hold_sec=self.storage_method4_hold_sec,
+            fresh_sec=self.storage_method4_fresh_sec,
+            min_length_m=self.storage_method4_min_line_length_m,
+            axis_tolerance_rad=self.storage_method4_axis_tolerance_rad,
+            boundary_residual_m=self.storage_method4_boundary_residual_m,
+            coordinate_spread_m=self.storage_method4_coordinate_spread_m,
+        )
+        self._storage_method4_wall_last_seq = -1
         self._wall_initialization_last_seq = -1
         self._wall_initialization_valid_frames = 0
         self._wall_initialization_confirmed_s: float | None = None
@@ -2997,6 +3730,7 @@ class MissionFsmNode(Node):
         self._arm_pick_phase_rx_s = -math.inf
         self._pending_pick: tuple[int, str, str] | None = None
         self._local_blacklisted_ids: set[int] = set()
+        self._picked_obstacle_positions: list[tuple[float, float]] = []
         self._opening_leg = "wait"
         self._opening_turn_target: float | None = None
         self._opening_heading_stable_count = 0
@@ -3097,6 +3831,9 @@ class MissionFsmNode(Node):
         )
         self.create_subscription(
             String, "/competition/state", self.on_competition_state, COMPETITION_QOS
+        )
+        self.create_subscription(
+            UInt64, "/competition/start_event", self.on_competition_start_event, 10
         )
         self.create_subscription(
             String, "/arm/pick_sequence_phase", self.on_arm_pick_phase, 10
@@ -3246,6 +3983,44 @@ class MissionFsmNode(Node):
         if state == "RUNNING" and not self._run_started:
             self._start_competition_run()
 
+    def on_competition_start_event(self, msg: UInt64) -> None:
+        """Use a late physical START press as an explicit operator rescue command."""
+        sequence = int(msg.data)
+        if sequence <= 2:
+            return
+        if not self.manual_reverse_rescue_enabled:
+            return
+        if not self._run_started or self._competition_state != "RUNNING":
+            return
+        if self.state == "MANUAL_RESCUE_REVERSE":
+            return
+        elapsed = self._mission_elapsed_s()
+        if elapsed < self.manual_reverse_rescue_min_match_sec:
+            self._decide(
+                f"MANUAL RESCUE START ignored t={elapsed:.1f}s "
+                f"< {self.manual_reverse_rescue_min_match_sec:.1f}s"
+            )
+            return
+        self._timed_storage_triggered = True
+        self._pending_pick = None
+        self.current_target = None
+        self._clear_current_slot()
+        self._anchor_current_slot_id = None
+        self.set_type = 0
+        self._opportunistic_set2_active = False
+        self._post_pick_lane_entry_pending = False
+        self._storage_route_completed = False
+        self._storage_last_chance_active = False
+        self._manual_reverse_rescue_mode = "idle"
+        self._reset_stuck_escape()
+        self._reset_pulsed_heading()
+        self._decide(
+            f"MANUAL RESCUE START#{sequence} t={elapsed:.1f}s "
+            f"-> STOP {self.manual_reverse_rescue_stop_sec:.1f}s "
+            f"then REVERSE {self.manual_reverse_rescue_speed:.2f}"
+        )
+        self._enter("MANUAL_RESCUE_REVERSE")
+
     def on_arm_pick_phase(self, msg: String) -> None:
         self._arm_pick_phase = str(msg.data).strip().upper() or "UNKNOWN"
         self._arm_pick_phase_rx_s = self._now_s()
@@ -3276,16 +4051,25 @@ class MissionFsmNode(Node):
         self._global_zigzag_idx = 0
         self._global_initial_sweep_start_xy = None
         self._global_initial_sweep_complete = not bool(self._global_zigzag_waypoints)
+        self._global_initial_sweep_rejoin_xy = None
+        self._global_initial_sweep_rejoin_goal_index = None
+        self._global_guide_center_selection_xy = None
         self._global_patrol_observe_seq = -1
+        self._global_patrol_observe_world_s = -math.inf
         self._global_patrol_observe_start_s = 0.0
         self._timed_storage_triggered = False
         self._pending_pick = None
         self._local_blacklisted_ids.clear()
+        self._picked_obstacle_positions.clear()
         self._slot_body_lost_retry_counts.clear()
         self._global_body_lost_retry_counts.clear()
         self._body_lost_lateral_sweep_counts.clear()
         self._global_deferred_targets.clear()
+        self._global_non_target_bans.clear()
+        self._global_target_release_counts.clear()
+        self._global_target_release_bans.clear()
         self._last_drive_route_blocked = False
+        self._route_blocked_escape_attempts = 0
         self._last_drive_command = (0.0, 0.0, 0.0)
         self._reset_stuck_escape()
         self._approach_route_blocked_since_s = None
@@ -3299,9 +4083,15 @@ class MissionFsmNode(Node):
         self._set2_identity_visit_target_xy = None
         self._localization_pose_history.clear()
         self._storage_route_completed = False
-        self._storage_route_phase = "face_bottom_wall"
+        self._storage_route_phase = self._initial_storage_route_phase()
         self._storage_staging_heading = None
         self._storage_reverse_heading = self.storage_right_heading_rad
+        self._storage_flag_acquire_started_s = 0.0
+        self._storage_flag_acquire_start_seq = -1
+        self._storage_flag_target_field = None
+        self._storage_flag_guidance_mode = "idle"
+        self._storage_method2_phase_started_s = 0.0
+        self._storage_method2_turn_heading = None
         self._storage_pose_fallback_key = None
         self._storage_pose_fallback_start_s = 0.0
         self._storage_last_chance_active = False
@@ -3309,6 +4099,8 @@ class MissionFsmNode(Node):
         self._storage_last_chance_started_s = 0.0
         self._storage_last_chance_phase_started_s = 0.0
         self._storage_last_chance_turn_heading = None
+        self._storage_last_chance_guidance_mode = "pattern"
+        self._manual_reverse_rescue_mode = "idle"
         self._reset_storage_wall_confirmation()
         self._wall_initialization_last_seq = self._wall_segments_seq
         self._wall_initialization_valid_frames = 0
@@ -3426,10 +4218,19 @@ class MissionFsmNode(Node):
             if self._opening_leg == "settle" and self._wall_translation_unlocked:
                 return "TRANSLATION_ONLY"
             return "OFF"
+        if self.state == "DRIVE_TO_STORAGE" and self.storage_parking_method == 4:
+            tracker = getattr(self, "_storage_method4_wall_tracker", None)
+            return (
+                "TRANSLATION_ONLY"
+                if tracker is not None and tracker.fresh(self._now_s())
+                else "OFF"
+            )
         return "TRANSLATION_ONLY" if self._wall_translation_unlocked else "OFF"
 
     def _wall_processing_requested(self) -> bool:
-        """Run expensive wall segmentation only while it can affect startup or parking."""
+        """Run wall segmentation throughout the mission when explicitly enabled."""
+        if self.wall_processing_during_mission_enabled:
+            return True
         if not self.storage_wall_guided_enabled:
             # Preserve explicit wall-localizer diagnostics when wall-guided storage is disabled.
             return True
@@ -3525,11 +4326,18 @@ class MissionFsmNode(Node):
         self._reset_object_connector_brake()
         self._plan_escape = False
         self._plan_flexible_fallback = False
+        self._route_blocked_escape_attempts = 0
         self._reset_stuck_escape()
         if new_state == "DRIVE_TO_STORAGE":
-            self._storage_route_phase = "face_bottom_wall"
+            self._storage_route_phase = self._initial_storage_route_phase()
             self._storage_staging_heading = None
             self._storage_reverse_heading = self.storage_right_heading_rad
+            self._storage_flag_acquire_started_s = now
+            self._storage_flag_acquire_start_seq = self._wide_relative_seq
+            self._storage_flag_target_field = None
+            self._storage_flag_guidance_mode = "idle"
+            self._storage_method2_phase_started_s = now
+            self._storage_method2_turn_heading = None
             self._storage_pose_fallback_key = None
             self._storage_pose_fallback_start_s = 0.0
             self._storage_last_chance_active = False
@@ -4323,6 +5131,15 @@ class MissionFsmNode(Node):
             self.pub_track_birth_slots.publish(slots_msg)
             self.pub_track_birth_enabled.publish(Bool(data=False))
             return
+        if (
+            self.state == "MANUAL_RESCUE_REVERSE"
+            or bool(getattr(self, "_storage_last_chance_active", False))
+        ):
+            # Both final fallback modes need the arrival landmark even when ordinary target-track
+            # birth is gated off.
+            self.pub_track_birth_slots.publish(slots_msg)
+            self.pub_track_birth_enabled.publish(Bool(data=True))
+            return
         if self._relative_mode():
             # Field-map tracks are not an authority in relative mode.  Keeping this gate closed
             # also prevents late field projection drift from creating extra anchor targets.
@@ -4403,6 +5220,163 @@ class MissionFsmNode(Node):
     def _fruit_quota_available(self) -> bool:
         return bool(self.set2_label) and self.tray_fruit < self.fruit_target_total
 
+    def _global_target_within_revisit_distance(self, target: Object) -> bool:
+        """During the initial three-point sweep, let patrol bring far targets closer."""
+        if not self.global_target_mode or self.world is None:
+            return True
+        if bool(getattr(self, "_global_initial_sweep_complete", False)):
+            return True
+        limit = float(getattr(self, "global_target_max_revisit_distance_m", 0.0))
+        if limit <= 0.0:
+            return True
+        distance = math.hypot(
+            float(target.x) - float(self.world.robot_x),
+            float(target.y) - float(self.world.robot_y),
+        )
+        return distance + 1e-6 < limit
+
+    def _global_position_is_non_target_banned(self, target: Object) -> bool:
+        """Apply a Body-confirmed non-target ban by position, surviving track/type churn."""
+        now_fn = getattr(self, "_now_s", None)
+        now = float(now_fn()) if callable(now_fn) else 0.0
+        active = [
+            entry
+            for entry in getattr(self, "_global_non_target_bans", [])
+            if float(entry[2]) > now
+        ]
+        self._global_non_target_bans = active
+        radius = float(
+            getattr(self, "global_non_target_spatial_ban_radius_m", 0.22)
+        )
+        return any(
+            math.hypot(float(target.x) - x, float(target.y) - y) <= radius
+            for x, y, _until in active
+        )
+
+    def _ban_global_non_target_position(
+        self,
+        point_xy: tuple[float, float] | None,
+        reason: str,
+    ) -> None:
+        """Ban one confirmed distractor position for the configured cooldown."""
+        if point_xy is None:
+            target = self.current_target
+            if target is None:
+                return
+            point_xy = (float(target.x), float(target.y))
+        duration = float(getattr(self, "global_non_target_spatial_ban_sec", 60.0))
+        radius = float(
+            getattr(self, "global_non_target_spatial_ban_radius_m", 0.22)
+        )
+        if duration <= 0.0 or radius <= 0.0:
+            return
+        now = self._now_s()
+        x, y = float(point_xy[0]), float(point_xy[1])
+        active = [
+            entry
+            for entry in getattr(self, "_global_non_target_bans", [])
+            if float(entry[2]) > now
+            and math.hypot(float(entry[0]) - x, float(entry[1]) - y) > radius
+        ]
+        active.append((x, y, now + duration))
+        self._global_non_target_bans = active
+        self.get_logger().info(
+            f"GLOBAL: Body-confirmed non-target position ({x:.2f},{y:.2f}) "
+            f"banned for {duration:.0f}s ({reason})"
+        )
+        self._decide(
+            f"NON-TARGET POSITION BAN {duration:.0f}s "
+            f"({x:.2f},{y:.2f}) {reason}"
+        )
+
+    def _global_position_is_release_banned(self, target: Object) -> bool:
+        """Reject a repeatedly released physical location even if its tracker ID changes."""
+        now_fn = getattr(self, "_now_s", None)
+        now = float(now_fn()) if callable(now_fn) else 0.0
+        active = [
+            entry
+            for entry in getattr(self, "_global_target_release_bans", [])
+            if float(entry[2]) > now
+        ]
+        self._global_target_release_bans = active
+        radius = float(
+            getattr(self, "global_target_release_match_radius_m", 0.22)
+        )
+        return any(
+            math.hypot(float(target.x) - x, float(target.y) - y) <= radius
+            for x, y, _until in active
+        )
+
+    def _record_global_target_release(
+        self,
+        point_xy: tuple[float, float] | None,
+        reason: str,
+    ) -> None:
+        """Count release cycles by position and promote the third one to a timed ban."""
+        if not getattr(self, "global_target_mode", False):
+            return
+        if point_xy is None:
+            target = self.current_target
+            if target is None:
+                return
+            point_xy = (float(target.x), float(target.y))
+        x, y = float(point_xy[0]), float(point_xy[1])
+        radius = float(
+            getattr(self, "global_target_release_match_radius_m", 0.22)
+        )
+        threshold = max(
+            1, int(getattr(self, "global_target_release_ban_threshold", 3))
+        )
+        counts = list(getattr(self, "_global_target_release_counts", []))
+        matched_index = next(
+            (
+                index
+                for index, (cx, cy, _count) in enumerate(counts)
+                if math.hypot(float(cx) - x, float(cy) - y) <= radius
+            ),
+            None,
+        )
+        count = 1
+        if matched_index is not None:
+            cx, cy, previous = counts.pop(matched_index)
+            count = int(previous) + 1
+            x = (float(cx) * int(previous) + x) / count
+            y = (float(cy) * int(previous) + y) / count
+
+        if count < threshold:
+            counts.append((x, y, count))
+            self._global_target_release_counts = counts
+            self.get_logger().info(
+                f"GLOBAL: target release ({x:.2f},{y:.2f}) "
+                f"{count}/{threshold} ({reason})"
+            )
+            self._decide(
+                f"TARGET RELEASE {count}/{threshold} "
+                f"({x:.2f},{y:.2f}) {reason}"
+            )
+            return
+
+        self._global_target_release_counts = counts
+        now = self._now_s()
+        duration = float(getattr(self, "global_target_release_ban_sec", 60.0))
+        active_bans = [
+            entry
+            for entry in getattr(self, "_global_target_release_bans", [])
+            if float(entry[2]) > now
+            and math.hypot(float(entry[0]) - x, float(entry[1]) - y) > radius
+        ]
+        if duration > 0.0:
+            active_bans.append((x, y, now + duration))
+        self._global_target_release_bans = active_bans
+        self.get_logger().warn(
+            f"GLOBAL: target position ({x:.2f},{y:.2f}) released "
+            f"{count} times -> ban {duration:.0f}s ({reason})"
+        )
+        self._decide(
+            f"TARGET RELEASE BAN {duration:.0f}s "
+            f"({x:.2f},{y:.2f}) after {count} releases"
+        )
+
     def _iter_set1_targets(self):
         """All eligible Set1 objects for selection (shared by nearest- and tour-ordering)."""
         if self.world is None or not self._shape_quota_available():
@@ -4417,6 +5391,12 @@ class MissionFsmNode(Node):
             if self._is_zone_ambiguous_excluded(o):
                 continue
             if self.global_target_mode and MissionFsmNode._global_target_is_deferred(self, o):
+                continue
+            if self.global_target_mode and (
+                MissionFsmNode._global_position_is_non_target_banned(self, o)
+                or MissionFsmNode._global_position_is_release_banned(self, o)
+                or not MissionFsmNode._global_target_within_revisit_distance(self, o)
+            ):
                 continue
             if str(o.class_label) != self.set1_label:
                 continue
@@ -4444,6 +5424,12 @@ class MissionFsmNode(Node):
             if self.zone_mission_enabled and not self._object_seen_after_zone_stabilize(o):
                 continue
             if self.global_target_mode and MissionFsmNode._global_target_is_deferred(self, o):
+                continue
+            if self.global_target_mode and (
+                MissionFsmNode._global_position_is_non_target_banned(self, o)
+                or MissionFsmNode._global_position_is_release_banned(self, o)
+                or not MissionFsmNode._global_target_within_revisit_distance(self, o)
+            ):
                 continue
             fl = str(o.fruit_label)
             if (
@@ -4546,6 +5532,12 @@ class MissionFsmNode(Node):
             return True
         if getattr(self, "_global_initial_sweep_complete", False):
             return True
+        guide_center = getattr(self, "_global_guide_center_selection_xy", None)
+        if guide_center is not None:
+            return math.hypot(
+                float(target.x) - float(guide_center[0]),
+                float(target.y) - float(guide_center[1]),
+            ) <= getattr(self, "global_guide_cell_target_radius_m", 0.40)
         waypoints = getattr(self, "_global_zigzag_waypoints", [])
         if self.world is None or not waypoints:
             return True
@@ -4569,6 +5561,11 @@ class MissionFsmNode(Node):
             (float(segment_start[0]), float(segment_start[1])),
             (float(goal_x), float(goal_y)),
             getattr(self, "global_target_corridor_radius_m", 0.45),
+            (
+                float(self.world.robot_x),
+                float(self.world.robot_y),
+            ),
+            getattr(self, "global_target_corridor_backtrack_m", 0.10),
         )
 
     def _advance_global_initial_sweep(self) -> None:
@@ -4576,6 +5573,8 @@ class MissionFsmNode(Node):
         goal_index = self._global_patrol_goal_zigzag_index
         if goal_index is None or not self._global_zigzag_waypoints:
             return
+        self._global_initial_sweep_rejoin_xy = None
+        self._global_initial_sweep_rejoin_goal_index = None
         next_index = int(goal_index) + 1
         if (
             self.global_initial_sweep_once_enabled
@@ -4617,9 +5616,94 @@ class MissionFsmNode(Node):
         goal_index: int,
     ) -> None:
         """Drive one configured initial-sweep leg as a straight, non-holonomic segment."""
+        # SCAN has already had one complete selection tick for the stopped cell centre.
+        # Once this method is entered there was no eligible corner target, so move on.
+        self._global_guide_center_selection_xy = None
         segment_start = self._initial_sweep_segment_start(goal_index)
         if segment_start is None:
             self._drive(0.0, 0.0, 0.0)
+            return
+        robot_fn = getattr(self, "_robot_xy", None)
+        robot_xy = robot_fn() if callable(robot_fn) else segment_start
+        if robot_xy is None:
+            self._drive(0.0, 0.0, 0.0)
+            return
+        route_goal = (float(goal_x), float(goal_y))
+        rejoin_xy = getattr(self, "_global_initial_sweep_rejoin_xy", None)
+        rejoin_index = getattr(
+            self, "_global_initial_sweep_rejoin_goal_index", None
+        )
+        if rejoin_index != int(goal_index):
+            rejoin_xy = None
+            self._global_initial_sweep_rejoin_xy = None
+            self._global_initial_sweep_rejoin_goal_index = None
+        closest, lateral_distance = closest_point_on_segment(
+            robot_xy,
+            segment_start,
+            route_goal,
+        )
+        if (
+            rejoin_xy is None
+            and getattr(self, "global_initial_sweep_rejoin_enabled", True)
+            and lateral_distance
+            > getattr(self, "global_initial_sweep_rejoin_trigger_m", 0.10)
+        ):
+            rejoin_xy, entry_distance = forward_rejoin_point_on_segment(
+                robot_xy,
+                segment_start,
+                route_goal,
+                getattr(
+                    self,
+                    "global_initial_sweep_rejoin_max_distance_m",
+                    1.0,
+                ),
+            )
+            self._global_initial_sweep_rejoin_xy = rejoin_xy
+            self._global_initial_sweep_rejoin_goal_index = int(goal_index)
+            self._plan = None
+            self._plan_start_xy = None
+            self._plan_dest = None
+            self._decide(
+                f"INITIAL SWEEP DIAGONAL REJOIN "
+                f"({rejoin_xy[0]:.2f},{rejoin_xy[1]:.2f}) "
+                f"entry={entry_distance:.2f}m offset={lateral_distance:.2f}m"
+            )
+        if rejoin_xy is not None:
+            rejoin_distance = math.hypot(
+                float(robot_xy[0]) - float(rejoin_xy[0]),
+                float(robot_xy[1]) - float(rejoin_xy[1]),
+            )
+            if rejoin_distance > getattr(
+                self, "global_initial_sweep_rejoin_reach_tol_m", 0.06
+            ):
+                self._drive_toward(
+                    float(rejoin_xy[0]),
+                    float(rejoin_xy[1]),
+                    route_mode="legacy",
+                    exclude_dest_obstacles=False,
+                    allow_flexible_fallback=True,
+                )
+                if getattr(self, "_last_drive_route_blocked", False):
+                    self._global_initial_sweep_rejoin_xy = None
+                    self._global_initial_sweep_rejoin_goal_index = None
+                    self._plan = None
+                    self._plan_start_xy = None
+                    self._plan_dest = None
+                    self._route_blocked_escape_attempts = 0
+                    self._decide(
+                        "INITIAL SWEEP REJOIN BLOCKED -> RESUME ORIGINAL LEG"
+                    )
+                return
+            self._drive(0.0, 0.0, 0.0)
+            self._decide(
+                f"INITIAL SWEEP REJOINED "
+                f"({rejoin_xy[0]:.2f},{rejoin_xy[1]:.2f}) -> RESUME LEG"
+            )
+            self._global_initial_sweep_rejoin_xy = None
+            self._global_initial_sweep_rejoin_goal_index = None
+            self._plan = None
+            self._plan_start_xy = None
+            self._plan_dest = None
             return
         self._publish_planning_obstacles([])
         self._plan = None
@@ -4738,29 +5822,34 @@ class MissionFsmNode(Node):
             )
             kind, _ = order[0]
             return kind, fruit_cands[order[0]]
-        # A weak non-target fruit label is not enough to discard a cube beside the active route.
-        # Treat it like an untyped cube and let the closer Body view settle the identity. Only a
-        # sufficiently confident non-target label is rejected without an inspection visit.
+        # During the fixed guide sweep, never leave the route merely to identify an untyped fruit
+        # cube. Wide SigLIP keeps classifying those crops in the background while the base drives;
+        # only an already-positive target may interrupt the sweep. This avoids spending an
+        # APPROACH+ALIGN cycle on every fruit just to discover that it is the wrong kind.
+        guide_sweep_active = bool(
+            getattr(self, "global_zigzag_patrol_enabled", False)
+            and getattr(self, "_global_zigzag_waypoints", ())
+            and not getattr(self, "_global_initial_sweep_complete", False)
+        )
+        if guide_sweep_active:
+            if shape_cands:
+                order = order_targets_min_path(
+                    rxy,
+                    [(k, float(o.x), float(o.y)) for k, o in shape_cands.items()],
+                )
+                kind, _ = order[0]
+                return kind, shape_cands[order[0]]
+            return None
+        # After the guide sweep, a cube that still has no fruit identity gets one close Body
+        # inspection as a last-resort fallback. A known non-target fruit is never revisited.
         remaining_set2 = [
             o
             for o in self._iter_set2_target_objects()
             if in_safe_field(o) and self._global_target_in_active_corridor(o)
         ]
         untyped = [obj for obj in remaining_set2 if not str(obj.fruit_label)]
-        weak_non_target = [
-            obj
-            for obj in remaining_set2
-            if str(obj.fruit_label)
-            and bool(str(getattr(obj, "fruit_label_source", "")))
-            and 0.0 < float(getattr(obj, "fruit_confidence", 0.0))
-            < getattr(
-                self,
-                "global_non_target_fruit_reject_min_confidence",
-                0.40,
-            )
-        ]
         verify = min(
-            untyped or weak_non_target,
+            untyped,
             key=lambda o: math.hypot(float(o.x) - rxy[0], float(o.y) - rxy[1]),
             default=None,
         )
@@ -4802,6 +5891,10 @@ class MissionFsmNode(Node):
             return
         if not str(tgt.fruit_label) and int(tgt.set_type) == 2:
             return                                       # never abandon a target for an untyped cube
+        if float(tgt.confidence) < self.global_retarget_min_confidence:
+            return
+        if int(getattr(tgt, "n_obs", 0)) < self.global_retarget_min_observations:
+            return
         rxy = self._robot_xy()
         if rxy is None:
             return
@@ -4868,6 +5961,24 @@ class MissionFsmNode(Node):
         ):
             return False, "wide camera stale"
         return True, "ready"
+
+    def _global_guide_observation_complete(
+        self,
+        *,
+        start_s: float,
+        start_seq: int,
+        start_world_s: float,
+    ) -> bool:
+        """Require one quick stopped Wide sample to reach the world map before driving on."""
+        return bool(
+            self._now_s() - float(start_s)
+            >= self.global_guide_node_observe_min_sec
+            and self._wide_relative_seq
+            >= int(start_seq) + self.global_guide_node_observe_frames
+            and self._world_last_rx_s > float(start_world_s)
+            and self._wide_relative_last_frame_s is not None
+            and self._world_last_rx_s >= self._wide_relative_last_frame_s
+        )
 
     def _global_patrol_step(self) -> None:
         """Sweep unseen object slots from ordered safe lane centres.
@@ -4950,6 +6061,7 @@ class MissionFsmNode(Node):
                 )
                 self._global_patrol_goal_zigzag_index = None
             self._global_patrol_observe_seq = -1
+            self._global_patrol_observe_world_s = -math.inf
             self._global_patrol_observe_start_s = 0.0
             if self._global_patrol_goal is None:
                 self._drive(0.0, 0.0, 0.0)
@@ -4964,6 +6076,12 @@ class MissionFsmNode(Node):
                     f"GLOBAL ZIGZAG Z2-FIRST {self._global_patrol_goal_zigzag_index + 1}/"
                     f"{len(self._global_zigzag_waypoints)} -> ({gx:.2f},{gy:.2f}) "
                     f"new_slots={len(covered)}"
+                )
+            elif self._committed_global_plain_cube():
+                evidence = (
+                    "committed Wide plain-cube positive with final Body grab presence "
+                    f"{self._classify_body_target_count}/"
+                    f"{self._classify_body_frame_count}"
                 )
             else:
                 self._decide(
@@ -5010,6 +6128,17 @@ class MissionFsmNode(Node):
                         and self.global_initial_sweep_holonomic_enabled
                     ),
                 )
+                if self._last_drive_route_blocked:
+                    # A free-exploration viewpoint is optional. Do not park forever when its
+                    # connector remains unreachable after the bounded escape attempts.
+                    self._global_seen_nodes |= set(_covered)
+                    self._global_patrol_goal = None
+                    self._global_patrol_goal_zigzag_index = None
+                    self._plan = None
+                    self._plan_start_xy = None
+                    self._plan_dest = None
+                    self._route_blocked_escape_attempts = 0
+                    self._decide("PATROL ROUTE BLOCKED -> NEXT REACHABLE VIEW")
             return
 
         self._plan = None
@@ -5024,25 +6153,56 @@ class MissionFsmNode(Node):
         )
         if not aligned:
             self._global_patrol_observe_seq = -1
+            self._global_patrol_observe_world_s = -math.inf
             return
         now = self._now_s()
         self._drive(0.0, 0.0, 0.0)
         if self._global_patrol_observe_seq < 0:
             self._global_patrol_observe_seq = self._wide_relative_seq
+            self._global_patrol_observe_world_s = self._world_last_rx_s
             self._global_patrol_observe_start_s = now
+            if self._global_patrol_goal_zigzag_index is not None:
+                self._decide(
+                    f"GUIDE CELL CENTER "
+                    f"{self._global_patrol_goal_zigzag_index + 1}/"
+                    f"{len(self._global_zigzag_waypoints)} "
+                    "STOP -> WIDE SNAPSHOT"
+                )
             return
-        if (
-            now - self._global_patrol_observe_start_s >= self.global_observe_min_sec
-            and self._wide_relative_seq > self._global_patrol_observe_seq
-        ):
+        guide_node = self._global_patrol_goal_zigzag_index is not None
+        observation_complete = (
+            self._global_guide_observation_complete(
+                start_s=self._global_patrol_observe_start_s,
+                start_seq=self._global_patrol_observe_seq,
+                start_world_s=self._global_patrol_observe_world_s,
+            )
+            if guide_node
+            else (
+                now - self._global_patrol_observe_start_s
+                >= self.global_observe_min_sec
+                and self._wide_relative_seq > self._global_patrol_observe_seq
+            )
+        )
+        if observation_complete:
             if (
                 self._global_patrol_goal_zigzag_index is not None
                 and self._global_zigzag_waypoints
             ):
+                self._decide(
+                    f"GUIDE CELL CENTER "
+                    f"{self._global_patrol_goal_zigzag_index + 1}/"
+                    f"{len(self._global_zigzag_waypoints)} "
+                    "DETECTION READY"
+                )
+                self._global_guide_center_selection_xy = (
+                    float(gx),
+                    float(gy),
+                )
                 self._advance_global_initial_sweep()
             self._global_patrol_goal = None
             self._global_patrol_goal_zigzag_index = None
             self._global_patrol_observe_seq = -1
+            self._global_patrol_observe_world_s = -math.inf
 
     # --------------------------------------------------------- Set2 slot inventory
     def _set2_slot_mode(self) -> bool:
@@ -5732,6 +6892,10 @@ class MissionFsmNode(Node):
         self._decide(
             f"SET2 EARLY NON-TARGET {latch.label} #{current_id or latch.target_id}"
         )
+        self._ban_global_non_target_position(
+            (float(latch.target_x), float(latch.target_y)),
+            f"Body fruit={latch.label}",
+        )
         self._blacklist(latch.target_id)
         if current_id and current_id != latch.target_id:
             self._blacklist(current_id)
@@ -6127,13 +7291,16 @@ class MissionFsmNode(Node):
         return self._body_target_base(self._body_label())
 
     def _fresh_body_set1_pick_candidate(self) -> tuple[str, float, float, float] | None:
-        """Return a fresh, spatially aligned Body confirmation for the latched Set1 target."""
+        """Return a fresh Set1 target that is physically centred at the gripper.
+
+        The world track is routing evidence only.  Once ALIGN has put a physical object at the
+        grab point, a same-ID track may disappear or regress to ``set0`` because close Body
+        projections associate with a neighbouring grid track.  Do not let that mutable map
+        identity veto a new, high-confidence Body classification at the actual pick location.
+        """
         if (
             self._opportunistic_set2_active
             or self.phase != 1
-            or self.current_target is None
-            or int(self.current_target.set_type) != 1
-            or str(self.current_target.class_label) != self.set1_label
             or self._body_dets_stamp_s < self.state_enter_s
             or self._now_s() - self._body_dets_stamp_s > self.classify_body_max_age_sec
         ):
@@ -6153,13 +7320,14 @@ class MissionFsmNode(Node):
         return label, confidence, ex, ey
 
     def _fresh_body_set1_pick_presence(self) -> tuple[str, float, float] | None:
-        """Return fresh label-agnostic Body presence at the grab point for Wide verification."""
+        """Return fresh Body presence at the grab point for Wide-owned Set1 identity.
+
+        As with the labelled Body gate above, final physical presence must not depend on a mutable
+        world track retaining its Set1 label after the robot reaches the object.
+        """
         if (
             self._opportunistic_set2_active
             or self.phase != 1
-            or self.current_target is None
-            or int(self.current_target.set_type) != 1
-            or str(self.current_target.class_label) != self.set1_label
             or self._body_dets_stamp_s < self.state_enter_s
             or self._now_s() - self._body_dets_stamp_s > self.classify_body_max_age_sec
         ):
@@ -6281,7 +7449,12 @@ class MissionFsmNode(Node):
             getattr(self, "global_body_target_match_radius_m", 0.18),
         )
 
-    def _defer_current_global_target(self, reason: str) -> None:
+    def _defer_current_global_target(
+        self,
+        reason: str,
+        *,
+        cooldown_sec: float | None = None,
+    ) -> None:
         """Temporarily suppress the current location after one failed Body reacquisition."""
         if not self.global_target_mode or self.current_target is None:
             return
@@ -6290,16 +7463,22 @@ class MissionFsmNode(Node):
             if self._appr_tgt_xy is not None
             else (float(self.current_target.x), float(self.current_target.y))
         )
-        until = self._now_s() + self.align_body_lost_reselect_cooldown_sec
+        self._record_global_target_release((float(x), float(y)), reason)
+        cooldown = (
+            self.align_body_lost_reselect_cooldown_sec
+            if cooldown_sec is None
+            else max(0.0, float(cooldown_sec))
+        )
+        until = self._now_s() + cooldown
         self._global_deferred_targets.append(
             (int(self.current_target.set_type), float(x), float(y), float(until))
         )
         self.get_logger().info(
             f"GLOBAL: defer target position ({x:.2f},{y:.2f}) for "
-            f"{self.align_body_lost_reselect_cooldown_sec:.1f}s ({reason})"
+            f"{cooldown:.1f}s ({reason})"
         )
         self._decide(
-            f"GLOBAL DEFER {self.align_body_lost_reselect_cooldown_sec:.1f}s ({reason})"
+            f"GLOBAL DEFER {cooldown:.1f}s ({reason})"
         )
 
     def _handle_global_approach_route_blocked(self, now_s: float) -> bool:
@@ -6334,7 +7513,14 @@ class MissionFsmNode(Node):
 
         target_id = int(getattr(self.current_target, "id", 0))
         target_xy = self._appr_tgt_xy
-        self._defer_current_global_target("APPROACH route unavailable")
+        self._defer_current_global_target(
+            "APPROACH route unavailable",
+            cooldown_sec=getattr(
+                self,
+                "global_approach_route_blocked_defer_sec",
+                20.0,
+            ),
+        )
         self.current_target = None
         self._appr_tgt_xy = None
         self._standoff_arrived_s = None
@@ -6393,6 +7579,55 @@ class MissionFsmNode(Node):
             and self.current_target is not None
             and self._appr_tgt_xy is not None
         )
+
+    def _committed_global_plain_cube(self) -> bool:
+        """Keep a Wide-positive cube unless definitive fruit-cube evidence supersedes it.
+
+        Dropout and ordinary label churn do not cancel the visit. A Set2/fruit-photo observation
+        at the same frozen position is authoritative evidence from the inner fruit face and must
+        cancel the stale plain-cube commitment.
+        """
+        frozen_xy = getattr(self, "_appr_tgt_xy", None)
+        base_commit = bool(
+            getattr(self, "global_target_mode", False)
+            and str(getattr(self, "set1_label", "")) == "cube"
+            and int(getattr(self, "phase", 0)) == 1
+            and not getattr(self, "_opportunistic_set2_active", False)
+            and getattr(self, "_global_approach_committed_from_wide", False)
+            and frozen_xy is not None
+        )
+        if not base_commit:
+            return False
+        candidates = []
+        target = getattr(self, "current_target", None)
+        world = getattr(self, "world", None)
+        if target is not None:
+            candidates.append(target)
+            lookup = getattr(self, "_lookup_object", None)
+            fresh = (
+                lookup(int(target.id))
+                if callable(lookup) and world is not None
+                else None
+            )
+            if fresh is not None:
+                candidates.append(fresh)
+        if world is not None and frozen_xy is not None:
+            radius = float(
+                getattr(self, "global_body_target_match_radius_m", 0.18)
+            )
+            candidates.extend(
+                obj for obj in world.objects
+                if math.hypot(
+                    float(obj.x) - float(frozen_xy[0]),
+                    float(obj.y) - float(frozen_xy[1]),
+                ) <= radius
+            )
+        definitive_fruit = any(
+            int(getattr(obj, "set_type", 0)) == 2
+            or str(getattr(obj, "class_label", "")) == "fruit_photo_cube"
+            for obj in candidates
+        )
+        return not definitive_fruit
 
     def _align_body_lost_backoff_limit(self) -> int:
         """Reserve extra reacquisition attempts for the committed target-fruit workflow."""
@@ -6469,6 +7704,10 @@ class MissionFsmNode(Node):
             f"GLOBAL TARGET ABSENT #{stale_id} "
             f"{elapsed:.2f}s/{self._global_target_absent_frames}f -> RESELECT"
         )
+        self._record_global_target_release(
+            getattr(self, "_appr_tgt_xy", None),
+            f"{context} target absent",
+        )
         # Blacklist only this short-lived tracker ID. A real object that reappears under a new
         # world-model ID remains eligible, while the vanished ID cannot immediately thrash back in.
         self._blacklist(stale_id)
@@ -6522,6 +7761,60 @@ class MissionFsmNode(Node):
         self._classify_body_frame_count = 0
         self._classify_body_target_count = 0
         self._classify_body_other_counts = {}
+        self._classify_fruit_siglip_wait_started_s = None
+
+    def _handle_set1_fruit_distractor_siglip(self, observed_label: str) -> bool:
+        """Wait for Body SigLIP before rejecting Set1-routed fruit geometry.
+
+        Wide can route a physical fruit cube as a Set1 shape. The faster Body shape vote can then
+        reach ``fruit_photo_cube`` 5/5 before the slower GPU result arrives. Only this explicit
+        fruit geometry gets a bounded wait; normal Set1 distractors keep the fast rejection path.
+
+        Returns True when this tick is fully handled by waiting or by a Set2 pick.
+        """
+        if str(observed_label) != "fruit_photo_cube":
+            return False
+
+        verdict, label, confidence = self._fresh_set2_body_verdict()
+        if verdict == "target":
+            target_id = (
+                int(self.current_target.id) if self.current_target is not None else 0
+            )
+            self._commit_pick(
+                2,
+                label,
+                f"Set1-routed fruit cube; fresh gripper Body SigLIP={confidence:.2f} "
+                f"track=#{target_id}",
+            )
+            return True
+        if verdict == "non_target":
+            self.get_logger().info(
+                f"CLASSIFY: fruit cube Body SigLIP='{label}' != '{self.set2_label}' "
+                "-> finish Set1 reject"
+            )
+            return False
+
+        now = self._now_s()
+        if self._classify_fruit_siglip_wait_started_s is None:
+            self._classify_fruit_siglip_wait_started_s = now
+            self._decide(
+                "FRUIT CUBE AT GRAB -> WAIT BODY SIGLIP "
+                f"{self.classify_fruit_siglip_wait_sec:.1f}s"
+            )
+            self.get_logger().info(
+                "CLASSIFY: fruit_photo_cube confirmed at grab; hold stopped for "
+                "a fresh spatial Body SigLIP result"
+            )
+        elapsed = now - float(self._classify_fruit_siglip_wait_started_s)
+        if elapsed < self.classify_fruit_siglip_wait_sec:
+            self._drive(0.0, 0.0, 0.0)
+            return True
+
+        self._decide("BODY SIGLIP WAIT TIMEOUT -> FINISH SET1 REJECT")
+        self.get_logger().info(
+            "CLASSIFY: fruit cube Body SigLIP wait timed out -> finish Set1 reject"
+        )
+        return False
 
     def _set1_final_uses_wide(self) -> bool:
         """Use Wide identity only for the known close-range octahedron failure mode."""
@@ -6532,6 +7825,7 @@ class MissionFsmNode(Node):
     def _update_set1_final_classification(self) -> tuple[str, str, bool]:
         """Consume one fresh source frame and return (decision, observed_label, fresh)."""
         use_wide = self._set1_final_uses_wide()
+        presence_only = self._committed_global_plain_cube()
         if use_wide:
             seq = int(getattr(self, "_wide_relative_seq", 0))
             if seq == self._classify_wide_last_seq:
@@ -6558,6 +7852,13 @@ class MissionFsmNode(Node):
                 )
             ):
                 observed_label = str(observation.label)
+        elif (
+            presence_only
+            and self._fresh_body_set1_pick_presence() is not None
+        ):
+            # Wide already owns the immutable plain-cube identity. Body owns only the final
+            # physical-presence and grab-position check; its transient class label is ignored.
+            observed_label = str(self.set1_label)
         elif self._fresh_body_set1_pick_candidate() is not None:
             observed_label = str(self.set1_label)
         else:
@@ -6724,9 +8025,16 @@ class MissionFsmNode(Node):
             return None
         return float(observation.x), float(observation.y)
 
-    def _drive(self, vx: float, vy: float, omega: float = 0.0) -> None:
+    def _drive(
+        self,
+        vx: float,
+        vy: float,
+        omega: float = 0.0,
+        *,
+        respect_boundary: bool = True,
+    ) -> None:
         requested_vx, requested_vy = float(vx), float(vy)
-        if self.world is not None and hasattr(self, "_planner"):
+        if respect_boundary and self.world is not None and hasattr(self, "_planner"):
             vx, vy = clamp_outward_field_velocity(
                 requested_vx,
                 requested_vy,
@@ -8246,6 +9554,13 @@ class MissionFsmNode(Node):
         )
         if not active or target is None:
             return "continue"
+        if (
+            int(target.set_type) == 2
+            or str(target.class_label) == "fruit_photo_cube"
+        ):
+            return "exclude"
+        if self._committed_global_plain_cube():
+            return "continue"
         if int(target.set_type) == 1 and str(target.class_label) == "cube":
             self._reset_plain_cube_reobservation()
             return "continue"
@@ -8344,12 +9659,23 @@ class MissionFsmNode(Node):
         dest: tuple[float, float],
         obstacles: list[tuple[float, float]],
         route_mode: str,
+        allow_flexible_fallback: bool = True,
     ) -> tuple[list[tuple[float, float]] | None, bool]:
         """Retry a failed strict lane plan with collision-checked flexible connectors."""
         vias = self._planner.plan(start, dest, obstacles, route_mode=route_mode)
         flexible = route_mode == "legacy"
-        if vias or not self.direct_fallback_enabled or flexible:
+        if (
+            vias
+            or not self.direct_fallback_enabled
+            or flexible
+            or not allow_flexible_fallback
+        ):
             return vias, flexible
+        # ``lane_simplify_enabled=false`` preserves raw four-connected routes, but must not
+        # disable a genuinely clear direct fallback after strict endpoint connectors fail.
+        segment_free = getattr(self._planner, "_seg_free", None)
+        if callable(segment_free) and segment_free(start, dest, obstacles):
+            return [dest], True
         vias = self._planner.plan(start, dest, obstacles, route_mode="legacy")
         return vias, bool(vias)
 
@@ -8411,25 +9737,82 @@ class MissionFsmNode(Node):
         self._advance_phase_or_end()
 
     # ------------------------------------------------------ lane-graph planning
-    def _obstacles_snapshot(self, exclude_id: int = 0,
-                            dest_xy: tuple[float, float] | None = None) -> list[tuple[float, float]]:
+    def _obstacles_snapshot(
+        self,
+        exclude_id: int = 0,
+        dest_xy: tuple[float, float] | None = None,
+    ) -> list[tuple[float, float]]:
         """Physical obstacles (field xy) for the planner from the current world snapshot. Drops the
         target being approached (by id) + anything within exclude_target_radius of the destination
-        (so the final leg is reachable) + storage flags; keeps blacklisted objects (still there)."""
+        (so the final leg is reachable) + storage flags. Confirmed picked positions are removed,
+        while rejected/blacklisted objects remain physical obstacles."""
         if self.world is None:
             return []
-        out = []
+        out: list[tuple[float, float]] = []
+        picked_positions = getattr(self, "_picked_obstacle_positions", [])
+        picked_radius = max(
+            0.0,
+            float(getattr(self, "planning_picked_suppress_radius_m", 0.18)),
+        )
+        merge_radius = max(
+            0.0,
+            float(getattr(self, "planning_duplicate_merge_radius_m", 0.12)),
+        )
         for o in self.world.objects:
             if int(o.set_type) == 3:                          # storage flag, not a body
                 continue
             if int(o.id) == int(exclude_id):
                 continue
-            if float(o.confidence) < self.obstacle_min_conf or int(o.n_obs) < self.obstacle_min_nobs:
+            if (
+                float(o.confidence) < self.obstacle_min_conf
+                or int(o.n_obs) < self.obstacle_min_nobs
+            ):
                 continue
-            if dest_xy is not None and math.hypot(o.x - dest_xy[0], o.y - dest_xy[1]) < self.exclude_target_radius_m:
+            if (
+                dest_xy is not None
+                and math.hypot(o.x - dest_xy[0], o.y - dest_xy[1])
+                < self.exclude_target_radius_m
+            ):
                 continue
-            out.append((float(o.x), float(o.y)))
+            xy = (float(o.x), float(o.y))
+            if (
+                picked_radius > 0.0
+                and any(
+                    math.hypot(xy[0] - px, xy[1] - py) < picked_radius
+                    for px, py in picked_positions
+                )
+            ):
+                continue
+            if (
+                merge_radius > 0.0
+                and any(
+                    math.hypot(xy[0] - ox, xy[1] - oy) < merge_radius
+                    for ox, oy in out
+                )
+            ):
+                continue
+            out.append(xy)
         return out
+
+    def _remember_picked_obstacle_position(self) -> None:
+        """Suppress stale/duplicate world tracks left behind after a confirmed physical pick."""
+        xy = getattr(self, "_appr_tgt_xy", None)
+        if xy is None and self.current_target is not None:
+            xy = (float(self.current_target.x), float(self.current_target.y))
+        if xy is None:
+            return
+        point = (float(xy[0]), float(xy[1]))
+        merge_radius = max(
+            0.01,
+            float(getattr(self, "planning_picked_suppress_radius_m", 0.18)),
+        )
+        positions = getattr(self, "_picked_obstacle_positions", [])
+        if not any(
+            math.hypot(point[0] - px, point[1] - py) < merge_radius
+            for px, py in positions
+        ):
+            positions.append(point)
+        self._picked_obstacle_positions = positions
 
     def _base_obstacles(
         self,
@@ -8487,6 +9870,77 @@ class MissionFsmNode(Node):
         )
         return ex, ey, sign
 
+    def _route_blocked_escape_waypoint(
+        self,
+        start: tuple[float, float],
+        obstacles: list[tuple[float, float]],
+    ) -> tuple[float, float, str] | None:
+        """Pick one short, collision-checked move out of a failed route start pose."""
+        if (
+            not getattr(self, "route_blocked_escape_enabled", True)
+            or getattr(self, "_route_blocked_escape_attempts", 0)
+            >= getattr(self, "route_blocked_escape_max_attempts", 2)
+        ):
+            return None
+        desired = max(
+            0.05,
+            float(getattr(self, "route_blocked_escape_distance_m", 0.18)),
+        )
+        now = self._now_s()
+        max_age = max(
+            0.1,
+            float(
+                getattr(
+                    self,
+                    "route_blocked_escape_history_max_age_sec",
+                    8.0,
+                )
+            ),
+        )
+
+        # Prefer retracing a point that the robot physically occupied moments ago.
+        history_candidates: list[tuple[float, tuple[float, float]]] = []
+        for stamp, px, py, _theta in reversed(
+            getattr(self, "_localization_pose_history", [])
+        ):
+            if now - float(stamp) > max_age:
+                break
+            point = (float(px), float(py))
+            distance = math.hypot(point[0] - start[0], point[1] - start[1])
+            if distance < max(0.08, desired * 0.60) or distance > desired * 1.80:
+                continue
+            if self._planner.escape_segment_free(start, point, obstacles):
+                history_candidates.append((abs(distance - desired), point))
+        if history_candidates:
+            _, point = min(history_candidates, key=lambda item: item[0])
+            return point[0], point[1], "breadcrumb"
+
+        # Without a safe breadcrumb, choose the clearest single-axis move. This avoids a
+        # diagonal cut through neighbouring objects while still exiting an overlap.
+        xmin, xmax, ymin, ymax = self._planner.interior
+        candidates: list[tuple[float, float, float]] = []
+        for ex, ey in (
+            (start[0] + desired, start[1]),
+            (start[0] - desired, start[1]),
+            (start[0], start[1] + desired),
+            (start[0], start[1] - desired),
+        ):
+            if not (xmin <= ex <= xmax and ymin <= ey <= ymax):
+                continue
+            point = (float(ex), float(ey))
+            if not self._planner.escape_segment_free(start, point, obstacles):
+                continue
+            clearance = (
+                min(math.hypot(ex - ox, ey - oy) for ox, oy in obstacles)
+                if obstacles
+                else float("inf")
+            )
+            candidates.append((clearance, ex, ey))
+        if not candidates:
+            return None
+        _clearance, ex, ey = max(candidates, key=lambda item: item[0])
+        return ex, ey, "axis"
+
     def _publish_planning_obstacles(self, obstacles: list[tuple[float, float]]) -> None:
         """Share the exact obstacle set used for lane planning with local go-to-goal avoidance."""
         msg = PoseArray()
@@ -8511,6 +9965,7 @@ class MissionFsmNode(Node):
         speed_override_mps: float | None = None,
         exclude_dest_obstacles: bool = True,
         holonomic_translation: bool = False,
+        allow_flexible_fallback: bool = True,
     ) -> bool:
         """Drive the active lane route and report when its final waypoint is reached."""
         self._last_drive_route_blocked = False
@@ -8562,22 +10017,42 @@ class MissionFsmNode(Node):
         ):
             self._last_replan_t = now
             vias, flexible_fallback = self._plan_with_flexible_fallback(
-                rxy, dest, obstacles, route_mode
+                rxy,
+                dest,
+                obstacles,
+                route_mode,
+                allow_flexible_fallback=allow_flexible_fallback,
             )
             self._plan_escape = False
             self._plan_flexible_fallback = False
             if vias:
                 self._plan = vias
                 self._plan_flexible_fallback = flexible_fallback
+                self._route_blocked_escape_attempts = 0
                 if route_mode == "post_pick_entry":
                     self._post_pick_lane_entry_pending = False
             else:
-                escape = self._front_escape_waypoint(obstacles)
-                if escape is not None:
-                    self._plan = [(escape[0], escape[1])]
+                route_escape = self._route_blocked_escape_waypoint(rxy, obstacles)
+                if route_escape is not None:
+                    ex, ey, source = route_escape
+                    self._route_blocked_escape_attempts += 1
+                    self._plan = [(ex, ey)]
                     self._plan_escape = True
+                    self._plan_flexible_fallback = True
+                    self._decide(
+                        f"ROUTE START ESCAPE "
+                        f"{self._route_blocked_escape_attempts}/"
+                        f"{self.route_blocked_escape_max_attempts} {source} "
+                        f"-> ({ex:.2f},{ey:.2f})"
+                    )
                 else:
-                    self._plan = []
+                    escape = self._front_escape_waypoint(obstacles)
+                    if escape is not None:
+                        self._plan = [(escape[0], escape[1])]
+                        self._plan_escape = True
+                        self._plan_flexible_fallback = True
+                    else:
+                        self._plan = []
             self._plan_idx = 0
             self._plan_start_xy = rxy
             self._plan_route_mode = route_mode
@@ -8615,9 +10090,9 @@ class MissionFsmNode(Node):
                     self._decide(f"LANE ROUTE {route}")
                 self.get_logger().info(f"latched lane route: {route}")
             else:
-                self._decide("SAFE ROUTE BLOCKED -> HOLD AND REPLAN")
+                self._decide("SAFE ROUTE BLOCKED -> DEFER OR NEXT VIEW")
                 self.get_logger().warn(
-                    "strict and flexible routes unavailable; holding for safe replan",
+                    "strict/flexible routes and bounded escapes unavailable",
                     throttle_duration_sec=3.0,
                 )
         if not self._plan:                            # safety: never index a None/empty plan
@@ -8944,17 +10419,33 @@ class MissionFsmNode(Node):
                 throttle_duration_sec=2.0,
             )
             return
-        observations = [
-            RelativeObservation(
-                x=float(obj.x),
-                y=float(obj.y),
-                label=str(obj.class_label),
-                set_type=int(obj.set_type),
-                confidence=float(obj.confidence),
+        observations: list[RelativeObservation] = []
+        for obj in msg.objects:
+            set_type = int(obj.set_type)
+            if bool(obj.blacklisted):
+                continue
+            arrival_fallback_active = (
+                self.state == "MANUAL_RESCUE_REVERSE"
+                or bool(getattr(self, "_storage_last_chance_active", False))
+                or (
+                    self.state == "DRIVE_TO_STORAGE"
+                    and self.storage_parking_method == 1
+                )
             )
-            for obj in msg.objects
-            if not bool(obj.blacklisted) and int(obj.set_type) in {1, 2}
-        ]
+            if set_type not in {1, 2} and not (
+                arrival_fallback_active
+                and (set_type == 3 or str(obj.class_label) == "arrival")
+            ):
+                continue
+            observations.append(
+                RelativeObservation(
+                    x=float(obj.x),
+                    y=float(obj.y),
+                    label=str(obj.class_label),
+                    set_type=set_type,
+                    confidence=float(obj.confidence),
+                )
+            )
         self._wide_relative_observations = [
             (float(observation.x), float(observation.y)) for observation in observations
         ]
@@ -9559,6 +11050,7 @@ class MissionFsmNode(Node):
 
     def _do_store_in_tray(self) -> None:
         """Tray bookkeeping + blacklist picked object, then branch (phase-aware)."""
+        self._remember_picked_obstacle_position()
         if self.anchor_mission_enabled and (slot := self._current_anchor_slot()) is not None:
             if self.set_type == 1:
                 self.tray_shape += 1
@@ -9624,6 +11116,9 @@ class MissionFsmNode(Node):
     def _maybe_start_timed_storage(self) -> None:
         """Preempt when the RUNNING-relative time left only covers return and dumping."""
         if not self.timed_storage_enabled:
+            return
+        if self.state == "MANUAL_RESCUE_REVERSE":
+            self._timed_storage_triggered = True
             return
         route_distance = (
             self._estimate_storage_return_path_distance()
@@ -9691,7 +11186,15 @@ class MissionFsmNode(Node):
         self.set_type = 0
         self._opportunistic_set2_active = False
         self._post_pick_lane_entry_pending = False
-        destination = f"BOTTOM WALL {self.storage_bottom_wall_stop_m:.2f}m"
+        if self.storage_parking_method == 1:
+            destination = (
+                f"FLAG STAGING ({self.storage_flag_staging_x:.2f},"
+                f"{self.storage_flag_staging_y:.2f})"
+            )
+        elif self.storage_parking_method == 2:
+            destination = "METHOD2 BOTTOM WALL CONTACT"
+        else:
+            destination = f"BOTTOM WALL {self.storage_bottom_wall_stop_m:.2f}m"
         now = self._now_s()
         match_elapsed = now - self._node_start_s
         process_elapsed = now - getattr(self, "_process_start_s", self._node_start_s)
@@ -9709,6 +11212,11 @@ class MissionFsmNode(Node):
         if self.world is None:
             return None
         start = (float(self.world.robot_x), float(self.world.robot_y))
+        if self.storage_parking_method == 1:
+            return math.hypot(
+                self.storage_flag_staging_x - start[0],
+                self.storage_flag_staging_y - start[1],
+            )
         reverse_entry = bool(getattr(self, "storage_reverse_entry_enabled", False))
         nav = (
             (self.storage_staging_x, self.storage_staging_y)
@@ -9740,8 +11248,37 @@ class MissionFsmNode(Node):
     def _reset_storage_wall_confirmation(self) -> None:
         self._storage_wall_confirm_count = 0
         self._storage_wall_confirm_last_seq = -1
+        tracker = getattr(self, "_storage_method4_wall_tracker", None)
+        if tracker is not None:
+            tracker.reset()
+        self._storage_method4_wall_last_seq = -1
+
+    def _initial_storage_route_phase(self) -> str:
+        if self.storage_parking_method == 1:
+            return "drive_to_flag_staging"
+        if self.storage_parking_method == 2:
+            return "method2_face_bottom_wall"
+        return "face_bottom_wall"
 
     def _storage_wall_distance(self, *, axis: str, direction: int) -> float | None:
+        if self.storage_parking_method == 4:
+            tracker = self._storage_method4_wall_tracker
+            if self._wall_segments_seq != self._storage_method4_wall_last_seq:
+                self._storage_method4_wall_last_seq = self._wall_segments_seq
+                tracker.observe(
+                    self._wall_segments,
+                    axis=axis,
+                    direction=direction,
+                    robot_x=float(self.world.robot_x),
+                    robot_y=float(self.world.robot_y),
+                    field_bounds=self._field_bounds,
+                    now_s=self._now_s(),
+                )
+            return tracker.distance(
+                float(self.world.robot_x),
+                float(self.world.robot_y),
+                self._now_s(),
+            )
         if self._now_s() - self._wall_segments_s > self.storage_wall_max_age_sec:
             return None
         return directional_wall_distance(
@@ -9754,6 +11291,11 @@ class MissionFsmNode(Node):
 
     def _storage_wall_stop_confirmed(self, distance: float | None, threshold: float) -> bool:
         """Require distinct wall-localizer frames before accepting a wall stop distance."""
+        if (
+            self.storage_parking_method == 4
+            and not self._storage_method4_wall_tracker.fresh(self._now_s())
+        ):
+            distance = None
         if self._wall_segments_seq == self._storage_wall_confirm_last_seq:
             return self._storage_wall_confirm_count >= self.storage_wall_confirm_frames
         self._storage_wall_confirm_last_seq = self._wall_segments_seq
@@ -9779,7 +11321,13 @@ class MissionFsmNode(Node):
             return 0.0, 0.0, 0.0
         command_fn = straight_reverse_command if reverse else straight_forward_command
         target_heading = (
-            self.storage_right_heading_rad if reverse else self.storage_down_heading_rad
+            (
+                self._storage_reverse_heading
+                if self._storage_reverse_heading is not None
+                else self.storage_right_heading_rad
+            )
+            if reverse
+            else self.storage_down_heading_rad
         )
         return command_fn(
             current_heading=float(self.world.robot_theta),
@@ -9791,6 +11339,25 @@ class MissionFsmNode(Node):
         )
 
     def _drive_storage_contact_hold(self) -> None:
+        if self.storage_parking_method == 1:
+            self._drive(0.0, 0.0, 0.0)
+            return
+        if self.storage_parking_method == 2 and self.world is not None:
+            target = (
+                self._storage_reverse_heading
+                if self._storage_reverse_heading is not None
+                else float(self.world.robot_theta)
+            )
+            vx, vy, omega = straight_reverse_command(
+                current_heading=float(self.world.robot_theta),
+                target_heading=target,
+                distance_m=1.0,
+                max_speed=max(0.01, self.storage_method2_reverse_speed),
+                heading_kp=self.storage_reverse_heading_kp,
+                omega_max=self.storage_reverse_omega_max,
+            )
+            self._drive(vx, vy, omega, respect_boundary=False)
+            return
         if not self.storage_wall_guided_enabled:
             self._drive(0.0, 0.0, 0.0)
             return
@@ -9800,6 +11367,19 @@ class MissionFsmNode(Node):
         self._drive(0.0, 0.0, 0.0)
         self._storage_route_completed = True
         self._decide(f"STORAGE LEFT WALL PARKED {reason}")
+        self._enter("ALIGN_OVER_BIN")
+
+    def _finish_storage_flag_parking(self, reason: str) -> None:
+        self._drive(0.0, 0.0, 0.0)
+        self._storage_route_completed = True
+        self._decide(f"STORAGE FLAG PARKED {reason}")
+        self._enter("ALIGN_OVER_BIN")
+
+    def _finish_storage_method2_parking(self, reason: str) -> None:
+        # Preserve the reverse command across this transition. ALIGN_OVER_BIN/DUMP_ALL/END
+        # continue applying the configured contact-hold reverse pressure.
+        self._storage_route_completed = True
+        self._decide(f"STORAGE METHOD2 PARKED {reason}")
         self._enter("ALIGN_OVER_BIN")
 
     def _mission_elapsed_s(self) -> float:
@@ -9834,8 +11414,8 @@ class MissionFsmNode(Node):
             return False
         if self._storage_route_completed or self.state != "DRIVE_TO_STORAGE":
             return False
-        elapsed = self._mission_elapsed_s()
-        if elapsed < self.storage_last_chance_trigger_sec:
+        storage_elapsed = self._time_in_state()
+        if storage_elapsed < self.storage_last_chance_trigger_sec:
             return False
         if self._fresh_storage_wall_available():
             return False
@@ -9845,12 +11425,15 @@ class MissionFsmNode(Node):
         self._storage_last_chance_started_s = now
         self._storage_last_chance_phase_started_s = now
         self._storage_last_chance_turn_heading = None
+        self._storage_last_chance_guidance_mode = "pattern"
         self._storage_pose_fallback_key = None
         self._reset_storage_wall_confirmation()
         self._reset_pulsed_heading()
         self._decide(
             "STORAGE LAST-CHANCE no fresh wall "
-            f"t={elapsed:.1f}s -> BACKOFF {self.storage_last_chance_pre_backoff_m * 100.0:.0f}cm"
+            f"storage_t={storage_elapsed:.1f}s "
+            f"match_t={self._mission_elapsed_s():.1f}s -> BACKOFF "
+            f"{self.storage_last_chance_pre_backoff_m * 100.0:.0f}cm"
         )
         return True
 
@@ -9871,6 +11454,28 @@ class MissionFsmNode(Node):
             return
 
         speed = max(0.0, self.storage_last_chance_speed)
+        if getattr(self, "storage_last_chance_arrival_guidance_enabled", False):
+            arrival = self._arrival_base_target(
+                max_age_sec=self.storage_last_chance_arrival_max_age_sec,
+                min_confidence=self.storage_last_chance_arrival_min_conf,
+            )
+            if arrival is not None:
+                bx, by, confidence, source = arrival
+                self._drive_toward_arrival(
+                    bx,
+                    by,
+                    confidence,
+                    source,
+                    speed=speed,
+                    mode_attr="_storage_last_chance_guidance_mode",
+                    decision_prefix="STORAGE LAST-CHANCE",
+                )
+                return
+            if self._storage_last_chance_guidance_mode != "pattern":
+                self._storage_last_chance_guidance_mode = "pattern"
+                self._decide(
+                    "STORAGE LAST-CHANCE arrival lost -> RESUME FALLBACK PATTERN"
+                )
         phase = self._storage_last_chance_phase
         phase_elapsed = now - self._storage_last_chance_phase_started_s
 
@@ -9951,8 +11556,318 @@ class MissionFsmNode(Node):
         self._storage_last_chance_phase_started_s = now
         self._drive(0.0, 0.0, 0.0)
 
+    def _step_emergency_storage(self) -> None:
+        """Method 2: press bottom wall, back off 10 cm, turn left 95 deg, reverse."""
+        if self.world is None:
+            self._drive(0.0, 0.0, 0.0)
+            return
+
+        phase = self._storage_route_phase
+        now = self._now_s()
+
+        if phase == "method2_face_bottom_wall":
+            aligned = self._turn_in_place_pulsed(
+                self.storage_down_heading_rad,
+                self.storage_heading_tolerance_rad,
+                key=("storage_method2_face_bottom", round(self.storage_down_heading_rad, 6)),
+            )
+            if aligned:
+                self._storage_route_phase = "method2_approach_bottom_wall"
+                self._storage_method2_phase_started_s = now
+                self._reset_storage_wall_confirmation()
+                self._decide(
+                    "STORAGE METHOD2 FACE BOTTOM -> DRIVE UNTIL WALL CONTACT"
+                )
+            return
+
+        if phase == "method2_approach_bottom_wall":
+            observed = self._storage_wall_distance(axis="y", direction=1)
+            pose_distance = self._storage_pose_wall_distance(axis="y", direction=1)
+            contacted = (
+                observed is not None
+                and observed <= self.storage_method2_contact_distance_m
+            ) or pose_distance <= self.storage_method2_contact_distance_m
+            if contacted:
+                self._storage_route_phase = "method2_contact_hold"
+                self._storage_method2_phase_started_s = now
+                self._decide(
+                    "STORAGE METHOD2 WALL CONTACT "
+                    f"wall={observed if observed is not None else pose_distance:.2f}m "
+                    f"-> PRESS {self.storage_method2_contact_hold_sec:.1f}s"
+                )
+            heading_error = self._wrap_pi(
+                self.storage_down_heading_rad - float(self.world.robot_theta)
+            )
+            if abs(heading_error) >= self.storage_reverse_realign_rad:
+                self._drive(0.0, 0.0, 0.0)
+                self._storage_route_phase = "method2_face_bottom_wall"
+                self._reset_pulsed_heading()
+                return
+            vx, vy, omega = straight_forward_command(
+                current_heading=float(self.world.robot_theta),
+                target_heading=self.storage_down_heading_rad,
+                distance_m=1.0,
+                max_speed=max(0.01, self.storage_method2_approach_speed),
+                heading_kp=self.storage_reverse_heading_kp,
+                omega_max=self.storage_reverse_omega_max,
+            )
+            self._drive(vx, vy, omega, respect_boundary=False)
+            return
+
+        if phase == "method2_contact_hold":
+            elapsed = now - self._storage_method2_phase_started_s
+            if elapsed < self.storage_method2_contact_hold_sec:
+                vx, vy, omega = straight_forward_command(
+                    current_heading=float(self.world.robot_theta),
+                    target_heading=self.storage_down_heading_rad,
+                    distance_m=1.0,
+                    max_speed=max(0.01, self.storage_method2_approach_speed),
+                    heading_kp=self.storage_reverse_heading_kp,
+                    omega_max=self.storage_reverse_omega_max,
+                )
+                self._drive(vx, vy, omega, respect_boundary=False)
+                return
+            self._storage_route_phase = "method2_backoff"
+            self._storage_method2_phase_started_s = now
+            self._decide(
+                f"STORAGE METHOD2 WALL PRESSED -> BACKOFF "
+                f"{self.storage_method2_backoff_distance_m * 100.0:.0f}cm"
+            )
+            phase = self._storage_route_phase
+
+        if phase == "method2_backoff":
+            speed = max(0.01, self.storage_method2_backoff_speed)
+            duration = self.storage_method2_backoff_distance_m / speed
+            if now - self._storage_method2_phase_started_s < duration:
+                vx, vy, omega = straight_reverse_command(
+                    current_heading=float(self.world.robot_theta),
+                    target_heading=self.storage_down_heading_rad,
+                    distance_m=1.0,
+                    max_speed=speed,
+                    heading_kp=self.storage_reverse_heading_kp,
+                    omega_max=self.storage_reverse_omega_max,
+                )
+                self._drive(vx, vy, omega, respect_boundary=False)
+                return
+            self._drive(0.0, 0.0, 0.0)
+            self._storage_method2_turn_heading = self._wrap_pi(
+                float(self.world.robot_theta)
+                + math.radians(self.storage_method2_turn_left_deg)
+            )
+            self._storage_reverse_heading = self._storage_method2_turn_heading
+            self._storage_route_phase = "method2_turn_left"
+            self._storage_method2_phase_started_s = now
+            self._reset_pulsed_heading()
+            self._decide(
+                f"STORAGE METHOD2 BACKOFF COMPLETE -> LEFT "
+                f"{self.storage_method2_turn_left_deg:.0f}deg"
+            )
+            return
+
+        if phase == "method2_turn_left":
+            target = self._storage_method2_turn_heading
+            if target is None:
+                target = self._wrap_pi(
+                    float(self.world.robot_theta)
+                    + math.radians(self.storage_method2_turn_left_deg)
+                )
+                self._storage_method2_turn_heading = target
+                self._storage_reverse_heading = target
+            aligned = self._turn_in_place_pulsed(
+                target,
+                self.storage_heading_tolerance_rad,
+                key=("storage_method2_turn_left", round(target, 6)),
+            )
+            if aligned:
+                self._storage_route_phase = "method2_reverse"
+                self._storage_method2_phase_started_s = now
+                self._decide(
+                    f"STORAGE METHOD2 LEFT TURN COMPLETE -> REVERSE "
+                    f"{self.storage_method2_reverse_speed:.2f}"
+                )
+            return
+
+        if phase == "method2_reverse":
+            elapsed = now - self._storage_method2_phase_started_s
+            if elapsed >= self.storage_method2_reverse_before_dump_sec:
+                self._finish_storage_method2_parking(
+                    f"continuous reverse {elapsed:.1f}s"
+                )
+                return
+            target = (
+                self._storage_method2_turn_heading
+                if self._storage_method2_turn_heading is not None
+                else float(self.world.robot_theta)
+            )
+            vx, vy, omega = straight_reverse_command(
+                current_heading=float(self.world.robot_theta),
+                target_heading=target,
+                distance_m=1.0,
+                max_speed=max(0.01, self.storage_method2_reverse_speed),
+                heading_kp=self.storage_reverse_heading_kp,
+                omega_max=self.storage_reverse_omega_max,
+            )
+            self._drive(vx, vy, omega, respect_boundary=False)
+            return
+
+        self._drive(0.0, 0.0, 0.0)
+        self.get_logger().error(
+            f"unknown method2 storage phase '{phase}'; holding stopped",
+            throttle_duration_sec=2.0,
+        )
+
+    def _step_flag_guided_storage(self) -> None:
+        """Method 1: stage at (x, y), face the configured point, then reverse to Wide arrival."""
+        if self.world is None:
+            self._drive(0.0, 0.0, 0.0)
+            return
+
+        if self._storage_route_phase == "drive_to_flag_staging":
+            distance = self._distance_to(
+                self.storage_flag_staging_x,
+                self.storage_flag_staging_y,
+            )
+            if (
+                distance is not None
+                and distance <= self.storage_flag_staging_tolerance_m
+            ):
+                self._drive(0.0, 0.0, 0.0)
+                self._storage_staging_heading = parking_face_heading(
+                    float(self.world.robot_x),
+                    float(self.world.robot_y),
+                    self.storage_flag_face_x,
+                    self.storage_flag_face_y,
+                )
+                self._storage_route_phase = "face_flag_reference"
+                self._reset_pulsed_heading()
+                self._decide(
+                    "STORAGE METHOD1 STAGING REACHED "
+                    f"({self.world.robot_x:.2f},{self.world.robot_y:.2f}) "
+                    f"tol={self.storage_flag_staging_tolerance_m:.2f}m -> FACE "
+                    f"({self.storage_flag_face_x:.2f},{self.storage_flag_face_y:.2f})"
+                )
+                return
+            self._drive_toward_direct(
+                self.storage_flag_staging_x,
+                self.storage_flag_staging_y,
+                speed_override_mps=self.storage_fast_nav_speed,
+            )
+            return
+
+        if self._storage_route_phase == "face_flag_reference":
+            target_heading = self._storage_staging_heading
+            if target_heading is None:
+                target_heading = parking_face_heading(
+                    float(self.world.robot_x),
+                    float(self.world.robot_y),
+                    self.storage_flag_face_x,
+                    self.storage_flag_face_y,
+                )
+                self._storage_staging_heading = target_heading
+            aligned = self._turn_in_place_pulsed(
+                target_heading,
+                self.storage_heading_tolerance_rad,
+                key=("storage_method1_face_reference", round(target_heading, 6)),
+            )
+            if aligned:
+                self._storage_route_phase = "acquire_wide_flag_snapshot"
+                self._storage_flag_acquire_started_s = self._now_s()
+                self._storage_flag_acquire_start_seq = self._wide_relative_seq
+                self._storage_flag_target_field = None
+                self._storage_flag_guidance_mode = "acquiring"
+                self._decide(
+                    f"STORAGE METHOD1 FACE ORIGIN "
+                    f"{math.degrees(target_heading):+.1f}deg -> SNAPSHOT WIDE ARRIVAL"
+                )
+            return
+
+        if self._storage_route_phase == "acquire_wide_flag_snapshot":
+            self._drive(0.0, 0.0, 0.0)
+            if (
+                self._now_s() - self._storage_flag_acquire_started_s
+                < self.storage_flag_acquire_sec
+                or self._wide_relative_seq <= self._storage_flag_acquire_start_seq
+            ):
+                return
+            selection = select_flag_snapshot_target(
+                self._wide_arrival_field_candidates(
+                    max_age_sec=self.storage_flag_max_age_sec,
+                    min_confidence=self.storage_flag_min_confidence,
+                ),
+                expected_x=self.storage_flag_floor_center_x,
+                expected_y=self.storage_flag_floor_center_y,
+                candidate_radius_m=self.storage_flag_floor_candidate_radius_m,
+                pair_max_spacing_m=self.storage_flag_pair_max_spacing_m,
+            )
+            if selection is None:
+                if self._storage_flag_guidance_mode != "waiting":
+                    self._storage_flag_guidance_mode = "waiting"
+                    self._decide(
+                        "STORAGE METHOD1 NO FLOOR FLAG IN SNAPSHOT -> HOLD"
+                    )
+                return
+            target_x, target_y, used_count = selection
+            self._storage_flag_target_field = (target_x, target_y)
+            self._storage_route_phase = "reverse_to_latched_flag"
+            self._storage_flag_guidance_mode = "reverse"
+            source = "PAIR MIDPOINT" if used_count == 2 else "SINGLE FLAG"
+            self._decide(
+                f"STORAGE METHOD1 LATCH {source} "
+                f"field=({target_x:.2f},{target_y:.2f}) -> REVERSE TO "
+                f"{self.storage_flag_stop_distance_m:.2f}m"
+            )
+            return
+
+        if self._storage_route_phase != "reverse_to_latched_flag":
+            self._drive(0.0, 0.0, 0.0)
+            self.get_logger().error(
+                f"parking method {self.storage_parking_method} phase "
+                f"'{self._storage_route_phase}' is not implemented; holding stopped",
+                throttle_duration_sec=2.0,
+            )
+            return
+
+        target = self._storage_flag_target_field
+        if target is None:
+            self._drive(0.0, 0.0, 0.0)
+            self.get_logger().error(
+                "method1 latched target is missing; holding stopped",
+                throttle_duration_sec=2.0,
+            )
+            return
+
+        bx, by = self._to_base(target[0], target[1])
+        distance = math.hypot(
+            target[0] - float(self.world.robot_x),
+            target[1] - float(self.world.robot_y),
+        )
+        rear_error = self._wrap_pi(math.atan2(by, bx) - math.pi)
+
+        if distance <= self.storage_flag_stop_distance_m:
+            self._finish_storage_flag_parking(
+                f"latched target distance={distance:.2f}m"
+            )
+            return
+
+        target_heading = self._wrap_pi(float(self.world.robot_theta) + rear_error)
+        vx, _vy, omega = straight_reverse_command(
+            current_heading=float(self.world.robot_theta),
+            target_heading=target_heading,
+            distance_m=max(0.0, distance - self.storage_flag_stop_distance_m),
+            max_speed=self.storage_flag_reverse_speed,
+            heading_kp=self.storage_flag_heading_kp,
+            omega_max=self.storage_flag_omega_max,
+        )
+        self._drive(vx, 0.0, omega, respect_boundary=False)
+
     def _step_drive_to_storage(self) -> None:
-        """Approach the bottom wall, face right, then reverse toward the left wall."""
+        """Execute the parking strategy selected by storage_parking_method."""
+        if self.storage_parking_method == 1:
+            self._step_flag_guided_storage()
+            return
+        if self.storage_parking_method == 2:
+            self._step_emergency_storage()
+            return
         if self.world is None:
             self._drive(0.0, 0.0, 0.0)
             return
@@ -10145,6 +12060,218 @@ class MissionFsmNode(Node):
             omega_max=self.storage_reverse_omega_max,
         )
         self._drive(vx, vy, omega)
+
+    def _step_manual_rescue_reverse(self) -> None:
+        """Operator-initiated final fallback: hold still, then blind reverse indefinitely."""
+        elapsed = self._time_in_state()
+        if elapsed < self.manual_reverse_rescue_stop_sec:
+            self._drive(0.0, 0.0, 0.0, respect_boundary=False)
+            return
+        if self.manual_reverse_rescue_arrival_guidance_enabled:
+            arrival = self._manual_rescue_arrival_base_target()
+            if arrival is not None:
+                bx, by, confidence, source = arrival
+                self._manual_rescue_drive_toward_arrival(bx, by, confidence, source)
+                return
+            if self._manual_reverse_rescue_mode != "blind":
+                self._manual_reverse_rescue_mode = "blind"
+                self._decide(
+                    "MANUAL RESCUE no fresh arrival -> BLIND REVERSE "
+                    f"{self.manual_reverse_rescue_speed:.2f}"
+                )
+        self._drive(
+            -self.manual_reverse_rescue_speed,
+            0.0,
+            0.0,
+            respect_boundary=False,
+        )
+
+    def _manual_rescue_arrival_base_target(self) -> tuple[float, float, float, str] | None:
+        """Return fresh arrival landmark target in base_link for manual rescue guidance."""
+        return self._arrival_base_target(
+            max_age_sec=self.manual_reverse_rescue_arrival_max_age_sec,
+            min_confidence=self.manual_reverse_rescue_arrival_min_conf,
+        )
+
+    def _wide_arrival_base_target(
+        self,
+        *,
+        max_age_sec: float,
+        min_confidence: float,
+    ) -> tuple[float, float, float] | None:
+        """Return the strongest fresh raw-Wide arrival point in base_link."""
+        last_frame_s = self._wide_relative_last_frame_s
+        if (
+            last_frame_s is None
+            or self._now_s() - last_frame_s > max(0.05, float(max_age_sec))
+        ):
+            return None
+        candidates = [
+            (
+                float(observation.x),
+                float(observation.y),
+                float(observation.confidence),
+            )
+            for observation in self._wide_relative_labeled_observations
+            if (
+                (
+                    int(observation.set_type) == 3
+                    or str(observation.label) == "arrival"
+                )
+                and float(observation.confidence) >= max(
+                    0.0, float(min_confidence)
+                )
+            )
+        ]
+        if not candidates:
+            return None
+        return max(
+            candidates,
+            key=lambda item: (item[2], -math.hypot(item[0], item[1])),
+        )
+
+    def _wide_arrival_field_candidates(
+        self,
+        *,
+        max_age_sec: float,
+        min_confidence: float,
+    ) -> list[tuple[float, float, float]]:
+        """Return current raw-Wide arrival detections transformed once into field coordinates."""
+        if self.world is None:
+            return []
+        last_frame_s = self._wide_relative_last_frame_s
+        if (
+            last_frame_s is None
+            or self._now_s() - last_frame_s > max(0.05, float(max_age_sec))
+        ):
+            return []
+        theta = float(self.world.robot_theta)
+        cos_theta = math.cos(theta)
+        sin_theta = math.sin(theta)
+        robot_x = float(self.world.robot_x)
+        robot_y = float(self.world.robot_y)
+        candidates: list[tuple[float, float, float]] = []
+        for observation in self._wide_relative_labeled_observations:
+            label = str(observation.label)
+            confidence = float(observation.confidence)
+            if (
+                not (int(observation.set_type) == 3 or label == "arrival")
+                or confidence < max(0.0, float(min_confidence))
+            ):
+                continue
+            bx = float(observation.x)
+            by = float(observation.y)
+            candidates.append(
+                (
+                    robot_x + cos_theta * bx - sin_theta * by,
+                    robot_y + sin_theta * bx + cos_theta * by,
+                    confidence,
+                )
+            )
+        return candidates
+
+    def _arrival_base_target(
+        self,
+        *,
+        max_age_sec: float,
+        min_confidence: float,
+    ) -> tuple[float, float, float, str] | None:
+        """Return the strongest fresh Wide/world arrival landmark in base_link."""
+        now = self._now_s()
+        max_age = max(0.05, float(max_age_sec))
+        min_conf = max(0.0, float(min_confidence))
+        candidates: list[tuple[float, float, float, str]] = []
+        if (
+            self._wide_relative_last_frame_s is not None
+            and now - self._wide_relative_last_frame_s <= max_age
+        ):
+            for observation in self._wide_relative_labeled_observations:
+                label = str(observation.label)
+                confidence = float(observation.confidence)
+                if (
+                    (int(observation.set_type) == 3 or label == "arrival")
+                    and confidence >= min_conf
+                ):
+                    candidates.append(
+                        (
+                            float(observation.x),
+                            float(observation.y),
+                            confidence,
+                            "wide_relative",
+                        )
+                    )
+        if self.world is not None:
+            for obj in self.world.objects:
+                label = str(obj.class_label)
+                confidence = float(obj.confidence)
+                last_seen = getattr(obj, "last_seen", None)
+                seen_s = (
+                    self._time_msg_to_sec(last_seen)
+                    if last_seen is not None
+                    else now
+                )
+                if (
+                    bool(obj.blacklisted)
+                    or not (int(obj.set_type) == 3 or label == "arrival")
+                    or confidence < min_conf
+                    or now - seen_s > max_age
+                ):
+                    continue
+                base = self._to_base(float(obj.x), float(obj.y))
+                if base is None:
+                    continue
+                candidates.append((base[0], base[1], confidence, "world_model"))
+        if not candidates:
+            return None
+        # Prefer the strongest landmark, with nearer detections used to break ties.
+        return max(
+            candidates,
+            key=lambda item: (item[2], -math.hypot(float(item[0]), float(item[1]))),
+        )
+
+    def _manual_rescue_drive_toward_arrival(
+        self,
+        bx: float,
+        by: float,
+        confidence: float,
+        source: str,
+    ) -> None:
+        self._drive_toward_arrival(
+            bx,
+            by,
+            confidence,
+            source,
+            speed=self.manual_reverse_rescue_speed,
+            mode_attr="_manual_reverse_rescue_mode",
+            decision_prefix="MANUAL RESCUE",
+        )
+
+    def _drive_toward_arrival(
+        self,
+        bx: float,
+        by: float,
+        confidence: float,
+        source: str,
+        *,
+        speed: float,
+        mode_attr: str,
+        decision_prefix: str,
+    ) -> None:
+        """Charge directly toward a fresh arrival target for either fallback mode."""
+        distance = math.hypot(float(bx), float(by))
+        speed = max(0.0, float(speed))
+        if distance <= 0.03:
+            self._drive(-speed, 0.0, 0.0, respect_boundary=False)
+            return
+        vx = speed * float(bx) / distance
+        vy = speed * float(by) / distance
+        if getattr(self, mode_attr, "") != "arrival":
+            setattr(self, mode_attr, "arrival")
+            self._decide(
+                f"{decision_prefix} ARRIVAL {source} conf={confidence:.2f} "
+                f"base=({bx:+.2f},{by:+.2f}) -> CHARGE {speed:.2f}"
+            )
+        self._drive(vx, vy, 0.0, respect_boundary=False)
 
     # -------------------------------------------------------------- transitions
     def _step(self) -> None:
@@ -10550,6 +12677,9 @@ class MissionFsmNode(Node):
                 self.get_logger().info("DUMP_ALL complete -> END")
                 self._enter("END")
 
+        elif self.state == "MANUAL_RESCUE_REVERSE":
+            self._step_manual_rescue_reverse()
+
         elif self.state == "END":
             if self._storage_route_completed:
                 self._drive_storage_contact_hold()
@@ -10905,6 +13035,11 @@ class MissionFsmNode(Node):
                 self._align_fail_count = 0
                 self._enter("SELECT_TARGET")
                 return
+            if self.global_target_mode and self.current_target is not None:
+                self._record_global_target_release(
+                    getattr(self, "_appr_tgt_xy", None),
+                    "ALIGN timeout",
+                )
             self._align_fail_count += 1
             if self._align_fail_count >= self.max_align_fails and self.current_target is not None:
                 self.get_logger().warn(
@@ -11171,6 +13306,10 @@ class MissionFsmNode(Node):
                 if not fresh_body_read:
                     return
                 self.slot_inventory.mark_non_target(slot.slot_id, self._now_s())
+                self._ban_global_non_target_position(
+                    (float(slot.x), float(slot.y)),
+                    f"Body fruit={slot.fruit_label}",
+                )
                 if tgt is not None:
                     self._blacklist(tgt.id)   # still retained by world_model as a physical obstacle
                 self._decide(f"SLOT NON-TARGET F{slot.slot_id} {slot.fruit_label}")
@@ -11288,6 +13427,8 @@ class MissionFsmNode(Node):
             return
 
         if decision == "distractor":
+            if self._handle_set1_fruit_distractor_siglip(observed_label):
+                return
             obj_id = self.current_target.id if self.current_target is not None else 0
             self.get_logger().info(
                 f"CLASSIFY FINAL: '{observed_label}' confirmed at grab -> skip target #{obj_id}"
@@ -11295,6 +13436,10 @@ class MissionFsmNode(Node):
             self._decide(
                 f"FINAL NON-TARGET {observed_label} {required}/"
                 f"{self._classify_body_frame_count} -> SKIP #{obj_id}"
+            )
+            self._ban_global_non_target_position(
+                getattr(self, "_appr_tgt_xy", None),
+                f"Body object={observed_label}",
             )
             self._blacklist(obj_id)
             self.current_target = None
@@ -11336,6 +13481,11 @@ class MissionFsmNode(Node):
         """
         if self._set2_slot_mode() and self._current_slot() is not None:
             self._step_classify_set2_slot()
+            return
+        if self._committed_global_plain_cube():
+            # The top view is definitive for this field. Never reinterpret the selected plain
+            # cube as Set2 merely because its mutable close-range world track becomes fruit/set0.
+            self._step_classify_set1_final()
             return
         # Final Set2 pick authority is the fresh Body crop at the gripper, not the map's current
         # set_type.  A fruit-photo track can regress to set0 or disappear in the close-range blind
@@ -11487,6 +13637,10 @@ class MissionFsmNode(Node):
                     f"CLASSIFY: fresh Body fruit '{body_fruit_label}' "
                     f"!= {self.set2_label} -> reject"
                 )
+                self._ban_global_non_target_position(
+                    getattr(self, "_appr_tgt_xy", None),
+                    f"Body fruit={body_fruit_label}",
+                )
                 self._blacklist(tgt.id)
                 self.current_target = None
                 self.set_type = 0
@@ -11518,6 +13672,10 @@ class MissionFsmNode(Node):
                 self.get_logger().info(
                     f"CLASSIFY: fresh Body fruit '{body_fruit_label}' "
                     f"!= {self.set2_label} -> skip now"
+                )
+                self._ban_global_non_target_position(
+                    getattr(self, "_appr_tgt_xy", None),
+                    f"Body fruit={body_fruit_label}",
                 )
                 self._blacklist(tgt.id)
                 self.current_target = None

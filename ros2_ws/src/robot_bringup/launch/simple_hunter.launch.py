@@ -1,20 +1,21 @@
-"""Full system bringup: cameras + static tf + localization/perception/judgment + control + MCU bridges.
+"""Simple-hunter bringup: full stack but with simple_hunter_node replacing the
+mission FSM (+ target_selector, which the hunter does not use).
 
-Composed of the smaller launch files so each layer can also be run on its own:
-    cameras.launch.py            two CSI cameras (top/wide=sensor-id 1, body=sensor-id 0)
-    static_transforms.launch.py  rig tf frames
-    perception.launch.py         localizer + perception + FSM/target selector
-    + control nodes and MCU serial bridge
+Same perception/control layers as bringup.launch.py; only the judgment node differs:
+    cameras + static tf + imu
+    localizer / yolo_detector / siglip_gate / world_model / wall_localizer / viz
+    simple_hunter_node          (robot_planning)  -> /mission_state, /base_command, /arm/pick_trigger
+    base_controller + pick_sequencer + mcu_bridge_base   (with_control:=true)
 
-Toggle the control/hardware-bridge layer with the 'with_control' launch arg (default true).
-On a bench with no MCU/cameras every node still starts (dry-run safe) — sensors/serial just
-stay idle.
+Usage:
+    ros2 launch robot_bringup simple_hunter.launch.py
+    ros2 launch robot_bringup simple_hunter.launch.py with_control:=false   # bench, no motors
 """
 import os
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, GroupAction
+from launch.actions import DeclareLaunchArgument, GroupAction, IncludeLaunchDescription
 from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
@@ -29,9 +30,10 @@ def generate_launch_description() -> LaunchDescription:
 
     with_control = LaunchConfiguration("with_control")
     motion_tuning = LaunchConfiguration("motion_tuning_file")
-    wall_pose_correction_enabled = LaunchConfiguration(
-        "wall_pose_correction_enabled"
-    )
+
+    def perc(executable, name):
+        return Node(package="robot_perception", executable=executable, name=name,
+                    parameters=[params, motion_tuning], output="screen")
 
     cameras = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(os.path.join(launch_dir, "cameras.launch.py"))
@@ -41,14 +43,6 @@ def generate_launch_description() -> LaunchDescription:
     )
     imu = Node(package="robot_hardware", executable="imu_mpu6050_node",
                name="imu_mpu6050_node", parameters=[params, motion_tuning], output="screen")
-    perception = IncludeLaunchDescription(
-        PythonLaunchDescriptionSource(os.path.join(launch_dir, "perception.launch.py")),
-        launch_arguments={
-            "params_file": params,
-            "motion_tuning_file": motion_tuning,
-            "wall_pose_correction_enabled": wall_pose_correction_enabled,
-        }.items(),
-    )
 
     control_layer = GroupAction(
         condition=IfCondition(with_control),
@@ -67,14 +61,16 @@ def generate_launch_description() -> LaunchDescription:
                               description="also start base control + 2R pick sequencer + combined MCU bridge"),
         DeclareLaunchArgument("motion_tuning_file", default_value=default_tuning,
                               description="match tuning override YAML loaded after perception.yaml"),
-        DeclareLaunchArgument(
-            "wall_pose_correction_enabled",
-            default_value="true",
-            description="false keeps wall detection active but prevents wall-based pose updates",
-        ),
         cameras,
         static_tf,
         imu,
-        perception,
+        perc("localizer_node", "localizer_node"),
+        perc("yolo_detector_node", "yolo_detector_node"),
+        perc("siglip_gate_node", "siglip_gate_node"),
+        perc("world_model_node", "world_model_node"),
+        perc("wall_localizer_node", "wall_localizer_node"),
+        perc("recognition_viz_node", "recognition_viz_node"),
+        Node(package="robot_planning", executable="simple_hunter_node",
+             name="simple_hunter_node", parameters=[params, motion_tuning], output="screen"),
         control_layer,
     ])

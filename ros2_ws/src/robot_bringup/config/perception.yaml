@@ -25,12 +25,15 @@ localizer_node:
     use_visual_odometry: true
     use_landmark_correction: false        # no arena walls -> disable cardinal yaw-snap
     use_object_landmarks: true            # correct x/y drift from re-observed mapped objects; theta stays IMU-only
-    landmark_gain: 0.5                     # 위치 보정만 중간 강도로 사용
+    landmark_gain: 0.50                    # 정지 중 신뢰도 높은 격자 anchor 보정만 반영
     landmark_theta_gain: 0.0               # HEADING은 IMU만 사용하고 landmark heading 보정은 끔
-    landmark_max_step_m: 0.2               # 한 번에 허용하는 위치 보정폭↑(드리프트 즉시 회수)
+    landmark_max_step_m: 0.15              # 단일 오연관이 pose를 크게 점프시키지 못하게 제한
     landmark_max_step_rad: 0.0             # landmark가 heading을 바꾸지 못하게 함
-    landmark_correction_max_speed_mps: 0.20 # landmark 보정을 물리적으로 가능한 pose 변화 속도로 제한
+    landmark_correction_max_speed_mps: 0.20 # 정지 관측 중 완만하게 보정
+    encoder_constraint_landmark_translation_floor: 1.0 # STOP에서도 절대 위치 보정 허용
     landmark_correction_max_dt_sec: 0.10   # 프레임 공백 뒤 한 번에 큰 위치 보정을 적용하지 않음
+    landmark_correction_min_confidence: 0.65
+    object_landmark_stationary_only: true
     broadcast_tf: true
     use_wheel_odom: false             # 엔코더 기반 위치/회전 보정 사용 안 함
     # OBJECT-FLOW = 주(主) 회전 소스: 광각 물체점 프레임간 매칭(world_model). LK 옵티컬플로는 진동을
@@ -57,6 +60,8 @@ localizer_node:
     wall_field_max_step_rad: 0.0           # 벽 field 보정은 heading을 바꾸지 않음
     wall_field_deadband_m: 0.005
     wall_correction_stale_sec: 1.5
+    wall_pose_correction_enabled: true   # false여도 벽 검출/표시는 계속하고 pose 적용만 차단
+    wall_pose_correction_stationary_only: true # 이동 중 벽 관측은 pose에 반영하지 않음
     use_imu_heading: true                 # IMU heading 보정 ON: 벽 보정 OFF 조건 비교 테스트
     imu_motion_smoothing_enabled: false   # STOP/ROTATING/IMPACT 상태별 고정 병진 감쇠 비활성화
     imu_flow_consistency_enabled: true    # 이전 flow 속도+IMU 가속도로 급격한 flow 변화만 연속 감쇠
@@ -177,7 +182,7 @@ siglip_gate_node:
     frame_match_tolerance_sec: 0.050      # 30fps 인접 프레임까지 허용해 sensor QoS 드롭을 흡수한다.
     detection_frame_wait_max_age_sec: 0.25 # 검출 선착 시 동일 timestamp 이미지가 들어올 때까지 잠시 보류한다.
     # --- TRANSIT 분류 (이동 중 body 백그라운드 저주기 분류; 기본 OFF, 기존 프로파일 무변경) ---
-    transit_classify_enabled: false       # true면 transit_classify_states에서 저주기 경로 사용
+    transit_classify_enabled: true        # 이동 중 Body 과일도 공간 태그로 미리 판정
     transit_classify_min_interval_sec: 0.5  # 이동 중 SigLIP 최소 간격(저주기)
     transit_classify_min_crop_px: 48      # 이동 중 크롭 최소 변(px) — 모션블러 방어
     transit_classify_min_det_conf: 0.60   # 이동 중 YOLO det conf 하한 — 블러 박스 배제
@@ -185,11 +190,11 @@ siglip_gate_node:
     # --- WIDE 백그라운드 분류 (광각 Set2 힌트; 기본 OFF) ---
     # 결과는 /classification/siglip_wide_hint(JSON String)로만 발행 — FSM CLASSIFY 게이트가
     # 구독하는 /classification/siglip에는 절대 실리지 않아 픽 판정을 우회할 수 없다.
-    wide_classify_enabled: false
-    wide_classify_rate_hz: 1.0            # 광각 SigLIP 레이트 리밋(1Hz)
-    wide_classify_min_crop_px: 28         # 광각 크롭 최소 변(px)
-    wide_classify_min_det_conf: 0.55      # 광각 det conf 하한
-    wide_classify_max_batch: 2            # 한 tick당 크롭 수 상한(큰 것부터)
+    wide_classify_enabled: true
+    wide_classify_rate_hz: 2.0            # 이동 중 광각 SigLIP 미리 판정
+    wide_classify_min_crop_px: 24
+    wide_classify_min_det_conf: 0.50
+    wide_classify_max_batch: 4             # 셀 주변 네 후보를 한 tick에 처리
     wide_hint_min_margin: 0.15            # 이 margin 미만 read는 힌트 발행 안 함
     # --- HSV 색상 일관성 veto (body+wide 공용; 기본 OFF, 보수적 veto 전용) ---
     color_filter_enabled: false
@@ -228,8 +233,7 @@ world_model_node:
     body_cam_height_m: 0.155              # 본체캠 바닥 위 높이
     body_radial_trim_m: 0.039             # 본체 앞면바이어스 보정(회전 3614샘플 radial +3.9cm 실측)→광각 중심과 일치
     assoc_radius_m: 0.18                  # 엄격 게이트: 신규트랙 간격 + 중복병합 기준
-    reassoc_radius_m: 0.32               # ★관대한 재연관★: 지터/몇프레임 놓쳐도 기존 트랙에 붙음(같은 객체 유지).
-                                          # 격자 0.5m보다 작아 실물체는 안 합침. "조금 움직임=같은 물체" 강화
+    reassoc_radius_m: 0.22               # 격자 반 칸(25cm) 미만에서만 재연결해 인접 노드 오연관을 막는다.
     # 교차검증: 기존 트랙에 안 붙는 새 검출은 즉시 트랙화하지 않고 CANDIDATE로 보류 → candidate_ttl 안에
     # new_track_min_hits번 같은 자리에서 재관측돼야 실제 트랙 생성. 흔들림 1프레임 오검출로 물체 양산되는 근본원인 차단.
     new_track_min_hits: 3                 # 새 물체 확정에 필요한 재관측 횟수(교차검증)
@@ -254,7 +258,7 @@ world_model_node:
     grid_anchor_snap_alpha: 0.90
     grid_anchor_pose_radius_m: 0.35
     grid_track_lock_enabled: true         # 주행 테스트 중 확인된 물체 track을 격자점에 고정한다.
-    grid_track_lock_radius_m: 0.26
+    grid_track_lock_radius_m: 0.22
     grid_track_lock_alpha: 1.0
     zone_anchor_xy: [-1.0, 0.5, -1.0, -1.0, 1.25, -1.25, 0.75, 0.5]
     grid_moved_threshold_m: 0.22
@@ -263,9 +267,10 @@ world_model_node:
     class_conf_threshold_body: 0.50       # 본체=신원 권위자라 낮은 바에서도 투표(0.6~0.8 octa/icosa도 자기 정체성 확립→과병합 방지)
     plain_cube_confirm_observations: 5    # 최근 유효 라벨 5개가 모두 cube일 때만 순수 일반 큐브로 확정
     body_siglip_assoc_radius_m: 0.18      # 공간 태그 Body SigLIP과 Set2 track 결속 반경.
-    fruit_cube_sticky_enabled: false      # 오분류 고착을 막고 이후 shape vote로 재분류를 허용한다
+    fruit_cube_sticky_enabled: false      # 광각 최근 관측을 우선하고 1회 판정을 영구 고정하지 않는다
     fruit_cube_sticky_conf_wide: 0.75
     fruit_cube_sticky_conf_body: 0.50
+    fruit_cube_sticky_min_wide_hits: 1
     # --- WIDE SigLIP 과일 힌트 수신 (라우팅 힌트 전용; producer 기본 OFF라 체인은 기본 비활성) ---
     # 힌트는 wide_fruit_votes/fruit_label에만 붙고 fruit_votes/fruit_confidence/confidence/
     # n_obs는 절대 건드리지 않는다(바디 라벨 우선, 픽 게이트 우회 불가).
@@ -286,11 +291,17 @@ world_model_node:
     min_keep_conf: 0.05                   # presence 이 아래로 내려가면 트랙 제거
     # object-landmark pose correction (feeds /localization/landmark_correction -> localizer)
     landmark_correction: true
-    lock_min_obs: 5                       # observations before a track freezes into an anchor
+    lock_min_obs: 5                       # 충분히 재관측한 격자 anchor만 확정
     lock_min_conf: 0.4
-    landmark_min_pairs: 3                 # need >=3 re-observed anchors to solve the rigid drift
-    landmark_max_resid_m: 0.30
-    unlock_after: 3                       # an anchor off-consensus this many frames = object moved -> unlock
+    landmark_min_pairs: 4                 # 네 고정 격자 물체가 일치할 때만 pose correction
+    landmark_max_resid_m: 0.12
+    landmark_grid_only: true              # grid-spawn lock 물체만 landmark로 사용
+    landmark_global_match_enabled: true   # 광각 전체 관측과 전체 locked landmark를 전역 일대일 대응
+    landmark_global_max_offset_m: 0.75
+    landmark_grid_alias_guard_enabled: true # 동일 지지도의 ±50cm 가설이면 pose 보류
+    landmark_grid_alias_tolerance_m: 0.08
+    landmark_grid_alias_residual_margin_m: 0.02
+    unlock_after: 2                       # 밀린 물체는 두 프레임 불일치부터 anchor 해제
     landmark_spread_ref_m: 0.4            # anchors spread this far (mean radius) = full-confidence heading fix
     landmark_heading_min_pairs: 5         # 회전 보정은 앵커 5개 이상일 때만(그 미만은 dth=0, heading은 VO에 맡김)
     landmark_heading_min_spread_m: 0.30   # 그리고 앵커가 이만큼 넓게 퍼져야 회전 신뢰(좁게 뭉치면 Umeyama 회전이 노이즈)
@@ -556,7 +567,7 @@ recognition_viz_node:
     show_zone_anchors: false
     show_global_zigzag_route: true
     global_zigzag_start_xy: [-1.25, 1.60]
-    global_zigzag_waypoints_xy: [-1.25, 1.25, -1.25, -1.25, 1.25, -1.25]
+    global_zigzag_waypoints_xy: [-1.25, 0.75, -1.25, -0.25, -1.25, -1.25, -0.25, -1.25, 0.75, -1.25, 1.25, -1.25, 1.25, -0.25, 0.25, -0.25, -0.25, -0.25, -0.25, 0.75, 0.75, 0.75, 1.25, 0.75, 1.25, 1.25]
     zone_anchor_xy: [-1.0, 0.5, -1.0, -1.0, 1.25, -1.25, 0.75, 0.5]
     # 맵 FOV 표시(world_model 과 동일값): 본체=부채꼴, 광각=전방 타원
     body_fov_half_deg: 30.0

@@ -289,6 +289,8 @@ def action_summary(
         return "ALIGNING OVER STORAGE BIN"
     if state == "DUMP_ALL":
         return "RELEASING STORED OBJECTS"
+    if state == "MANUAL_RESCUE_REVERSE":
+        return "MANUAL RESCUE: STOP THEN BLIND REVERSE"
     if state == "END":
         return "MISSION COMPLETE"
     return f"ACTIVE: {state.replace('_', ' ')}"
@@ -1658,7 +1660,7 @@ class RecognitionVizNode(Node):
         lines = [
             f"state={self.mission_state}  phase={self.phase} zone={self.zone}  "
             f"match={match_text}s  run={run_elapsed:5.0f}s  comp={self.competition_state}",
-            f"timers: storage@match {storage_text}  last-chance@match {last_chance_text}",
+            f"timers: storage@match {storage_text}  last-chance@storage+{last_chance_text}",
             f"objects={n_obj} (picked/bl={n_bl})  tray shape={self.tray_shape} fruit={self.tray_fruit}",
             f"det wide={len(self.top_dets)} body={len(self.body_dets)}",
         ]

@@ -148,6 +148,57 @@ class LanePlanner:
                   obstacles: list[tuple[float, float]]) -> bool:
         return self._seg_min_clear(a, b, obstacles) >= self.block_r
 
+    def escape_segment_free(
+        self,
+        start: tuple[float, float],
+        dest: tuple[float, float],
+        obstacles: list[tuple[float, float]],
+    ) -> bool:
+        """Allow only a segment that monotonically exits obstacles overlapping ``start``.
+
+        Normal route segments must satisfy ``block_r`` everywhere.  That makes a robot whose
+        estimated pose has drifted a few centimetres into an inflated obstacle mathematically
+        unable to connect to *any* lane node.  A recovery segment may ignore only those obstacles
+        already overlapping its start, and only while moving strictly farther away from each of
+        them.  Every other obstacle keeps the normal clearance requirement.
+        """
+        sx, sy = float(start[0]), float(start[1])
+        dx = float(dest[0]) - sx
+        dy = float(dest[1]) - sy
+        if math.hypot(dx, dy) < 1e-6:
+            return False
+        for ox, oy in obstacles:
+            ox = float(ox)
+            oy = float(oy)
+            start_rx = sx - ox
+            start_ry = sy - oy
+            start_distance = math.hypot(start_rx, start_ry)
+            if start_distance < self.block_r:
+                # d/dt |start + t*delta - obstacle|^2 at t=0 must be positive.
+                # The derivative then only grows with t, so clearance increases throughout.
+                if start_rx * dx + start_ry * dy <= 1e-9:
+                    return False
+                end_distance = math.hypot(
+                    float(dest[0]) - ox,
+                    float(dest[1]) - oy,
+                )
+                if end_distance <= start_distance + 1e-4:
+                    return False
+                continue
+            if (
+                _pt_seg_dist(
+                    ox,
+                    oy,
+                    sx,
+                    sy,
+                    float(dest[0]),
+                    float(dest[1]),
+                )
+                < self.block_r
+            ):
+                return False
+        return True
+
     def _edge_cost(self, a: tuple[float, float], b: tuple[float, float],
                    obstacles: list[tuple[float, float]]) -> float:
         """Base length + a penalty that grows as the lane narrows below comfort_clear, so A*

@@ -25,6 +25,7 @@ setup(
     entry_points={
         'console_scripts': [
             'mission_fsm_node = robot_planning.nodes.mission_fsm_node:main',
+            'simple_hunter_node = robot_planning.nodes.simple_hunter_node:main',
             'target_selector_node = robot_planning.nodes.target_selector_node:main',
             'explorer_node = robot_planning.nodes.explorer_node:main',
             'local_anchor_test_node = robot_planning.nodes.local_anchor_test_node:main',

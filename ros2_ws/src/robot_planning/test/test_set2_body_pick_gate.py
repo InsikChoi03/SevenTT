@@ -164,6 +164,70 @@ def test_fresh_gripper_bound_set2_target_survives_transient_yolo_loss():
     assert node._fresh_aligned_set2_body_target() == ("banana", 0.99)
 
 
+def _set1_fruit_wait_node(verdict=("pending", "", 0.0)):
+    node = MissionFsmNode.__new__(MissionFsmNode)
+    node.current_target = SimpleNamespace(id=37)
+    node.set2_label = "banana"
+    node.classify_fruit_siglip_wait_sec = 1.5
+    node._classify_fruit_siglip_wait_started_s = None
+    node._test_now_s = 10.0
+    node._now_s = lambda: node._test_now_s
+    node._fresh_set2_body_verdict = lambda: verdict
+    node._drive_calls = []
+    node._drive = lambda vx, vy, omega=0.0: node._drive_calls.append(
+        (vx, vy, omega)
+    )
+    node._decisions = []
+    node._decide = node._decisions.append
+    node.get_logger = lambda: SimpleNamespace(info=lambda *_args, **_kwargs: None)
+    node._commits = []
+    node._commit_pick = lambda set_type, label, detail: node._commits.append(
+        (set_type, label, detail)
+    )
+    return node
+
+
+def test_set1_routed_fruit_cube_waits_stopped_for_siglip():
+    node = _set1_fruit_wait_node()
+
+    assert node._handle_set1_fruit_distractor_siglip("fruit_photo_cube")
+    assert node._drive_calls == [(0.0, 0.0, 0.0)]
+    assert node._decisions == ["FRUIT CUBE AT GRAB -> WAIT BODY SIGLIP 1.5s"]
+
+    node._test_now_s = 11.4
+    assert node._handle_set1_fruit_distractor_siglip("fruit_photo_cube")
+    assert node._commits == []
+
+
+def test_set1_routed_fruit_cube_timeout_releases_normal_reject_path():
+    node = _set1_fruit_wait_node()
+    assert node._handle_set1_fruit_distractor_siglip("fruit_photo_cube")
+
+    node._test_now_s = 11.5
+    assert not node._handle_set1_fruit_distractor_siglip("fruit_photo_cube")
+    assert node._decisions[-1] == "BODY SIGLIP WAIT TIMEOUT -> FINISH SET1 REJECT"
+
+
+def test_set1_routed_fruit_cube_target_siglip_promotes_to_set2_pick():
+    node = _set1_fruit_wait_node(("target", "banana", 0.999))
+
+    assert node._handle_set1_fruit_distractor_siglip("fruit_photo_cube")
+    assert node._commits == [
+        (
+            2,
+            "banana",
+            "Set1-routed fruit cube; fresh gripper Body SigLIP=1.00 track=#37",
+        )
+    ]
+
+
+def test_non_fruit_set1_distractor_keeps_fast_reject_path():
+    node = _set1_fruit_wait_node()
+
+    assert not node._handle_set1_fruit_distractor_siglip("icosahedron")
+    assert node._drive_calls == []
+
+
 def test_gripper_body_target_cannot_override_a_set1_visit():
     node = MissionFsmNode.__new__(MissionFsmNode)
     node.phase = 1

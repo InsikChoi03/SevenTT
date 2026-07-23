@@ -57,9 +57,17 @@ def test_global_target_approach_uses_collision_checked_fast_route():
     node = _approach_node()
     node.global_target_mode = True
     node.global_fast_safe_routes_enabled = True
+    node._planner.simplify = True
 
     assert node._latch_approach_goal((1.0, 0.0))
     assert node._approach_route_mode == "legacy"
+    path = node._planner.plan(
+        (0.0, 0.0),
+        node._approach_standoff_xy,
+        [],
+        route_mode=node._approach_route_mode,
+    )
+    assert path == [node._approach_standoff_xy]
 
 
 def test_non_global_approach_keeps_strict_lane_route():
@@ -338,6 +346,30 @@ def test_missing_strict_lane_route_retries_collision_checked_flexible_route():
     )
 
     assert calls == ["post_pick_entry", "legacy"]
+    assert vias == [(1.0, 1.0)]
+    assert flexible
+
+
+def test_clear_direct_fallback_does_not_depend_on_lane_simplification():
+    node = MissionFsmNode.__new__(MissionFsmNode)
+    calls = []
+
+    class Planner:
+        def plan(self, start, dest, obstacles, route_mode):
+            calls.append(route_mode)
+            return None
+
+        def _seg_free(self, start, dest, obstacles):
+            return True
+
+    node._planner = Planner()
+    node.direct_fallback_enabled = True
+
+    vias, flexible = node._plan_with_flexible_fallback(
+        (0.1, 0.1), (1.0, 1.0), [], "grid_only"
+    )
+
+    assert calls == ["grid_only"]
     assert vias == [(1.0, 1.0)]
     assert flexible
 

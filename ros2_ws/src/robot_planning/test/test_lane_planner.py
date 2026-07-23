@@ -82,6 +82,26 @@ def test_no_path_returns_none():
     assert lp.plan((-1.25, -1.25), (1.25, 1.25), ring) is None
 
 
+def test_escape_segment_can_leave_only_the_obstacle_overlapping_start():
+    lp = LanePlanner(block_radius=0.24)
+    start = (0.20, 0.0)
+    overlapping = (0.0, 0.0)
+
+    assert lp.escape_segment_free(start, (0.40, 0.0), [overlapping])
+    assert not lp.escape_segment_free(start, (0.00, 0.0), [overlapping])
+
+
+def test_escape_segment_still_rejects_a_different_obstacle_ahead():
+    lp = LanePlanner(block_radius=0.24)
+    start = (0.20, 0.0)
+
+    assert not lp.escape_segment_free(
+        start,
+        (0.60, 0.0),
+        [(0.0, 0.0), (0.50, 0.0)],
+    )
+
+
 def test_coverage_visits_all_lane_nodes():
     lp = _planner()
     nodes = lp._lane_nodes(*lp.infer_origin(GRID))

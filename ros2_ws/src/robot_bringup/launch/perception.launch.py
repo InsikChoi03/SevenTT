@@ -20,6 +20,7 @@ from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
+from launch_ros.descriptions import ParameterValue
 
 
 def generate_launch_description() -> LaunchDescription:
@@ -28,10 +29,14 @@ def generate_launch_description() -> LaunchDescription:
     default_tuning = os.path.join(bringup_share, "config", "motion_tuning.yaml")
     params = LaunchConfiguration("params_file")
     motion_tuning = LaunchConfiguration("motion_tuning_file")
+    wall_pose_correction_enabled = LaunchConfiguration(
+        "wall_pose_correction_enabled"
+    )
 
-    def perc(executable, name):
+    def perc(executable, name, extra=None):
         return Node(package="robot_perception", executable=executable, name=name,
-                    parameters=[params, motion_tuning], output="screen")
+                    parameters=[params, motion_tuning] + ([extra] if extra else []),
+                    output="screen")
 
     def plan(executable, name):
         return Node(package="robot_planning", executable=executable, name=name,
@@ -42,7 +47,20 @@ def generate_launch_description() -> LaunchDescription:
                               description="base ROS parameter YAML"),
         DeclareLaunchArgument("motion_tuning_file", default_value=default_tuning,
                               description="match tuning override YAML loaded after params_file"),
-        perc("localizer_node", "localizer_node"),
+        DeclareLaunchArgument(
+            "wall_pose_correction_enabled",
+            default_value="true",
+            description="false keeps wall detection active but prevents wall-based pose updates",
+        ),
+        perc(
+            "localizer_node",
+            "localizer_node",
+            {
+                "wall_pose_correction_enabled": ParameterValue(
+                    wall_pose_correction_enabled, value_type=bool
+                )
+            },
+        ),
         perc("yolo_detector_node", "yolo_detector_node"),
         perc("siglip_gate_node", "siglip_gate_node"),
         perc("world_model_node", "world_model_node"),

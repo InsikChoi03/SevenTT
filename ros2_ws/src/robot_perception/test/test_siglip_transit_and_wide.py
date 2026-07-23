@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import numpy as np
 
+from robot_perception.fruit_color_gate import ColorGateConfig
 from robot_perception.nodes.siglip_gate_node import (
     ClassificationProfile,
     CropScore,
@@ -276,10 +277,16 @@ def _run_wide(score, unlabeled=True):
         aspect_ratio_max=1.7,
         square_pad_crops=False,
         color_filter_enabled=False,
+        color_target_override_enabled=False,
         pub_wide_hint=_PublisherSpy(),
         get_logger=lambda: _SilentLogger(),
         _score_crops=lambda crops: [score] * len(crops),
         _color_veto=lambda crop, label: False,
+    )
+    harness._apply_color_target_override = (
+        lambda crop, label, margin: SiglipGateNode._apply_color_target_override(
+            harness, crop, label, margin
+        )
     )
     harness._crop_wide = (
         lambda frame, det, w, h: SiglipGateNode._crop_wide(harness, frame, det, w, h)
@@ -301,11 +308,29 @@ def test_wide_path_publishes_hint_on_its_own_topic_only():
     assert abs(hint.stamp_sec - 100.25) < 1e-9
 
 
-def test_wide_path_skips_when_no_unlabeled_set2_track_remains():
+def test_wide_path_keeps_live_hint_updates_after_all_tracks_have_a_label():
     score = CropScore("apple", 0.5, 0.9, image_face_visible=True)
     harness = _run_wide(score, unlabeled=False)
-    assert harness.pub_wide_hint.messages == []
-    assert harness._wide_pending is None       # pending dropped, GPU saved
+    assert len(harness.pub_wide_hint.messages) == 1
+    assert harness._wide_pending is None
+
+
+def test_pineapple_target_never_overrides_a_banana_read_from_yellow_alone():
+    harness = SimpleNamespace(
+        color_filter_enabled=True,
+        color_target_override_enabled=True,
+        set2_label="pineapple",
+        color_target_override_min_fraction=0.90,
+        color_target_override_min_colored_fraction=0.10,
+        color_filter_veto_scale=0.25,
+        color_gate_config=ColorGateConfig(),
+        get_logger=lambda: _SilentLogger(),
+    )
+    yellow = np.full((40, 40, 3), (0, 255, 255), dtype=np.uint8)
+    label, margin, vetoed = SiglipGateNode._apply_color_target_override(
+        harness, yellow, "banana", 0.6
+    )
+    assert (label, margin, vetoed) == ("banana", 0.6, False)
 
 
 def test_wide_path_suppresses_faceless_and_low_margin_reads():

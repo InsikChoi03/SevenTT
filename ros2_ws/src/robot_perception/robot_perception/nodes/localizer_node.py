@@ -93,6 +93,13 @@ def limit_planar_delta(
     return float(dx) * scale, float(dy) * scale, True
 
 
+def wall_pose_update_allowed(
+    enabled: bool, stationary_only: bool, is_stationary: bool
+) -> bool:
+    """Allow wall-based pose mutation only under the selected motion policy."""
+    return bool(enabled and (not stationary_only or is_stationary))
+
+
 def blend_flow_velocity_with_imu(
     flow_velocity: np.ndarray,
     expected_velocity: np.ndarray,
@@ -148,6 +155,8 @@ class LocalizerNode(Node):
         self.declare_parameter("landmark_max_step_rad", 0.1)
         self.declare_parameter("landmark_correction_max_speed_mps", 0.20)
         self.declare_parameter("landmark_correction_max_dt_sec", 0.10)
+        self.declare_parameter("landmark_correction_min_confidence", 0.0)
+        self.declare_parameter("object_landmark_stationary_only", False)
         # HEADING authority for a CONFIDENT landmark fix (scaled by the fix's confidence). Higher
         # than landmark_gain because a well-conditioned object-bearing heading is an absolute ref.
         self.declare_parameter("landmark_theta_gain", 0.7)
@@ -198,6 +207,9 @@ class LocalizerNode(Node):
         # prevent the motion constraint from fully discarding a confident wall-based correction.
         self.declare_parameter("encoder_constraint_wall_translation_floor", 0.35)
         self.declare_parameter("encoder_constraint_wall_yaw_floor", 0.35)
+        # Grid-locked objects are another absolute field reference. Keep their translation
+        # correction alive while the encoder reports STOP, especially at guide-cell snapshots.
+        self.declare_parameter("encoder_constraint_landmark_translation_floor", 0.0)
         self.declare_parameter("stationary_wheel_eps_mps", 0.008)
         self.declare_parameter("stationary_cmd_eps", 0.03)
         self.declare_parameter("stationary_cmd_stale_sec", 0.7)
@@ -219,6 +231,8 @@ class LocalizerNode(Node):
         self.declare_parameter("wall_field_deadband_m", 0.005)
         self.declare_parameter("wall_correction_stale_sec", 1.5)
         self.declare_parameter("wall_translation_heading_gate_rad", 0.05235987756)
+        self.declare_parameter("wall_pose_correction_enabled", True)
+        self.declare_parameter("wall_pose_correction_stationary_only", True)
         enabled = [bool(v) for v in self.get_parameter("wheel_odom_enabled_wheels").value]
         self.wheel_odom_enabled = enabled if len(enabled) == 4 else [True, True, True, True]
         self.wheel_odom_deadband = float(self.get_parameter("wheel_odom_deadband_mps").value)
@@ -286,6 +300,9 @@ class LocalizerNode(Node):
         self.encoder_constraint_wall_yaw_floor = float(
             self.get_parameter("encoder_constraint_wall_yaw_floor").value
         )
+        self.encoder_constraint_landmark_translation_floor = float(
+            self.get_parameter("encoder_constraint_landmark_translation_floor").value
+        )
         self.stationary_wheel_eps = float(self.get_parameter("stationary_wheel_eps_mps").value)
         self.stationary_cmd_eps = float(self.get_parameter("stationary_cmd_eps").value)
         self.stationary_cmd_stale_sec = float(self.get_parameter("stationary_cmd_stale_sec").value)
@@ -322,6 +339,12 @@ class LocalizerNode(Node):
         self.wall_translation_heading_gate_rad = max(
             0.0, float(self.get_parameter("wall_translation_heading_gate_rad").value)
         )
+        self.wall_pose_correction_enabled = bool(
+            self.get_parameter("wall_pose_correction_enabled").value
+        )
+        self.wall_pose_correction_stationary_only = bool(
+            self.get_parameter("wall_pose_correction_stationary_only").value
+        )
         self._wheel_rows_all = np.array(
             [
                 [1.0, -1.0, -self.k],  # FL
@@ -356,6 +379,20 @@ class LocalizerNode(Node):
         )
         self.landmark_correction_max_dt_sec = max(
             0.0, float(self.get_parameter("landmark_correction_max_dt_sec").value)
+        )
+        self.landmark_correction_min_confidence = max(
+            0.0,
+            min(
+                1.0,
+                float(
+                    self.get_parameter(
+                        "landmark_correction_min_confidence"
+                    ).value
+                ),
+            ),
+        )
+        self.object_landmark_stationary_only = bool(
+            self.get_parameter("object_landmark_stationary_only").value
         )
         publish_rate_hz = max(1.0, float(self.get_parameter("publish_rate_hz").value))
         self.landmark_correction_nominal_dt = 1.0 / publish_rate_hz
@@ -839,6 +876,13 @@ class LocalizerNode(Node):
             forward = max(forward, self.encoder_constraint_wall_translation_floor)
             lateral = max(lateral, self.encoder_constraint_wall_translation_floor)
             yaw = max(yaw, self.encoder_constraint_wall_yaw_floor)
+        elif source == "object_landmark":
+            forward = max(
+                forward, self.encoder_constraint_landmark_translation_floor
+            )
+            lateral = max(
+                lateral, self.encoder_constraint_landmark_translation_floor
+            )
         return (
             self._bounded_gain(forward),
             self._bounded_gain(lateral),
@@ -1157,13 +1201,15 @@ class LocalizerNode(Node):
         """
         if not (self.use_object_landmarks or self.use_landmark_correction):
             return
-        if self.freeze_pose_when_stationary and self.is_stationary:
-            return
         d = msg.data
         if len(d) < 3:
             return
         dx, dy, dth = float(d[0]), float(d[1]), float(d[2])
         conf = float(d[3]) if len(d) > 3 else 1.0
+        if conf < self.landmark_correction_min_confidence:
+            return
+        if self.object_landmark_stationary_only and not self.is_stationary:
+            return
         mx, mr = self.landmark_max_step_m, self.landmark_max_step_rad
         cf = max(0.0, min(1.0, conf))
         # POSITION: the locked anchors ARE the wide cam's (now 1280, cm-accurate) map, so this dx/dy
@@ -1212,6 +1258,8 @@ class LocalizerNode(Node):
 
     def on_wall_anchor_correction(self, msg: Float32MultiArray) -> None:
         """Pull a stationary pose back toward the initial yellow-wall anchor."""
+        if not getattr(self, "wall_pose_correction_enabled", True):
+            return
         if not self.freeze_pose_when_stationary or not self.is_stationary or len(msg.data) < 3:
             return
         dx, dy, dth = (float(msg.data[i]) for i in range(3))
@@ -1263,8 +1311,19 @@ class LocalizerNode(Node):
         heading_conf = max(
             0.0, min(1.0, float(msg.data[7]) if len(msg.data) > 7 else conf)
         )
-        allow_heading = self.wall_correction_mode in {"HEADING_ONLY", "FULL"}
-        allow_translation = self.wall_correction_mode in {"TRANSLATION_ONLY", "FULL"}
+        pose_enabled = wall_pose_update_allowed(
+            getattr(self, "wall_pose_correction_enabled", True),
+            getattr(self, "wall_pose_correction_stationary_only", True),
+            getattr(self, "is_stationary", False),
+        )
+        allow_heading = pose_enabled and self.wall_correction_mode in {
+            "HEADING_ONLY",
+            "FULL",
+        }
+        allow_translation = pose_enabled and self.wall_correction_mode in {
+            "TRANSLATION_ONLY",
+            "FULL",
+        }
         # Translation was measured after rotating the observed lines by raw_dth. Never consume it
         # until the wall and field axes are already parallel, otherwise x/y is geometrically wrong.
         heading_converged = abs(raw_dth) <= self.wall_translation_heading_gate_rad
@@ -1311,6 +1370,8 @@ class LocalizerNode(Node):
         ]
         self.pub_wall_heading_debug.publish(debug)
 
+        if not pose_enabled:
+            return
         if self.wall_correction_mode == "OFF":
             return
         if not allow_translation and not allow_heading:

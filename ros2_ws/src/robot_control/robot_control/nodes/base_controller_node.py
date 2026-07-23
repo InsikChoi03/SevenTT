@@ -21,11 +21,26 @@ from std_msgs.msg import Bool, Float32MultiArray
 LOCAL_ANCHOR_MOTION_STATES = frozenset(
     {"LOCAL_ANCHOR_INSPECTION", "LOCAL_ANCHOR_ALIGN"}
 )
+FORWARD_START_BOOST_STATES = frozenset({"SCAN", "APPROACH"})
 
 
 def local_anchor_motion_profile_active(mission_state: str) -> bool:
     """Return whether the isolated local-anchor base profile owns this state."""
     return str(mission_state).strip().upper() in LOCAL_ANCHOR_MOTION_STATES
+
+
+def forward_start_boost_active(mission_state: str, vx: float, vy: float) -> bool:
+    """Boost only a forward start used by normal sweep/approach navigation.
+
+    Keep reverse, holonomic strafe, ALIGN, opening, and storage profiles unchanged.  Lane heading
+    correction may add omega, so yaw is deliberately not part of this translation-only gate.
+    """
+    state = str(mission_state).strip().upper()
+    return bool(
+        state in FORWARD_START_BOOST_STATES
+        and float(vx) >= 0.02
+        and abs(float(vx)) >= abs(float(vy))
+    )
 
 
 def select_mission_profile_value(mission_state: str, main_value, local_anchor_value):
@@ -192,11 +207,13 @@ class BaseControllerNode(Node):
         # get floored to wheel_min and spin too fast; set this LOWER for a slow-but-moving CW/CCW turn
         # (the start-boost still breaks static friction, then it relaxes to this). Raise if it stalls.
         self.declare_parameter("wheel_min_rot", 0.07)
-        # STATIC friction from REST is higher, so strafe/rotation starts get a short breakaway kick,
-        # then relax to wheel_min/wheel_min_rot. Forward starts stay unboosted so straight-line tuning
-        # is not disturbed. `wheel_boost` is kept as a legacy fallback for older YAML files.
+        # STATIC friction from REST is higher, so starts get a short breakaway kick, then relax to
+        # wheel_min/wheel_min_rot. Forward boost is narrowly scoped to SCAN/APPROACH and uniformly
+        # scales the calibrated wheel vector, preserving straight-line trim.
         self.declare_parameter("wheel_boost", 0.60)
         legacy_boost = float(self.get_parameter("wheel_boost").value)
+        self.declare_parameter("wheel_boost_forward", 0.16)
+        self.declare_parameter("wheel_boost_forward_ms", 120)
         self.declare_parameter("wheel_boost_strafe", legacy_boost)
         self.declare_parameter("wheel_boost_rot", legacy_boost)
         self.declare_parameter("wheel_boost_ms", 120)
@@ -279,6 +296,12 @@ class BaseControllerNode(Node):
         self.wheel_min = float(self.get_parameter("wheel_min").value)
         self.wheel_min_strafe = float(self.get_parameter("wheel_min_strafe").value)
         self.wheel_min_rot = float(self.get_parameter("wheel_min_rot").value)
+        self.wheel_boost_forward = float(
+            self.get_parameter("wheel_boost_forward").value
+        )
+        self.wheel_boost_forward_ms = float(
+            self.get_parameter("wheel_boost_forward_ms").value
+        )
         self.wheel_boost_strafe = float(self.get_parameter("wheel_boost_strafe").value)
         self.wheel_boost_rot = float(self.get_parameter("wheel_boost_rot").value)
         self.wheel_boost_ms = float(self.get_parameter("wheel_boost_ms").value)
@@ -464,6 +487,10 @@ class BaseControllerNode(Node):
                     self.wheel_min_strafe = float(p.value)
                 elif name == "wheel_min_rot":
                     self.wheel_min_rot = float(p.value)
+                elif name == "wheel_boost_forward":
+                    self.wheel_boost_forward = float(p.value)
+                elif name == "wheel_boost_forward_ms":
+                    self.wheel_boost_forward_ms = float(p.value)
                 elif name == "wheel_boost_strafe":
                     self.wheel_boost_strafe = float(p.value)
                 elif name == "wheel_boost_rot":
@@ -590,6 +617,7 @@ class BaseControllerNode(Node):
         aligning = self._mstate in {"ALIGN", "LOCAL_ANCHOR_ALIGN"}
         is_rot = abs(vx) < 0.02 and abs(vy) < 0.02 and abs(omega) > 1e-3
         is_strafe = abs(vy) >= 0.02 and abs(vy) >= abs(vx)
+        forward_start_boost = forward_start_boost_active(self._mstate, vx, vy)
         opening = self._mstate == "OPENING"
         # The opening's one left-strafe pulse is deliberately calibrated from ALIGN.  Give that
         # exact pure-strafe command the same boost-free, slew-bypassed output profile as ALIGN;
@@ -676,6 +704,9 @@ class BaseControllerNode(Node):
             if local_anchor_profile and is_rot:
                 boost = self.local_anchor_wheel_boost_rot
                 boost_ms = self.local_anchor_wheel_boost_ms
+            elif forward_start_boost:
+                boost = self.wheel_boost_forward
+                boost_ms = self.wheel_boost_forward_ms
             elif opening and is_rot:
                 boost = self.opening_wheel_boost_rot
                 boost_ms = self.opening_wheel_boost_ms
@@ -686,7 +717,8 @@ class BaseControllerNode(Node):
                 boost = self.wheel_boost_rot
             elif is_strafe:
                 boost = self.wheel_boost_strafe
-            if (not align_profile and not was_moving and (is_rot or is_strafe)
+            if (not align_profile and not was_moving
+                    and (is_rot or is_strafe or forward_start_boost)
                     and boost > 0.0 and boost_ms > 0.0):
                 self._boost_until = now + boost_ms / 1000.0
             if opening_align_strafe:
@@ -711,7 +743,7 @@ class BaseControllerNode(Node):
             if 0.0 < m < steady_floor:
                 s = steady_floor / m
                 wheels = [max(-1.0, min(1.0, w * s)) for w in wheels]
-            if (is_rot or is_strafe) and now < self._boost_until:
+            if (is_rot or is_strafe or forward_start_boost) and now < self._boost_until:
                 bm = max(abs(w) for w in wheels)
                 if 0.0 < bm < boost:
                     s = boost / bm

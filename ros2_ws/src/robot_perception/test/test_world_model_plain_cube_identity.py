@@ -1,4 +1,5 @@
 from robot_perception.nodes.world_model_node import (
+    Track,
     WorldModelNode,
     resolve_recent_yolo_identity,
 )
@@ -51,3 +52,26 @@ def test_fruit_uses_its_own_threshold_for_recent_veto_evidence():
 
     assert node._is_recent_label_evidence("fruit_photo_cube", 0.80, False, 0.85)
     assert not node._is_recent_label_evidence("cube", 0.80, False, 0.85)
+
+
+def test_nonsticky_wide_fruit_decision_is_dominant_but_reversible():
+    node = WorldModelNode.__new__(WorldModelNode)
+    node.fruit_cube_sticky_enabled = False
+    node.plain_cube_confirm_observations = 3
+    track = Track(
+        id=1,
+        x=0.0,
+        y=0.0,
+        confidence=0.9,
+        last_seen_sec=0.0,
+        latest_wide_cube_label="fruit_photo_cube",
+        label_history=["fruit_photo_cube"],
+    )
+
+    WorldModelNode._refresh_identity(node, track)
+    assert (track.class_label, track.set_type) == ("fruit_photo_cube", 2)
+
+    track.latest_wide_cube_label = "cube"
+    track.label_history = ["cube", "cube", "cube"]
+    WorldModelNode._refresh_identity(node, track)
+    assert (track.class_label, track.set_type) == ("cube", 1)
